@@ -32,3 +32,12 @@ def test_dsv4_mhc_head_uses_rms_norm_eps_separately_from_hc_eps():
     assert "self.rms_norm_eps = rms_norm_eps" in text
     assert "+ self.rms_norm_eps" in text
     assert "F.linear(xf * rsqrt, self.hc_fn.float())" in text
+
+
+def test_dsv4_layer_keeps_hyper_connection_constructor_contract():
+    text = _lite_model_text()
+    layer_init = text.split("class DeepseekV4Layer", 1)[1].split("def forward", 1)[0]
+
+    assert "config.hc_sinkhorn_iters" in layer_init
+    assert "config.hc_eps" in layer_init
+    assert "config.hc_eps,\n            config.rms_norm_eps" not in layer_init

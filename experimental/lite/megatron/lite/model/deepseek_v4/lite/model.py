@@ -143,14 +143,12 @@ class DeepseekV4Layer(nn.Module):
             config.hc_mult,
             config.hc_sinkhorn_iters,
             config.hc_eps,
-            config.rms_norm_eps,
         )
         self.ffn_hc = HyperConnection(
             config.hidden_size,
             config.hc_mult,
             config.hc_sinkhorn_iters,
             config.hc_eps,
-            config.rms_norm_eps,
         )
 
     def forward(
