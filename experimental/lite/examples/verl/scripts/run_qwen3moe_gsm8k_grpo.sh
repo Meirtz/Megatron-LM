@@ -88,6 +88,12 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # - dist_opt (default): Megatron-Core DDP + distributed optimizer.
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
 MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
+LORA_RANK="${LORA_RANK:-0}"
+LORA_ALPHA="${LORA_ALPHA:-${LORA_RANK}}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
+LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-all-linear}"
+LORA_USE_RSLORA="${LORA_USE_RSLORA:-False}"
+LORA_INIT="${LORA_INIT:-}"
 
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
@@ -112,6 +118,10 @@ SAVE_FREQ="${SAVE_FREQ:-20}"
 TEST_FREQ="${TEST_FREQ:-5}"
 RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
+CHECKPOINT_SAVE_CONTENTS="${CHECKPOINT_SAVE_CONTENTS:-}"
+CHECKPOINT_LOAD_CONTENTS="${CHECKPOINT_LOAD_CONTENTS:-}"
+CHECKPOINT_SAVE_LORA_ADAPTER="${CHECKPOINT_SAVE_LORA_ADAPTER:-}"
+LORA_ADAPTER_DIR_NAME="${LORA_ADAPTER_DIR_NAME:-}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
 USE_LEGACY_WORKER_IMPL="${USE_LEGACY_WORKER_IMPL:-disable}"
@@ -222,6 +232,19 @@ ACTOR=(
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 )
 
+if [[ "${LORA_RANK}" != "0" ]]; then
+  ACTOR+=(
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.rank=${LORA_RANK}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.alpha=${LORA_ALPHA}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.dropout=${LORA_DROPOUT}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.target_modules=${LORA_TARGET_MODULES}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.use_rslora=${LORA_USE_RSLORA}"
+  )
+fi
+if [[ -n "${LORA_INIT}" ]]; then
+  ACTOR+=("+actor_rollout_ref.actor.engine.impl_cfg.lora_init=${LORA_INIT}")
+fi
+
 if [[ "${OPTIMIZER_OFFLOAD}" == "True" || "${OPTIMIZER_OFFLOAD}" == "true" || "${OPTIMIZER_OFFLOAD}" == "1" ]]; then
   ACTOR+=(
     "+actor_rollout_ref.actor.optim.override_optimizer_config.offload_fraction=${OPTIMIZER_STATE_OFFLOAD_FRACTION}"
@@ -282,6 +305,20 @@ TRAINER=(
   "trainer.use_legacy_worker_impl=${USE_LEGACY_WORKER_IMPL}"
 )
 
+CHECKPOINT=()
+if [[ -n "${CHECKPOINT_SAVE_CONTENTS}" ]]; then
+  CHECKPOINT+=("checkpoint.save_contents=${CHECKPOINT_SAVE_CONTENTS}")
+fi
+if [[ -n "${CHECKPOINT_LOAD_CONTENTS}" ]]; then
+  CHECKPOINT+=("checkpoint.load_contents=${CHECKPOINT_LOAD_CONTENTS}")
+fi
+if [[ -n "${CHECKPOINT_SAVE_LORA_ADAPTER}" ]]; then
+  CHECKPOINT+=("checkpoint.save_lora_adapter=${CHECKPOINT_SAVE_LORA_ADAPTER}")
+fi
+if [[ -n "${LORA_ADAPTER_DIR_NAME}" ]]; then
+  CHECKPOINT+=("checkpoint.lora_adapter_dir_name=${LORA_ADAPTER_DIR_NAME}")
+fi
+
 COMMAND=(
   python3
   -m
@@ -293,8 +330,13 @@ COMMAND=(
   "${ACTOR[@]}"
   "${ROLLOUT[@]}"
   "${TRAINER[@]}"
-  "${EXTRA_ARGS[@]}"
 )
+if (( ${#CHECKPOINT[@]} )); then
+  COMMAND+=("${CHECKPOINT[@]}")
+fi
+if (( ${#EXTRA_ARGS[@]} )); then
+  COMMAND+=("${EXTRA_ARGS[@]}")
+fi
 
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"
 printf '\n' >> "${CMD_FILE}"

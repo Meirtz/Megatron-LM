@@ -361,6 +361,116 @@ def test_model_handle_cp_range_and_config_properties():
     assert configured_handle.config is cfg
 
 
+def test_mlite_runtime_forwards_lora_adapter_helpers_to_protocol(tmp_path):
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    calls = []
+
+    class FakeProtocol:
+        __name__ = "fake_protocol"
+
+        @staticmethod
+        def export_lora_adapter_state(chunks, model_cfg, ps, **kwargs):
+            calls.append(("export", chunks, model_cfg, ps, kwargs))
+            return {"adapter.weight": "tensor"}
+
+        @staticmethod
+        def save_lora_adapter(chunks, model_cfg, ps, output_dir, **kwargs):
+            calls.append(("save", chunks, model_cfg, ps, output_dir, kwargs))
+            return {"saved": str(output_dir)}
+
+        @staticmethod
+        def load_lora_adapter(chunks, adapter_dir, model_cfg, ps, **kwargs):
+            calls.append(("load", chunks, adapter_dir, model_cfg, ps, kwargs))
+            return {"loaded": str(adapter_dir)}
+
+    chunks = [MagicMock(name="chunk0"), MagicMock(name="chunk1")]
+    model_cfg = MagicMock(name="model_cfg")
+    ps = MagicMock(name="parallel_state")
+    handle = ModelHandle(
+        model=chunks[0],
+        parallel_state=ps,
+        _extras={"model_chunks": chunks, "model_cfg": model_cfg, "protocol": FakeProtocol},
+    )
+
+    assert runtime.export_lora_adapter_state(handle, cpu=True) == {"adapter.weight": "tensor"}
+    save_dir = tmp_path / "adapter"
+    assert runtime.save_lora_adapter(handle, save_dir, lora_config={"rank": 2}) == {
+        "saved": str(save_dir)
+    }
+    assert runtime.load_lora_adapter(handle, save_dir, strict=True) == {"loaded": str(save_dir)}
+
+    assert calls == [
+        ("export", chunks, model_cfg, ps, {"cpu": True}),
+        ("save", chunks, model_cfg, ps, save_dir, {"lora_config": {"rank": 2}}),
+        ("load", chunks, save_dir, model_cfg, ps, {"strict": True}),
+    ]
+
+
+def test_mlite_runtime_lora_adapter_helpers_require_protocol_context():
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    with pytest.raises(ValueError, match="protocol"):
+        runtime.export_lora_adapter_state(ModelHandle(model=MagicMock()))
+
+    with pytest.raises(ValueError, match="model_cfg"):
+        runtime.save_lora_adapter(
+            ModelHandle(model=MagicMock(), _extras={"protocol": types.SimpleNamespace()}),
+            "/tmp/adapter",
+        )
+
+    with pytest.raises(ValueError, match="non-empty sequence of model_chunks"):
+        runtime.export_lora_adapter_state(
+            ModelHandle(
+                model=MagicMock(),
+                parallel_state=MagicMock(),
+                _extras={
+                    "protocol": types.SimpleNamespace(),
+                    "model_cfg": {},
+                    "model_chunks": [],
+                },
+            )
+        )
+
+    with pytest.raises(ValueError, match="non-None model_chunks"):
+        runtime.export_lora_adapter_state(
+            ModelHandle(
+                model=MagicMock(),
+                parallel_state=MagicMock(),
+                _extras={
+                    "protocol": types.SimpleNamespace(),
+                    "model_cfg": {},
+                    "model_chunks": [None],
+                },
+            )
+        )
+
+    with pytest.raises(ValueError, match="parallel_state"):
+        runtime.export_lora_adapter_state(
+            ModelHandle(
+                model=MagicMock(),
+                _extras={
+                    "protocol": types.SimpleNamespace(),
+                    "model_cfg": {},
+                    "model_chunks": [MagicMock()],
+                },
+            )
+        )
+
+    with pytest.raises(NotImplementedError, match="load_lora_adapter"):
+        runtime.load_lora_adapter(
+            ModelHandle(
+                model=MagicMock(),
+                parallel_state=MagicMock(),
+                _extras={
+                    "protocol": types.SimpleNamespace(__name__="no_adapter"),
+                    "model_cfg": {},
+                    "model_chunks": [MagicMock()],
+                },
+            ),
+            "/tmp/adapter",
+        )
+
+
 def test_runtime_dispatch_creates_mlite_backend():
     with patch("megatron.lite.runtime.backends.mlite.create") as mock_create:
         backend = MagicMock()
@@ -440,3 +550,135 @@ def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp
     assert "engine.param_offload=False" in command
     assert "engine.optimizer_offload=False" in command
     assert "override_optimizer_config.offload_fraction" not in command
+
+
+def test_verl_sft_script_maps_lora_env_to_impl_cfg(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(
+        script,
+        tmp_path,
+        LORA_RANK="16",
+        LORA_ALPHA="32",
+        LORA_DROPOUT="0.05",
+        LORA_TARGET_MODULES="all-linear",
+        LORA_USE_RSLORA="True",
+        LORA_INIT="olora_tail",
+    )
+
+    assert "+engine.impl_cfg.lora.rank=16" in command
+    assert "+engine.impl_cfg.lora.alpha=32" in command
+    assert "+engine.impl_cfg.lora.dropout=0.05" in command
+    assert "+engine.impl_cfg.lora.target_modules=all-linear" in command
+    assert "+engine.impl_cfg.lora.use_rslora=True" in command
+    assert "+engine.impl_cfg.lora_init=olora_tail" in command
+
+
+def test_verl_sft_script_maps_lora_adapter_checkpoint_env(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_sft.sh"
+    )
+
+    command = _run_verl_sft_dry_run(
+        script,
+        tmp_path,
+        CHECKPOINT_SAVE_CONTENTS="[model,optimizer,lora_adapter]",
+        CHECKPOINT_LOAD_CONTENTS="[lora_adapter]",
+        CHECKPOINT_SAVE_LORA_ADAPTER="True",
+        LORA_ADAPTER_DIR_NAME="peft_adapter",
+    )
+    normalized_command = command.replace("\\", "")
+
+    assert "checkpoint.save_contents=[model,optimizer,lora_adapter]" in normalized_command
+    assert "checkpoint.load_contents=[lora_adapter]" in normalized_command
+    assert "checkpoint.save_lora_adapter=True" in command
+    assert "checkpoint.lora_adapter_dir_name=peft_adapter" in command
+
+
+def _run_verl_grpo_dry_run(script: Path, tmp_path: Path, **env_overrides: str) -> str:
+    env = {
+        **os.environ,
+        "MODEL_PATH": "/tmp/mlite-model",
+        "DATASET_DIR": "/tmp/mlite-gsm8k",
+        "OUTPUT_ROOT": str(tmp_path),
+        "DRY_RUN": "1",
+        "NGPUS_PER_NODE": "1",
+        "NPROC_PER_NODE": "1",
+        "ACTOR_TP": "1",
+        "ACTOR_PP": "1",
+        "ACTOR_CP": "1",
+        "ACTOR_EP": "1",
+        "ACTOR_ETP": "1",
+        "ROLLOUT_TP": "1",
+        **env_overrides,
+    }
+    completed = subprocess.run([str(script)], env=env, text=True, capture_output=True, check=True)
+    return completed.stdout
+
+
+def test_verl_grpo_script_maps_lora_env_to_actor_impl_cfg(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_gsm8k_grpo.sh"
+    )
+
+    command = _run_verl_grpo_dry_run(
+        script,
+        tmp_path,
+        LORA_RANK="16",
+        LORA_ALPHA="32",
+        LORA_DROPOUT="0.0",
+        LORA_TARGET_MODULES="[linear_qkv,linear_proj,linear_fc1,linear_fc2]",
+        LORA_USE_RSLORA="True",
+        LORA_INIT="olora_tail",
+    )
+    normalized_command = command.replace("\\", "")
+
+    assert "+actor_rollout_ref.actor.engine.impl_cfg.lora.rank=16" in command
+    assert "+actor_rollout_ref.actor.engine.impl_cfg.lora.alpha=32" in command
+    assert "+actor_rollout_ref.actor.engine.impl_cfg.lora.dropout=0.0" in command
+    assert (
+        "+actor_rollout_ref.actor.engine.impl_cfg.lora.target_modules="
+        "[linear_qkv,linear_proj,linear_fc1,linear_fc2]"
+        in normalized_command
+    )
+    assert "+actor_rollout_ref.actor.engine.impl_cfg.lora.use_rslora=True" in command
+    assert "+actor_rollout_ref.actor.engine.impl_cfg.lora_init=olora_tail" in command
+
+
+def test_verl_grpo_script_maps_lora_adapter_checkpoint_env(tmp_path):
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "verl"
+        / "scripts"
+        / "run_qwen3moe_gsm8k_grpo.sh"
+    )
+
+    command = _run_verl_grpo_dry_run(
+        script,
+        tmp_path,
+        CHECKPOINT_SAVE_CONTENTS="[lora_adapter]",
+        CHECKPOINT_LOAD_CONTENTS="[lora_adapter]",
+        CHECKPOINT_SAVE_LORA_ADAPTER="True",
+        LORA_ADAPTER_DIR_NAME="peft_adapter",
+    )
+    normalized_command = command.replace("\\", "")
+
+    assert "checkpoint.save_contents=[lora_adapter]" in normalized_command
+    assert "checkpoint.load_contents=[lora_adapter]" in normalized_command
+    assert "checkpoint.save_lora_adapter=True" in command
+    assert "checkpoint.lora_adapter_dir_name=peft_adapter" in command

@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
@@ -12,6 +14,7 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.modules.lora import normalize_lora_config
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -41,6 +44,8 @@ except ImportError:
 
 
 _LR_SCHEDULER_STATE = "lr_scheduler.pt"
+_LORA_ADAPTER_DIR = "lora_adapter"
+_LORA_ADAPTER_CONTENT_KEYS = {"adapter", "lora", "lora_adapter", "peft_adapter"}
 
 
 def _isolate_compile_cache_per_rank() -> None:
@@ -66,6 +71,51 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
         or getattr(pad_mode, "value", None) == "no_padding"
         or str(pad_mode) in {"no_padding", "DatasetPadMode.NO_PADDING"}
     )
+
+
+def _content_set(contents: Any, *, key: str = "checkpoint contents") -> set[str]:
+    def normalize_entry(item: str) -> str:
+        return item.strip().strip("'\"").strip()
+
+    if contents is None:
+        return set()
+    if isinstance(contents, str):
+        contents = contents.strip()
+        if contents.startswith("[") and contents.endswith("]"):
+            contents = contents[1:-1].strip()
+        if "," in contents:
+            return {entry for item in contents.split(",") if (entry := normalize_entry(item))}
+        entry = normalize_entry(contents)
+        return {entry} if entry else set()
+    if isinstance(contents, Mapping):
+        raise TypeError(f"{key} must be None, a string, or a sequence of strings.")
+    try:
+        iterator = iter(contents)
+    except TypeError as exc:
+        raise TypeError(f"{key} must be None, a string, or a sequence of strings.") from exc
+    result: set[str] = set()
+    for item in iterator:
+        if not isinstance(item, str):
+            raise TypeError(f"{key} entries must be strings, got {type(item)!r}.")
+        item = normalize_entry(item)
+        if item:
+            result.add(item)
+    return result
+
+
+def _checkpoint_bool(value: Any, *, key: str) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+        raise ValueError(f"{key} must be a boolean or boolean string, got {value!r}.")
+    raise TypeError(f"{key} must be a boolean or boolean string, got {type(value)!r}.")
 
 
 class _MegatronLiteLRScheduler:
@@ -419,9 +469,14 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
 
         save_contents = self.checkpoint_config.get("save_contents", None)
-        save_model = save_contents is None or "model" in save_contents
-        save_optimizer = save_contents is None or "optimizer" in save_contents
-        if not save_model and not save_optimizer:
+        save_content_keys = _content_set(save_contents, key="checkpoint_config.save_contents")
+        save_model = save_contents is None or "model" in save_content_keys
+        save_optimizer = save_contents is None or "optimizer" in save_content_keys
+        save_lora_adapter = _checkpoint_bool(
+            self.checkpoint_config.get("save_lora_adapter", False),
+            key="checkpoint_config.save_lora_adapter",
+        ) or bool(save_content_keys & _LORA_ADAPTER_CONTENT_KEYS)
+        if not save_model and not save_optimizer and not save_lora_adapter:
             if self._rank == 0:
                 print(
                     f"Skipping Megatron Lite checkpoint save at step {global_step}: save_contents={save_contents}"
@@ -430,6 +485,21 @@ class MegatronLiteEngine(BaseEngine):
                 dist.barrier()
             return
 
+        lora_adapter_path = None
+        lora_adapter_kwargs = None
+        save_adapter = None
+        if save_lora_adapter:
+            save_adapter = getattr(self.runtime, "save_lora_adapter", None)
+            if not callable(save_adapter):
+                raise NotImplementedError(
+                    "Megatron Lite runtime does not support save_lora_adapter."
+                )
+            lora_adapter_path = self._lora_adapter_checkpoint_path(local_path)
+            lora_adapter_kwargs = self._lora_adapter_checkpoint_kwargs(
+                require_enabled_lora_config=True
+            )
+
+        checkpoint_path_preexisting = os.path.exists(local_path)
         os.makedirs(local_path, exist_ok=True)
         placement_fn, expert_classifier = self._checkpoint_hooks()
         reload_params_for_save = self.is_param_offload_enabled
@@ -437,25 +507,46 @@ class MegatronLiteEngine(BaseEngine):
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
-            save_training_checkpoint(
-                self.module,
-                self.handle._optimizer,
-                global_step,
-                local_path,
-                self.handle._config.parallel,
-                self.handle._parallel_state,
-                get_placements=placement_fn,
-                is_expert=expert_classifier,
-                save_model=save_model,
-                save_optimizer=save_optimizer,
-            )
-            if self.handle._lr_scheduler is not None and self._rank == 0:
-                torch.save(
-                    self.handle._lr_scheduler.state_dict(),
-                    os.path.join(local_path, _LR_SCHEDULER_STATE),
+            save_full_checkpoint = save_model or save_optimizer
+            if save_full_checkpoint:
+                save_training_checkpoint(
+                    self.module,
+                    self.handle._optimizer,
+                    global_step,
+                    local_path,
+                    self.handle._config.parallel,
+                    self.handle._parallel_state,
+                    get_placements=placement_fn,
+                    is_expert=expert_classifier,
+                    save_model=save_model,
+                    save_optimizer=save_optimizer,
+                )
+                if self.handle._lr_scheduler is not None and self._rank == 0:
+                    torch.save(
+                        self.handle._lr_scheduler.state_dict(),
+                        os.path.join(local_path, _LR_SCHEDULER_STATE),
+                    )
+            if save_lora_adapter:
+                assert save_adapter is not None
+                assert lora_adapter_path is not None
+                assert lora_adapter_kwargs is not None
+                self._save_lora_adapter_checkpoint(
+                    lora_adapter_path,
+                    global_step,
+                    adapter_kwargs=lora_adapter_kwargs,
+                    save_adapter=save_adapter,
                 )
             if dist.is_initialized():
                 dist.barrier()
+        except Exception:
+            if (
+                save_lora_adapter
+                and not save_full_checkpoint
+                and not checkpoint_path_preexisting
+                and (not dist.is_initialized() or self._rank == 0)
+            ):
+                shutil.rmtree(local_path, ignore_errors=True)
+            raise
         finally:
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
@@ -470,32 +561,197 @@ class MegatronLiteEngine(BaseEngine):
         del hdfs_path, del_local_after_load, kwargs
         self._require_initialized()
 
+        load_contents = self.checkpoint_config.get("load_contents", None)
+        load_content_keys = _content_set(load_contents, key="checkpoint_config.load_contents")
+        load_model = load_contents is None or "model" in load_content_keys
+        load_optimizer = load_contents is None or "optimizer" in load_content_keys
+        load_lora_adapter = _checkpoint_bool(
+            self.checkpoint_config.get("load_lora_adapter", False),
+            key="checkpoint_config.load_lora_adapter",
+        ) or bool(load_content_keys & _LORA_ADAPTER_CONTENT_KEYS)
+        if not load_model and not load_optimizer and not load_lora_adapter:
+            if self._rank == 0:
+                print(
+                    f"Skipping Megatron Lite checkpoint load: load_contents={load_contents}"
+                )
+            if dist.is_initialized():
+                dist.barrier()
+            return
+        lora_adapter_path = None
+        lora_adapter_kwargs = None
+        load_adapter = None
+        if load_lora_adapter:
+            load_adapter = getattr(self.runtime, "load_lora_adapter", None)
+            if not callable(load_adapter):
+                raise NotImplementedError(
+                    "Megatron Lite runtime does not support load_lora_adapter."
+                )
+            lora_adapter_path = self._lora_adapter_checkpoint_path(local_path)
+            lora_adapter_kwargs = self._lora_adapter_checkpoint_kwargs()
+            lora_adapter_kwargs.pop("metadata", None)
+            lora_adapter_kwargs.pop("base_model_name_or_path", None)
+            lora_adapter_kwargs.pop("init_lora_weights", None)
+            self._validate_lora_adapter_checkpoint_load_path(lora_adapter_path)
+
         placement_fn, expert_classifier = self._checkpoint_hooks()
         reload_params_for_load = self.is_param_offload_enabled
         if reload_params_for_load:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
-            load_training_checkpoint(
-                self.module,
-                self.handle._optimizer,
-                local_path,
-                self.handle._config.parallel,
-                self.handle._parallel_state,
-                get_placements=placement_fn,
-                is_expert=expert_classifier,
-                load_model=True,
-                load_optimizer=True,
-            )
-            scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
-            if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
-                state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
-                self.handle._lr_scheduler.load_state_dict(state)
+            if load_model or load_optimizer:
+                load_training_checkpoint(
+                    self.module,
+                    self.handle._optimizer,
+                    local_path,
+                    self.handle._config.parallel,
+                    self.handle._parallel_state,
+                    get_placements=placement_fn,
+                    is_expert=expert_classifier,
+                    load_model=load_model,
+                    load_optimizer=load_optimizer,
+                )
+                scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
+                if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
+                    state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
+                    self.handle._lr_scheduler.load_state_dict(state)
+            if load_lora_adapter:
+                assert load_adapter is not None
+                assert lora_adapter_path is not None
+                assert lora_adapter_kwargs is not None
+                self._load_lora_adapter_checkpoint(
+                    lora_adapter_path,
+                    adapter_kwargs=lora_adapter_kwargs,
+                    load_adapter=load_adapter,
+                )
             if dist.is_initialized():
                 dist.barrier()
         finally:
             if reload_params_for_load:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+
+    def _lora_adapter_checkpoint_path(self, local_path: str) -> str:
+        name = self.checkpoint_config.get("lora_adapter_dir_name", _LORA_ADAPTER_DIR)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("checkpoint_config.lora_adapter_dir_name must be a non-empty string.")
+        name = name.strip()
+        normalized = os.path.normpath(name)
+        raw_parts = name.split(os.sep)
+        parts = normalized.split(os.sep)
+        if (
+            os.path.isabs(name)
+            or normalized in {"", ".", os.pardir}
+            or any(part == os.pardir for part in raw_parts)
+            or any(part == os.pardir for part in parts)
+        ):
+            raise ValueError(
+                "checkpoint_config.lora_adapter_dir_name must be a relative path "
+                "inside the checkpoint directory."
+            )
+        return os.path.join(local_path, normalized)
+
+    @staticmethod
+    def _validate_lora_adapter_checkpoint_load_path(adapter_path: str) -> None:
+        if not os.path.exists(adapter_path):
+            raise FileNotFoundError(
+                f"LoRA adapter checkpoint directory does not exist: {adapter_path}"
+            )
+        if not os.path.isdir(adapter_path):
+            raise NotADirectoryError(
+                f"LoRA adapter checkpoint path must be a directory: {adapter_path}"
+            )
+
+    def _lora_adapter_checkpoint_kwargs(
+        self, *, require_enabled_lora_config: bool = False
+    ) -> dict[str, Any]:
+        raw_kwargs = self.checkpoint_config.get("lora_adapter_kwargs", None)
+        if raw_kwargs is None:
+            adapter_kwargs: dict[str, Any] = {}
+        elif isinstance(raw_kwargs, Mapping):
+            adapter_kwargs = dict(raw_kwargs)
+        else:
+            raise TypeError("checkpoint_config.lora_adapter_kwargs must be a mapping.")
+        raw_metadata = adapter_kwargs.get("metadata", None)
+        if raw_metadata is not None and not isinstance(raw_metadata, Mapping):
+            raise TypeError("checkpoint_config.lora_adapter_kwargs.metadata must be a mapping.")
+        impl_cfg = self.engine_config.impl_cfg or {}
+        if "lora_config" not in adapter_kwargs and impl_cfg.get("lora") is not None:
+            adapter_kwargs["lora_config"] = impl_cfg["lora"]
+        if require_enabled_lora_config:
+            lora_config = adapter_kwargs.get("lora_config", None)
+            if lora_config is None:
+                raise ValueError(
+                    "LoRA adapter sidecar save requires an enabled LoRA config in "
+                    "engine.impl_cfg.lora or checkpoint_config.lora_adapter_kwargs.lora_config."
+                )
+            if not normalize_lora_config(lora_config).enabled:
+                raise ValueError(
+                    "LoRA adapter sidecar save requires an enabled LoRA config."
+                )
+        if "base_model_name_or_path" not in adapter_kwargs:
+            adapter_kwargs["base_model_name_or_path"] = self.model_config.local_path
+        lora_init = self.handle._extras.get("lora_init", impl_cfg.get("lora_init"))
+        if lora_init is not None and "init_lora_weights" not in adapter_kwargs:
+            adapter_kwargs["init_lora_weights"] = lora_init
+        return adapter_kwargs
+
+    def _save_lora_adapter_checkpoint(
+        self,
+        adapter_path: str,
+        global_step: int,
+        *,
+        adapter_kwargs: dict[str, Any] | None = None,
+        save_adapter=None,
+    ) -> None:
+        if save_adapter is None:
+            save_adapter = getattr(self.runtime, "save_lora_adapter", None)
+            if not callable(save_adapter):
+                raise NotImplementedError(
+                    "Megatron Lite runtime does not support save_lora_adapter."
+                )
+        adapter_kwargs = dict(
+            self._lora_adapter_checkpoint_kwargs(require_enabled_lora_config=True)
+            if adapter_kwargs is None
+            else adapter_kwargs
+        )
+        raw_metadata = adapter_kwargs.pop("metadata", None)
+        if raw_metadata is None:
+            metadata: dict[str, Any] = {}
+        else:
+            metadata = dict(raw_metadata)
+        metadata.setdefault("global_step", global_step)
+        adapter_kwargs["metadata"] = metadata
+        save_adapter(
+            self.handle,
+            adapter_path,
+            **adapter_kwargs,
+        )
+
+    def _load_lora_adapter_checkpoint(
+        self,
+        adapter_path: str,
+        *,
+        adapter_kwargs: dict[str, Any] | None = None,
+        load_adapter=None,
+    ) -> None:
+        if load_adapter is None:
+            load_adapter = getattr(self.runtime, "load_lora_adapter", None)
+            if not callable(load_adapter):
+                raise NotImplementedError(
+                    "Megatron Lite runtime does not support load_lora_adapter."
+                )
+        if adapter_kwargs is None:
+            adapter_kwargs = self._lora_adapter_checkpoint_kwargs()
+            adapter_kwargs.pop("metadata", None)
+            adapter_kwargs.pop("base_model_name_or_path", None)
+            adapter_kwargs.pop("init_lora_weights", None)
+        else:
+            adapter_kwargs = dict(adapter_kwargs)
+        load_adapter(
+            self.handle,
+            adapter_path,
+            **adapter_kwargs,
+        )
 
     def is_mp_src_rank_with_outputs(self):
         if self.handle is None:

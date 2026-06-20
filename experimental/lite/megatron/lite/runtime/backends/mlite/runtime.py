@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -335,6 +335,39 @@ class MegatronLiteRuntime(RuntimeBase):
             for chunk in model_chunks:
                 yield from chunk.named_parameters()
 
+    def export_lora_adapter_state(
+        self, handle: ModelHandle, **kwargs
+    ) -> dict[str, torch.Tensor]:
+        model_chunks, proto, model_cfg, ps = _adapter_protocol_context(handle)
+        export_fn = getattr(proto, "export_lora_adapter_state", None)
+        if not callable(export_fn):
+            raise NotImplementedError(
+                f"MLite protocol {proto.__name__} does not implement export_lora_adapter_state."
+            )
+        return export_fn(model_chunks, model_cfg, ps, **kwargs)
+
+    def save_lora_adapter(
+        self, handle: ModelHandle, output_dir: str | os.PathLike, **kwargs
+    ) -> Any:
+        model_chunks, proto, model_cfg, ps = _adapter_protocol_context(handle)
+        save_fn = getattr(proto, "save_lora_adapter", None)
+        if not callable(save_fn):
+            raise NotImplementedError(
+                f"MLite protocol {proto.__name__} does not implement save_lora_adapter."
+            )
+        return save_fn(model_chunks, model_cfg, ps, output_dir, **kwargs)
+
+    def load_lora_adapter(
+        self, handle: ModelHandle, adapter_dir: str | os.PathLike, **kwargs
+    ) -> Any:
+        model_chunks, proto, model_cfg, ps = _adapter_protocol_context(handle)
+        load_fn = getattr(proto, "load_lora_adapter", None)
+        if not callable(load_fn):
+            raise NotImplementedError(
+                f"MLite protocol {proto.__name__} does not implement load_lora_adapter."
+            )
+        return load_fn(model_chunks, adapter_dir, model_cfg, ps, **kwargs)
+
     # ── Memory ──
 
     def to(
@@ -565,4 +598,34 @@ def _checkpoint_hooks(handle: ModelHandle):
     return (
         getattr(proto, "PLACEMENT_FN", default_placement_fn),
         getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier),
+    )
+
+
+def _adapter_protocol_context(handle: ModelHandle):
+    proto = handle._extras.get("protocol")
+    if proto is None:
+        raise ValueError("MLite LoRA adapter helpers require a protocol in handle extras.")
+    model_cfg = handle._extras.get("model_cfg")
+    if model_cfg is None:
+        raise ValueError("MLite LoRA adapter helpers require model_cfg in handle extras.")
+    model_chunks = handle._extras.get("model_chunks", [handle._model])
+    if (
+        isinstance(model_chunks, str | bytes)
+        or not isinstance(model_chunks, Sequence)
+        or len(model_chunks) == 0
+    ):
+        raise ValueError(
+            "MLite LoRA adapter helpers require a non-empty sequence of model_chunks "
+            "in handle extras."
+        )
+    if any(chunk is None for chunk in model_chunks):
+        raise ValueError("MLite LoRA adapter helpers require non-None model_chunks.")
+    ps = handle._parallel_state
+    if ps is None:
+        raise ValueError("MLite LoRA adapter helpers require parallel_state on the handle.")
+    return (
+        model_chunks,
+        proto,
+        model_cfg,
+        ps,
     )
