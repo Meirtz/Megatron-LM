@@ -139,10 +139,18 @@ class DeepseekV4Layer(nn.Module):
         self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, use_deepep=use_deepep)
         # DS4 ONLY: per-layer multi-head hyper-connections wrapping attn + ffn.
         self.attn_hc = HyperConnection(
-            config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
+            config.hidden_size,
+            config.hc_mult,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+            config.rms_norm_eps,
         )
         self.ffn_hc = HyperConnection(
-            config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
+            config.hidden_size,
+            config.hc_mult,
+            config.hc_sinkhorn_iters,
+            config.hc_eps,
+            config.rms_norm_eps,
         )
 
     def forward(
@@ -201,7 +209,9 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hc_head = MultiHeadHyperConnectionHead(config.hidden_size, config.hc_mult, config.hc_eps)
+        self.hc_head = MultiHeadHyperConnectionHead(
+            config.hidden_size, config.hc_mult, config.hc_eps, config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -209,7 +219,8 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        return_contract: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # hidden_states is the per-stream mHC source [S, B, hc_mult, H].
         embedded = self.embedding(input_ids)
         embedded = scatter_to_sequence_parallel(embedded, self.ps)
@@ -220,7 +231,10 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
         # e_proj on the [S, B, H] embedding, broadcast across the hc_mult streams;
         # h_proj on the normed mHC hidden keeps the per-stream state.
         projected = self.e_proj(embedded).unsqueeze(2) + self.h_proj(self.hnorm(hidden_states))
-        return super().forward(projected, position_ids=position_ids, input_ids=input_ids)
+        source = super().forward(projected, position_ids=position_ids, input_ids=input_ids)
+        if not return_contract:
+            return source
+        return source, self.contract(source)
 
     def contract(self, x: torch.Tensor) -> torch.Tensor:
         # Collapse the hc_mult streams [S, B, hc_mult, H] -> [S, B, H].
@@ -338,7 +352,7 @@ class DeepseekV4Model(nn.Module):
         if layout.has_head:
             self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.hc_head = MultiHeadHyperConnectionHead(
-                config.hidden_size, config.hc_mult, config.hc_eps
+                config.hidden_size, config.hc_mult, config.hc_eps, config.rms_norm_eps
             )
             self.lm_head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
@@ -529,12 +543,13 @@ class DeepseekV4Model(nn.Module):
         outputs: list[torch.Tensor] = []
         for mtp_layer in self.mtp:
             mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, dims=-1)
-            source = mtp_layer(
+            source, contracted = mtp_layer(
                 input_ids=mtp_input_ids,
                 hidden_states=source,
                 position_ids=position_ids,
+                return_contract=True,
             )
-            outputs.append(mtp_layer.contract(source))
+            outputs.append(contracted)
         return outputs
 
     def _apply_mtp_loss(
