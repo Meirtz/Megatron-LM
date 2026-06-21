@@ -55,8 +55,12 @@ __all__ = [
     "PLACEMENT_FN",
     "build_model",
     "build_model_config",
+    "export_lora_adapter_state",
     "export_hf_weights",
+    "load_lora_adapter",
+    "load_lora_adapter_state",
     "load_hf_weights",
+    "save_lora_adapter",
     "vocab_size",
 ]
 
@@ -314,6 +318,38 @@ def export_hf_weights(
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
+
+
+def export_lora_adapter_state(chunks, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import (
+        export_lora_adapter_state as export_impl,
+    )
+
+    return export_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def save_lora_adapter(
+    chunks, model_cfg: Qwen3MoEConfig, ps: ParallelState, output_dir: str | Path, **kwargs
+):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import save_lora_adapter as save_impl
+
+    return save_impl(chunks, model_cfg, ps, output_dir, **kwargs)
+
+
+def load_lora_adapter_state(chunks, state, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import (
+        load_lora_adapter_state as load_impl,
+    )
+
+    return load_impl(chunks, state, model_cfg, ps, **kwargs)
+
+
+def load_lora_adapter(
+    chunks, adapter_dir: str | Path, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
+):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import load_lora_adapter as load_impl
+
+    return load_impl(chunks, adapter_dir, model_cfg, ps, **kwargs)
 
 
 # ---------------------------------------------------------------------------
