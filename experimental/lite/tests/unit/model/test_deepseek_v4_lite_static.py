@@ -210,7 +210,8 @@ def test_deepseek_v4_checkpoint_loader_has_legacy_alias_markers():
         "compressor.indexer.",
         "mlp.gate.",
         "mlp.shared_experts.gate_proj.weight",
-        "mlp.experts..{int(expert_id)}",
+        "mlp.experts.{int(expert_id)}",
         "attn_hc",
     ):
         assert marker in text
+    assert "mlp.experts.." not in text

@@ -299,7 +299,7 @@ def _legacy_hf_names_for_state_key(name: str, config: DeepseekV4Config) -> list[
     if expert is None:
         return []
     fc, expert_id = expert.groups()
-    expert_prefix = f"{prefix}.mlp.experts..{int(expert_id)}"
+    expert_prefix = f"{prefix}.mlp.experts.{int(expert_id)}"
     if fc == "1":
         return [f"{expert_prefix}.w1.weight", f"{expert_prefix}.w3.weight"]
     return [f"{expert_prefix}.w2.weight"]
