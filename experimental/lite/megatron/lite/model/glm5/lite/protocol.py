@@ -161,7 +161,12 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
 
 
 def _build_dist_opt_optimizer(
-    chunks, model_cfg: Glm5Config, impl_cfg: ImplConfig, ps: ParallelState
+    chunks,
+    model_cfg: Glm5Config,
+    impl_cfg: ImplConfig,
+    ps: ParallelState,
+    *,
+    mtp_enabled: bool,
 ):
     from megatron.lite.primitive.optimizers.megatron_wrap import (
         build_dist_opt_training_optimizer,
@@ -175,6 +180,7 @@ def _build_dist_opt_optimizer(
         model_name="glm5",
         is_expert=is_expert_param,
         deterministic=impl_cfg.deterministic,
+        mtp_enabled=mtp_enabled,
     )
 
 
@@ -198,6 +204,11 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             model_cfg.mtp_use_repeated_layer = impl_cfg.mtp_use_repeated_layer
     elif hasattr(model_cfg, "num_nextn_predict_layers"):
         model_cfg.num_nextn_predict_layers = 0
+    if impl_cfg.optimizer == "fsdp2" and mtp_enable and p.pp > 1:
+        raise NotImplementedError(
+            "FSDP2 does not yet synchronize the PP-replicated MTP input embedding; "
+            "use dist_opt for PP+MTP training."
+        )
 
     from megatron.lite.model.glm5.lite.model import (
         Glm5Model,
@@ -211,6 +222,13 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         offload_modules=impl_cfg.offload,
     )
     ps = init_parallel(p)
+    from megatron.lite.primitive.parallel import (
+        init_mtp_embedding_group,
+        synchronize_mtp_embedding_parameters,
+    )
+
+    if mtp_enable:
+        init_mtp_embedding_group(ps)
     vpp = None if p.vpp == 1 else p.vpp
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
@@ -254,6 +272,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             .cuda()
             for i in range(vpp)
         ]
+    synchronize_mtp_embedding_parameters(chunks, ps, enabled=mtp_enable)
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     if recompute_spec:
@@ -272,7 +291,7 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     optimizer_backend = "none"
     if impl_cfg.optimizer == "dist_opt":
         optimizer, finalize_grads = _build_dist_opt_optimizer(
-            chunks, model_cfg, impl_cfg, ps
+            chunks, model_cfg, impl_cfg, ps, mtp_enabled=mtp_enable
         )
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks

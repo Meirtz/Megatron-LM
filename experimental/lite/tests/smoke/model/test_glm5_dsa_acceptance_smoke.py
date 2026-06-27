@@ -10,8 +10,8 @@ pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu]
 
 _DIRECT_PUBLIC_OUTPUT_ATOL = 2.0e-3
 _DIRECT_PUBLIC_LOSS_ATOL = 1.0e-6
-_FUSED_R2R_GRAD_ATOL = 5.0e-2
-_FUSED_VS_REFERENCE_GRAD_ATOL = 5.0e-2
+_GLM_X_GRAD_MAX_ABS = 1.0e-6
+_GLM_PARAM_GRAD_MAX_ABS = 4.0e-6
 _INDEXER_LOSS_ATOL = 1.0e-6
 _INDEXER_LOSS_RTOL = 5.0e-3
 # Main-attention comparisons use a scale-independent envelope plus a
@@ -31,14 +31,19 @@ _INDEXER_TOPK = 512
 _SEQUENCE_LENGTH = 1024
 _INDEXER_LOSS_COEFF = 1.0e-2
 _MIN_INDEXER_GRAD_MAX_ABS = 1.0e-8
-_MIN_INDEXER_GRAD_COSINE = 0.99
-_MAX_INDEXER_GRAD_RMS_REL = 0.20
-_MIN_INDEXER_GRAD_NORM_RATIO = 0.90
-_MAX_INDEXER_GRAD_NORM_RATIO = 1.10
-_MIN_MAIN_GRAD_COSINE = 0.99
-_MAX_MAIN_GRAD_RMS_REL = 0.20
-_MIN_MAIN_GRAD_NORM_RATIO = 0.90
-_MAX_MAIN_GRAD_NORM_RATIO = 1.10
+# Four-rank GB300 acceptance high-water marks were 0.999462 cosine, 0.032821
+# RMS-relative, and 0.997976--1.001816 norm ratio for indexer gradients; DSv4
+# main gradients reached 0.999956 cosine, 0.009290 RMS-relative, and
+# 0.998507--1.000822 norm ratio. Keep bounded BF16/kernel headroom without
+# retaining the former 0.99/0.20/0.90--1.10 compatibility envelope.
+_MIN_INDEXER_GRAD_COSINE = 0.999
+_MAX_INDEXER_GRAD_RMS_REL = 0.05
+_MIN_INDEXER_GRAD_NORM_RATIO = 0.995
+_MAX_INDEXER_GRAD_NORM_RATIO = 1.005
+_MIN_MAIN_GRAD_COSINE = 0.9999
+_MAX_MAIN_GRAD_RMS_REL = 0.02
+_MIN_MAIN_GRAD_NORM_RATIO = 0.997
+_MAX_MAIN_GRAD_NORM_RATIO = 1.003
 _TOPK_SCORE_ATOL = 1.0e-5
 _TOPK_SCORE_RTOL = 1.0e-4
 
@@ -596,14 +601,26 @@ def _tensor_similarity_metrics(
     expected_norm = torch.linalg.vector_norm(expected_flat)
     actual_norm_value = float(actual_norm.item())
     expected_norm_value = float(expected_norm.item())
-    if actual_norm_value == 0.0 or expected_norm_value == 0.0:
-        assert actual_norm_value == 0.0 and expected_norm_value == 0.0
-        torch.testing.assert_close(actual_flat, expected_flat, atol=0, rtol=0)
+    if actual_norm_value == 0.0 and expected_norm_value == 0.0:
         return {
             "cosine": 1.0,
             "rms_relative": 0.0,
             "norm_ratio": 1.0,
             "max_abs": 0.0,
+        }
+    if expected_norm_value == 0.0:
+        return {
+            "cosine": 0.0,
+            "rms_relative": float("inf"),
+            "norm_ratio": float("inf"),
+            "max_abs": _max_abs(actual_flat, expected_flat),
+        }
+    if actual_norm_value == 0.0:
+        return {
+            "cosine": 0.0,
+            "rms_relative": 1.0,
+            "norm_ratio": 0.0,
+            "max_abs": _max_abs(actual_flat, expected_flat),
         }
     cosine = torch.dot(actual_flat, expected_flat) / (actual_norm * expected_norm)
     rms_diff = torch.sqrt(torch.mean((actual_flat - expected_flat).square()))
@@ -761,6 +778,44 @@ def _max_param_grad_abs(a: dict, b: dict) -> float:
     )
 
 
+def _main_param_grad_similarity(
+    actual: dict, expected: dict
+) -> dict[str, dict[str, float]]:
+    """Compare every non-indexer parameter separately so large tensors cannot hide drift."""
+
+    actual_names = {
+        name for name in actual["param_grads"] if not name.startswith("source.indexer.")
+    }
+    expected_names = {
+        name
+        for name in expected["param_grads"]
+        if not name.startswith("source.indexer.")
+    }
+    assert actual_names == expected_names, (
+        "main-gradient key mismatch: "
+        f"only_actual={sorted(actual_names - expected_names)}, "
+        f"only_expected={sorted(expected_names - actual_names)}"
+    )
+    assert actual_names
+    return {
+        name: _tensor_similarity_metrics(
+            actual["param_grads"][name], expected["param_grads"][name]
+        )
+        for name in sorted(actual_names)
+    }
+
+
+def _assert_main_grad_similarity(
+    comparisons: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    extrema = _similarity_extrema(comparisons)
+    assert extrema["min_cosine"] >= _MIN_MAIN_GRAD_COSINE, comparisons
+    assert extrema["max_rms_relative"] <= _MAX_MAIN_GRAD_RMS_REL, comparisons
+    assert extrema["min_norm_ratio"] >= _MIN_MAIN_GRAD_NORM_RATIO, comparisons
+    assert extrema["max_norm_ratio"] <= _MAX_MAIN_GRAD_NORM_RATIO, comparisons
+    return extrema
+
+
 def _assert_meaningful_indexer_grads(result: dict) -> float:
     expected = {
         "source.indexer.wq_b.weight",
@@ -885,6 +940,12 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     )
     fused_r2r_x_grad = _max_abs(fused_a["x_grad"], fused_b["x_grad"])
     fused_r2r_param_grad = _max_param_grad_abs(fused_a, fused_b)
+    fused_r2r_x_grad_similarity = {
+        "input": _tensor_similarity_metrics(fused_a["x_grad"], fused_b["x_grad"])
+    }
+    fused_r2r_param_grad_similarity = _main_param_grad_similarity(fused_a, fused_b)
+    fused_r2r_x_grad_extrema = _similarity_extrema(fused_r2r_x_grad_similarity)
+    fused_r2r_param_grad_extrema = _similarity_extrema(fused_r2r_param_grad_similarity)
     unfused_r2r_out = _max_abs(unfused_a["out"], unfused_b["out"])
     unfused_r2r_loss = abs(
         float(unfused_a["loss"].item()) - float(unfused_b["loss"].item())
@@ -906,6 +967,34 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     fused_vs_unfused_param_grad = max(
         _max_param_grad_abs(fused_a, matched_unfused_a),
         _max_param_grad_abs(fused_b, matched_unfused_b),
+    )
+    fused_vs_unfused_x_grad_similarity = {
+        "run_a": _tensor_similarity_metrics(
+            fused_a["x_grad"], matched_unfused_a["x_grad"]
+        ),
+        "run_b": _tensor_similarity_metrics(
+            fused_b["x_grad"], matched_unfused_b["x_grad"]
+        ),
+    }
+    fused_vs_unfused_param_grad_similarity = {
+        **{
+            f"run_a:{name}": value
+            for name, value in _main_param_grad_similarity(
+                fused_a, matched_unfused_a
+            ).items()
+        },
+        **{
+            f"run_b:{name}": value
+            for name, value in _main_param_grad_similarity(
+                fused_b, matched_unfused_b
+            ).items()
+        },
+    }
+    fused_vs_unfused_x_grad_extrema = _similarity_extrema(
+        fused_vs_unfused_x_grad_similarity
+    )
+    fused_vs_unfused_param_grad_extrema = _similarity_extrema(
+        fused_vs_unfused_param_grad_similarity
     )
     loss_diff = max(
         abs(fused_a_loss - float(matched_unfused_a["loss"].item())),
@@ -1072,6 +1161,8 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         f"fused_r2r_out_max_norm_ratio={fused_r2r_output_extrema['max_norm_ratio']:.6e} "
         f"fused_r2r_x_grad_max_abs={fused_r2r_x_grad:.6e} "
         f"fused_r2r_param_grad_max_abs={fused_r2r_param_grad:.6e} "
+        f"fused_r2r_x_grad_similarity={fused_r2r_x_grad_extrema} "
+        f"fused_r2r_param_grad_similarity={fused_r2r_param_grad_extrema} "
         f"fused_vs_unfused_out_max_abs={fused_vs_unfused_out:.6e} "
         f"fused_vs_unfused_out_min_cosine={fused_vs_unfused_output_extrema['min_cosine']:.6e} "
         f"fused_vs_unfused_out_max_rms_relative={fused_vs_unfused_output_extrema['max_rms_relative']:.6e} "
@@ -1079,6 +1170,8 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         f"fused_vs_unfused_out_max_norm_ratio={fused_vs_unfused_output_extrema['max_norm_ratio']:.6e} "
         f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
         f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e}"
+        f" fused_vs_unfused_x_grad_similarity={fused_vs_unfused_x_grad_extrema}"
+        f" fused_vs_unfused_param_grad_similarity={fused_vs_unfused_param_grad_extrema}"
         f" fused_indexer_loss_r2r={fused_indexer_loss_r2r:.6e}"
         f" fused_vs_unfused_indexer_loss={fused_vs_unfused_indexer_loss:.6e}"
         f" min_indexer_grad_cosine={min_indexer_grad_cosine:.6e}"
@@ -1101,8 +1194,10 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
             fused_r2r_output_similarity,
             max_abs=_GLM_FUSED_R2R_OUTPUT_MAX_ABS,
         )
-        assert fused_r2r_x_grad <= _FUSED_R2R_GRAD_ATOL
-        assert fused_r2r_param_grad <= _FUSED_R2R_GRAD_ATOL
+        _assert_main_grad_similarity(fused_r2r_x_grad_similarity)
+        _assert_main_grad_similarity(fused_r2r_param_grad_similarity)
+        assert fused_r2r_x_grad <= _GLM_X_GRAD_MAX_ABS
+        assert fused_r2r_param_grad <= _GLM_PARAM_GRAD_MAX_ABS
         assert fused_indexer_loss_r2r <= _INDEXER_LOSS_ATOL
     else:
         # Radix top-k is allowed to choose different members at a quantized
@@ -1149,8 +1244,10 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         fused_vs_unfused_output_similarity,
         max_abs=_GLM_FUSED_VS_REFERENCE_OUTPUT_MAX_ABS,
     )
-    assert fused_vs_unfused_x_grad <= _FUSED_VS_REFERENCE_GRAD_ATOL
-    assert fused_vs_unfused_param_grad <= _FUSED_VS_REFERENCE_GRAD_ATOL
+    _assert_main_grad_similarity(fused_vs_unfused_x_grad_similarity)
+    _assert_main_grad_similarity(fused_vs_unfused_param_grad_similarity)
+    assert fused_vs_unfused_x_grad <= _GLM_X_GRAD_MAX_ABS
+    assert fused_vs_unfused_param_grad <= _GLM_PARAM_GRAD_MAX_ABS
 
     print(
         "NON_SKIP_GLM5_DSA_RUN_TO_RUN_ACCEPT_WITH_PROOF "
@@ -1176,6 +1273,8 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         f"fused_r2r_out_max_norm_ratio={fused_r2r_output_extrema['max_norm_ratio']:.6e} "
         f"fused_r2r_x_grad_max_abs={fused_r2r_x_grad:.6e} "
         f"fused_r2r_param_grad_max_abs={fused_r2r_param_grad:.6e} "
+        f"fused_r2r_x_grad_similarity={fused_r2r_x_grad_extrema} "
+        f"fused_r2r_param_grad_similarity={fused_r2r_param_grad_extrema} "
         f"unfused_r2r_out_max_abs={unfused_r2r_out:.6e} "
         f"unfused_r2r_loss_diff={unfused_r2r_loss:.6e} "
         f"unfused_r2r_x_grad_max_abs={unfused_r2r_x_grad:.6e} "
@@ -1187,6 +1286,8 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         f"fused_vs_unfused_out_max_norm_ratio={fused_vs_unfused_output_extrema['max_norm_ratio']:.6e} "
         f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
         f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e} "
+        f"fused_vs_unfused_x_grad_similarity={fused_vs_unfused_x_grad_extrema} "
+        f"fused_vs_unfused_param_grad_similarity={fused_vs_unfused_param_grad_extrema} "
         f"fused_indexer_grad_max_abs={fused_indexer_grad_max_abs:.6e} "
         f"unfused_indexer_grad_max_abs={unfused_indexer_grad_max_abs:.6e}"
         f" min_indexer_grad_cosine={min_indexer_grad_cosine:.6e}"

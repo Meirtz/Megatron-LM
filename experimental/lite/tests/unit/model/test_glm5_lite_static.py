@@ -1003,6 +1003,7 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     assert "model.layers.2.shared_head.norm.weight" in exported
     assert "model.layers.2.input_layernorm.weight" in exported
     assert "model.layers.2.mlp.gate.weight" in exported
+    assert "model.layers.2.mlp.gate.e_score_correction_bias" in exported
 
     save_safetensors(exported, str(tmp_path))
     loaded = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
