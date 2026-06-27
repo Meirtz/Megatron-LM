@@ -176,6 +176,48 @@ def test_dsv4_zero_loss_fused_selector_does_not_create_optimizer_grads():
     assert all(actual is source for actual, source in zip(differentiable, inputs))
 
 
+def test_dsv4_torch_indexer_rotates_query_and_compressed_key(monkeypatch):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from megatron.lite.primitive.modules.attention import csa
+    from megatron.lite.primitive.parallel import ParallelState
+
+    monkeypatch.setattr(csa.te, "RMSNorm", torch.nn.RMSNorm)
+    rotated_shapes = []
+
+    def record_rotation(tensor):
+        rotated_shapes.append(tuple(tensor.shape))
+        return tensor
+
+    monkeypatch.setattr(csa, "rotate_activation", record_rotation)
+    cfg = DeepseekV4Config(
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        qk_rope_head_dim=2,
+        q_lora_rank=4,
+        o_lora_rank=4,
+        o_groups=1,
+        compress_ratios=[4],
+        sliding_window=4,
+        index_head_dim=4,
+        index_n_heads=2,
+        index_topk=1,
+    )
+    module = csa.CompressedSparseAttention(cfg, layer_idx=0, ps=ParallelState())
+    hidden = torch.randn(1, 8, cfg.hidden_size)
+    position_ids = torch.arange(8).unsqueeze(0)
+
+    output = module(hidden, position_ids=position_ids)
+
+    assert output.shape == hidden.shape
+    assert rotated_shapes == [
+        (1, 1, 2, cfg.index_head_dim),
+        (1, cfg.index_n_heads, 8, cfg.index_head_dim),
+    ]
+
+
 def test_topk_router_aux_loss_contributes_gate_gradient(monkeypatch):
     TopKRouter, ParallelState = _router_and_parallel_state(monkeypatch)
     config = _router_config()

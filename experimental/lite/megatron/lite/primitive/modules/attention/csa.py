@@ -467,6 +467,11 @@ class CompressedSparseAttention(nn.Module):
                         .transpose(1, 2)
                     )
                     q_idx = apply_partial_rope(q_idx, idx_cos, idx_sin, self.indexer.rope_head_dim)
+                    # The indexer compressor stores Hadamard-rotated keys for
+                    # the fused kernel.  Rotate the eager query as well: an
+                    # orthonormal transform preserves q·k only when applied to
+                    # both operands.  The fused path below already does this.
+                    q_idx = rotate_activation(q_idx)
                     index_weights = (
                         self.indexer.weights_proj(x).float()
                         * (self.indexer.index_n_heads**-0.5)

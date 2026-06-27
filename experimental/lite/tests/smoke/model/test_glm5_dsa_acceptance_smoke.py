@@ -574,8 +574,17 @@ def _tensor_similarity_metrics(
     assert torch.isfinite(expected_flat).all()
     actual_norm = torch.linalg.vector_norm(actual_flat)
     expected_norm = torch.linalg.vector_norm(expected_flat)
-    assert float(actual_norm.item()) > 0.0
-    assert float(expected_norm.item()) > 0.0
+    actual_norm_value = float(actual_norm.item())
+    expected_norm_value = float(expected_norm.item())
+    if actual_norm_value == 0.0 or expected_norm_value == 0.0:
+        assert actual_norm_value == 0.0 and expected_norm_value == 0.0
+        torch.testing.assert_close(actual_flat, expected_flat, atol=0, rtol=0)
+        return {
+            "cosine": 1.0,
+            "rms_relative": 0.0,
+            "norm_ratio": 1.0,
+            "max_abs": 0.0,
+        }
     cosine = torch.dot(actual_flat, expected_flat) / (actual_norm * expected_norm)
     rms_diff = torch.sqrt(torch.mean((actual_flat - expected_flat).square()))
     rms_expected = torch.sqrt(torch.mean(expected_flat.square()))
@@ -764,9 +773,9 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for GLM5 DSA accept-with-proof smoke.")
 
-    from megatron.lite.primitive.modules.attention import (
+    from megatron.lite.primitive.modules.attention import build_rope_cache
+    from megatron.lite.primitive.modules.attention.dsa import (
         DSAIndexerLossAutoScaler,
-        build_rope_cache,
     )
 
     device = torch.device("cuda", int(torch.cuda.current_device()))
