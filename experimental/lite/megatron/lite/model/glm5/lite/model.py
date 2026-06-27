@@ -188,6 +188,10 @@ class Glm5DSAAttention(nn.Module):
             index_topk_freq=config.index_topk_freq,
             index_skip_topk_offset=config.index_skip_topk_offset,
             indexer_type=config.dsa_indexer_type(layer_idx),
+            index_share_enabled=(
+                config.uses_dsa_index_share and layer_idx < config.num_hidden_layers
+            ),
+            index_share_source_layer=config.dsa_indexer_source_layer(layer_idx) + 1,
             indexer_loss_coeff=config.dsa_indexer_loss_coeff,
             indexer_use_sparse_loss=config.dsa_indexer_use_sparse_loss,
             calculate_per_token_loss=config.calculate_per_token_loss,
@@ -688,25 +692,7 @@ def _apply_attention_backend_override(backend: str | None) -> None:
 
 
 def _dsa_index_share_decoder_layer_groups(config: Glm5Config) -> list[list[int]] | None:
-    if not config.uses_dsa_index_share:
-        return None
-
-    groups: list[list[int]] = []
-    current: list[int] = []
-    current_source: int | None = None
-    for layer_idx in range(config.num_hidden_layers):
-        if config.dsa_indexer_type(layer_idx) == "shared":
-            source_idx = config.dsa_indexer_source_layer(layer_idx)
-        else:
-            source_idx = layer_idx
-        if current and source_idx != current_source:
-            groups.append(current)
-            current = []
-        current.append(layer_idx)
-        current_source = source_idx
-    if current:
-        groups.append(current)
-    return groups
+    return config.dsa_index_share_decoder_layer_groups()
 
 
 class Glm5Model(nn.Module):
@@ -750,7 +736,7 @@ class Glm5Model(nn.Module):
             self.layer_indices,
             topk_freq=config.index_topk_freq,
             skip_topk_offset=config.index_skip_topk_offset,
-            indexer_types=config.indexer_types,
+            indexer_types=list(config.resolved_dsa_indexer_types),
         )
         # GLM-5 does not tie embeddings (no tie_word_embeddings HF field); the
         # attribute is preserved for the dist-opt / distckpt interface.

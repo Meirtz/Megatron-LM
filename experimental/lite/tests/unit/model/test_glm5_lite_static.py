@@ -130,7 +130,7 @@ def test_glm5_config_ignores_null_hf_optional_fields():
     assert cfg.mlp_layer_types is None
 
 
-def test_glm52_config_validates_index_share_schedule():
+def test_glm52_config_uses_explicit_indexer_types_as_canonical_schedule():
     import pytest
 
     from megatron.lite.model.glm5.config import Glm5Config
@@ -145,7 +145,6 @@ def test_glm52_config_validates_index_share_schedule():
         index_topk_freq=4,
         index_skip_topk_offset=3,
         indexer_types=indexer_types,
-        index_share_for_mtp_iteration=True,
     )
 
     assert indexer_types.count("full") == 21
@@ -157,21 +156,96 @@ def test_glm52_config_validates_index_share_schedule():
     assert cfg.dsa_indexer_type(74) == "full"
     assert cfg.dsa_indexer_type(77) == "shared"
     assert cfg.dsa_indexer_source_layer(77) == 74
-    # MTP layer 78 (0-based) is outside trunk indexer_types and is full by
-    # the same global layer-number schedule.
+    # MTP layer 78 (0-based) is outside the backbone-only indexer_types and is
+    # always full.  The serving-only HF index_share_for_mtp_iteration field is
+    # not an architecture schedule input in MLite.
     assert cfg.dsa_indexer_type(78) == "full"
     assert cfg.builds_dsa_indexer(78) is True
-    assert cfg.index_share_for_mtp_iteration is True
 
-    bad_types = list(indexer_types)
-    bad_types[3] = "full"
-    with pytest.raises(ValueError, match="indexer_types\\[3\\]"):
+    custom_types = list(indexer_types)
+    custom_types[3] = "full"
+    custom_cfg = Glm5Config(
+        **{**_tiny_config_kwargs(), "num_hidden_layers": 78},
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=custom_types,
+    )
+    assert custom_cfg.dsa_indexer_type(3) == "full"
+    assert custom_cfg.dsa_indexer_source_layer(4) == 3
+
+    with pytest.raises(ValueError, match="shared before any full source"):
         Glm5Config(
-            **{**_tiny_config_kwargs(), "num_hidden_layers": 78},
-            index_topk_freq=4,
-            index_skip_topk_offset=3,
-            indexer_types=bad_types,
+            **{**_tiny_config_kwargs(), "num_hidden_layers": 3},
+            indexer_types=["shared", "full", "shared"],
         )
+
+
+def test_glm52_config_pattern_precedence_groups_and_all_full_override():
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    pattern_cfg = Glm5Config(
+        **{**_tiny_config_kwargs(), "num_hidden_layers": 6},
+        index_topk_freq=1,
+        index_topk_pattern="FSFSSF",
+    )
+    assert pattern_cfg.resolved_dsa_indexer_types == (
+        "full",
+        "shared",
+        "full",
+        "shared",
+        "shared",
+        "full",
+    )
+    assert pattern_cfg.uses_dsa_index_share is True
+    assert pattern_cfg.dsa_indexer_source_layer(4) == 2
+    assert [pattern_cfg.builds_dsa_indexer(idx) for idx in range(6)] == [
+        True,
+        False,
+        True,
+        False,
+        False,
+        True,
+    ]
+    assert pattern_cfg.dsa_index_share_decoder_layer_groups() == [
+        [0, 1],
+        [2, 3, 4],
+        [5],
+    ]
+
+    # Explicit indexer_types overrides both pattern and a contradictory
+    # freq/offset schedule, matching HF's configuration precedence.
+    all_full_cfg = Glm5Config(
+        **{**_tiny_config_kwargs(), "num_hidden_layers": 6},
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        index_topk_pattern="SSSSSS",
+        indexer_types=["full"] * 6,
+    )
+    assert all_full_cfg.uses_dsa_index_share is False
+    assert all_full_cfg.dsa_index_share_decoder_layer_groups() is None
+
+
+def test_glm52_serving_mtp_share_metadata_is_ignored_and_mtp_is_always_full():
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    cfg = Glm5Config._from_hf_dict(
+        {
+            **_tiny_config_kwargs(),
+            "num_hidden_layers": 4,
+            "num_nextn_predict_layers": 2,
+            "index_topk_freq": 3,
+            "index_skip_topk_offset": 1,
+            "indexer_types": ["full", "shared", "shared", "full"],
+            "index_share_for_mtp_iteration": True,
+        }
+    )
+
+    # The legacy formula would classify global layers 5 and 6 differently;
+    # architecture construction must not apply it to MTP/nextn layers.
+    assert [cfg.dsa_indexer_type(idx) for idx in (4, 5)] == ["full", "full"]
+    assert [cfg.dsa_indexer_source_layer(idx) for idx in (4, 5)] == [4, 5]
+    assert [cfg.builds_dsa_indexer(idx) for idx in (4, 5)] == [True, True]
+    assert "index_share_for_mtp_iteration" not in cfg.to_dict()
 
 
 def test_glm5_config_preserves_mtp_aliases_and_layer_types():
@@ -437,18 +511,20 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
         },
         index_topk_freq=4,
         index_skip_topk_offset=3,
-        indexer_types=_glm52_indexer_types(num_layers=6),
+        # Deliberately differs from freq/offset: module construction must obey
+        # the explicit HF list, not the legacy inferred schedule.
+        indexer_types=["full", "shared", "full", "shared", "shared", "full"],
     )
     model = _make_glm5_model(cfg, mtp_enable=True)
     attention_modules = [layer.self_attention.self_attention for layer in model.layers]
 
     assert [module.indexer is not None for module in attention_modules] == [
         True,
+        False,
         True,
+        False,
+        False,
         True,
-        False,
-        False,
-        False,
     ]
     assert model.mtp is not None
     mtp_attention = model.mtp.layers[0].transformer_layer.self_attention.self_attention
@@ -456,8 +532,10 @@ def test_glm52_index_share_shared_layers_omit_indexer_modules():
     assert mtp_attention.indexer is not None
 
     keys = set(model.state_dict())
+    assert "layers.1.self_attention.self_attention.indexer.wq_b.weight" not in keys
     assert "layers.2.self_attention.self_attention.indexer.wq_b.weight" in keys
     assert "layers.3.self_attention.self_attention.indexer.wq_b.weight" not in keys
+    assert "layers.5.self_attention.self_attention.indexer.wq_b.weight" in keys
     assert (
         "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight" in keys
     )
@@ -572,9 +650,12 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
 
 def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
     import importlib.util
+    import pytest
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
+
+    pytest.importorskip("safetensors")
 
     checkpoint_path = (
         Path(__file__).resolve().parents[3]
@@ -598,8 +679,9 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
         },
         index_topk_freq=4,
         index_skip_topk_offset=3,
-        indexer_types=_glm52_indexer_types(num_layers=6),
-        index_share_for_mtp_iteration=True,
+        # Deliberately differs from freq/offset: checkpoint presence must obey
+        # the explicit HF list, not the legacy inferred schedule.
+        indexer_types=["full", "shared", "full", "shared", "shared", "full"],
     )
     spec = checkpoint_module.Glm5WeightSpec(cfg)
     tensor = torch.ones(1)
@@ -611,6 +693,13 @@ def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
         spec.native_to_hf("layers.3.self_attention.self_attention.indexer.wq_b.weight", tensor)
         == []
     )
+    assert (
+        spec.native_to_hf("layers.1.self_attention.self_attention.indexer.wq_b.weight", tensor)
+        == []
+    )
+    assert spec.native_to_hf(
+        "layers.5.self_attention.self_attention.indexer.wq_b.weight", tensor
+    ) == [("model.layers.5.self_attn.indexer.wq_b.weight", tensor)]
     assert spec.native_to_hf(
         "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight",
         tensor,
@@ -670,7 +759,6 @@ def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(tmp
         index_topk_freq=4,
         index_skip_topk_offset=3,
         indexer_types=_glm52_indexer_types(num_layers=6),
-        index_share_for_mtp_iteration=True,
     )
     ps = ParallelState()
     model = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
