@@ -598,33 +598,45 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
     _assert_params_bitwise_equal(saved, loaded)
 
     # A checkpoint is not resume-ready merely because model tensors reload.
-    # Require optimizer moments/steps and distributed-optimizer master weights
-    # to match before the resumed update, then run the exact same next batch and
-    # prove uninterrupted and resumed training remain bitwise identical.
-    _assert_named_bitwise_equal(
+    # Require non-empty optimizer moments/steps and, where the backend exposes
+    # them, non-empty distributed-optimizer master weights to match before the
+    # resumed update. Then prove the exact next batch remains bitwise identical.
+    _assert_nonempty_named_bitwise_equal(
         _opt_state_snapshot(saved, backend),
         _opt_state_snapshot(loaded, backend),
         f"{model_name}/{backend} optimizer state after load",
     )
-    _assert_named_bitwise_equal(
-        _optimizer_master_snapshot(saved, backend),
-        _optimizer_master_snapshot(loaded, backend),
-        f"{model_name}/{backend} optimizer master weights after load",
-    )
+    saved_master = _optimizer_master_snapshot(saved, backend)
+    loaded_master = _optimizer_master_snapshot(loaded, backend)
+    if backend == "dist_opt":
+        _assert_nonempty_named_bitwise_equal(
+            saved_master,
+            loaded_master,
+            f"{model_name}/{backend} optimizer master weights after load",
+        )
+        master_weights_evidence = "nonempty_exact"
+    else:
+        assert saved_master == loaded_master == {}
+        master_weights_evidence = "not_applicable"
     resume_batch = _random_packed_batch(cfg.vocab_size)
     _train_step(saved, backend, cfg, batch=resume_batch, seed=20260628)
     _train_step(loaded, backend, cfg, batch=resume_batch, seed=20260628)
     _assert_params_bitwise_equal(saved, loaded)
-    _assert_named_bitwise_equal(
+    _assert_nonempty_named_bitwise_equal(
         _opt_state_snapshot(saved, backend),
         _opt_state_snapshot(loaded, backend),
         f"{model_name}/{backend} optimizer state after resumed step",
     )
-    _assert_named_bitwise_equal(
-        _optimizer_master_snapshot(saved, backend),
-        _optimizer_master_snapshot(loaded, backend),
-        f"{model_name}/{backend} optimizer master weights after resumed step",
-    )
+    resumed_saved_master = _optimizer_master_snapshot(saved, backend)
+    resumed_loaded_master = _optimizer_master_snapshot(loaded, backend)
+    if backend == "dist_opt":
+        _assert_nonempty_named_bitwise_equal(
+            resumed_saved_master,
+            resumed_loaded_master,
+            f"{model_name}/{backend} optimizer master weights after resumed step",
+        )
+    else:
+        assert resumed_saved_master == resumed_loaded_master == {}
     from megatron.lite.primitive.parallel import (
         validate_mtp_embedding_parameter_replicas,
     )
@@ -639,9 +651,10 @@ def test_save_load_roundtrip(model_name, backend, tmp_path):
     if dist.get_rank() == 0:
         print(
             "NON_SKIP_DISTRIBUTED_CHECKPOINT_RESUME_EXACT "
-            f"model={model_name} backend={backend} model_params=True "
-            "optimizer_state=True master_weights=True next_step=True "
-            "mtp_embedding_replicas=True"
+            f"model={model_name} backend={backend} model_params=nonempty_exact "
+            "optimizer_state=nonempty_exact "
+            f"master_weights={master_weights_evidence} next_step=bitwise_exact "
+            "mtp_embedding_replicas=validated_when_enabled"
         )
 
 
@@ -780,6 +793,12 @@ def _assert_named_bitwise_equal(lhs: dict, rhs: dict, label: str) -> None:
     assert not mismatches, f"{label} not bitwise after offload/onload:\n" + "\n".join(
         mismatches
     )
+
+
+def _assert_nonempty_named_bitwise_equal(lhs: dict, rhs: dict, label: str) -> None:
+    assert lhs, f"{label} left snapshot is empty; exactness would be vacuous."
+    assert rhs, f"{label} right snapshot is empty; exactness would be vacuous."
+    _assert_named_bitwise_equal(lhs, rhs, label)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
