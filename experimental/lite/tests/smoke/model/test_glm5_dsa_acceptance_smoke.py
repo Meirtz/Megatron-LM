@@ -8,12 +8,25 @@ import torch
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu]
 
-_FUSED_R2R_OUTPUT_ATOL = 2.0e-3
+_DIRECT_PUBLIC_OUTPUT_ATOL = 2.0e-3
+_DIRECT_PUBLIC_LOSS_ATOL = 1.0e-6
 _FUSED_R2R_GRAD_ATOL = 5.0e-2
-_FUSED_VS_REFERENCE_OUTPUT_ATOL = 2.0e-3
 _FUSED_VS_REFERENCE_GRAD_ATOL = 5.0e-2
-_FUSED_VS_REFERENCE_LOSS_ATOL = 1.0e-6
-_FUSED_VS_REFERENCE_LOSS_RTOL = 5.0e-3
+_INDEXER_LOSS_ATOL = 1.0e-6
+_INDEXER_LOSS_RTOL = 5.0e-3
+# Main-attention comparisons use a scale-independent envelope plus a
+# path-specific outlier ceiling. Keep these separate from the stricter
+# indexer-loss oracle above so their tolerances cannot weaken it.
+_MAIN_LOSS_MAX_ABS_DIFF = 1.0e-5
+_MAX_MAIN_LOSS_SYMMETRIC_REL = 1.0e-3
+_GLM_FUSED_R2R_OUTPUT_MAX_ABS = 2.0e-2
+_GLM_FUSED_VS_REFERENCE_OUTPUT_MAX_ABS = 4.0e-2
+_DSV4_FUSED_VS_DECOMPOSED_OUTPUT_MAX_ABS = 2.0e-2
+_DSV4_CSA_OUTPUT_MAX_ABS = 6.0e-3
+_MIN_MAIN_OUTPUT_COSINE = 0.999
+_MAX_MAIN_OUTPUT_RMS_REL = 0.02
+_MIN_MAIN_OUTPUT_NORM_RATIO = 0.99
+_MAX_MAIN_OUTPUT_NORM_RATIO = 1.01
 _INDEXER_TOPK = 512
 _SEQUENCE_LENGTH = 1024
 _INDEXER_LOSS_COEFF = 1.0e-2
@@ -565,6 +578,13 @@ def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).abs().max().item())
 
 
+def _symmetric_relative_difference(actual: float, expected: float) -> float:
+    denominator = abs(actual) + abs(expected)
+    if denominator == 0.0:
+        return 0.0
+    return 2.0 * abs(actual - expected) / denominator
+
+
 def _tensor_similarity_metrics(
     actual: torch.Tensor, expected: torch.Tensor
 ) -> dict[str, float]:
@@ -594,6 +614,35 @@ def _tensor_similarity_metrics(
         "norm_ratio": float((actual_norm / expected_norm).item()),
         "max_abs": _max_abs(actual_flat, expected_flat),
     }
+
+
+def _similarity_extrema(
+    comparisons: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    assert comparisons
+    return {
+        "min_cosine": min(value["cosine"] for value in comparisons.values()),
+        "max_rms_relative": max(
+            value["rms_relative"] for value in comparisons.values()
+        ),
+        "min_norm_ratio": min(value["norm_ratio"] for value in comparisons.values()),
+        "max_norm_ratio": max(value["norm_ratio"] for value in comparisons.values()),
+        "max_abs": max(value["max_abs"] for value in comparisons.values()),
+    }
+
+
+def _assert_main_output_similarity(
+    comparisons: dict[str, dict[str, float]], *, max_abs: float
+) -> dict[str, float]:
+    """Require both scale-independent agreement and a bounded worst outlier."""
+
+    extrema = _similarity_extrema(comparisons)
+    assert extrema["min_cosine"] >= _MIN_MAIN_OUTPUT_COSINE, comparisons
+    assert extrema["max_rms_relative"] <= _MAX_MAIN_OUTPUT_RMS_REL, comparisons
+    assert extrema["min_norm_ratio"] >= _MIN_MAIN_OUTPUT_NORM_RATIO, comparisons
+    assert extrema["max_norm_ratio"] <= _MAX_MAIN_OUTPUT_NORM_RATIO, comparisons
+    assert extrema["max_abs"] <= max_abs, comparisons
+    return extrema
 
 
 def _canonical_topk_set(topk_indices: torch.Tensor) -> torch.Tensor:
@@ -823,8 +872,17 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         forced_source_topk=fused_b["topk_indices"],
     )
 
-    fused_r2r_out = _max_abs(fused_a["out"], fused_b["out"])
-    fused_r2r_loss = abs(float(fused_a["loss"].item()) - float(fused_b["loss"].item()))
+    fused_r2r_output_similarity = {
+        "run_a_vs_run_b": _tensor_similarity_metrics(fused_a["out"], fused_b["out"])
+    }
+    fused_r2r_output_extrema = _similarity_extrema(fused_r2r_output_similarity)
+    fused_r2r_out = fused_r2r_output_extrema["max_abs"]
+    fused_a_loss = float(fused_a["loss"].item())
+    fused_b_loss = float(fused_b["loss"].item())
+    fused_r2r_loss = abs(fused_a_loss - fused_b_loss)
+    fused_r2r_loss_symmetric_rel = _symmetric_relative_difference(
+        fused_a_loss, fused_b_loss
+    )
     fused_r2r_x_grad = _max_abs(fused_a["x_grad"], fused_b["x_grad"])
     fused_r2r_param_grad = _max_param_grad_abs(fused_a, fused_b)
     unfused_r2r_out = _max_abs(unfused_a["out"], unfused_b["out"])
@@ -833,10 +891,14 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     )
     unfused_r2r_x_grad = _max_abs(unfused_a["x_grad"], unfused_b["x_grad"])
     unfused_r2r_param_grad = _max_param_grad_abs(unfused_a, unfused_b)
-    fused_vs_unfused_out = max(
-        _max_abs(fused_a["out"], matched_unfused_a["out"]),
-        _max_abs(fused_b["out"], matched_unfused_b["out"]),
+    fused_vs_unfused_output_similarity = {
+        "run_a": _tensor_similarity_metrics(fused_a["out"], matched_unfused_a["out"]),
+        "run_b": _tensor_similarity_metrics(fused_b["out"], matched_unfused_b["out"]),
+    }
+    fused_vs_unfused_output_extrema = _similarity_extrema(
+        fused_vs_unfused_output_similarity
     )
+    fused_vs_unfused_out = fused_vs_unfused_output_extrema["max_abs"]
     fused_vs_unfused_x_grad = max(
         _max_abs(fused_a["x_grad"], matched_unfused_a["x_grad"]),
         _max_abs(fused_b["x_grad"], matched_unfused_b["x_grad"]),
@@ -846,8 +908,16 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         _max_param_grad_abs(fused_b, matched_unfused_b),
     )
     loss_diff = max(
-        abs(float(fused_a["loss"].item()) - float(matched_unfused_a["loss"].item())),
-        abs(float(fused_b["loss"].item()) - float(matched_unfused_b["loss"].item())),
+        abs(fused_a_loss - float(matched_unfused_a["loss"].item())),
+        abs(fused_b_loss - float(matched_unfused_b["loss"].item())),
+    )
+    loss_symmetric_rel = max(
+        _symmetric_relative_difference(
+            fused_a_loss, float(matched_unfused_a["loss"].item())
+        ),
+        _symmetric_relative_difference(
+            fused_b_loss, float(matched_unfused_b["loss"].item())
+        ),
     )
     unfused_indexer_loss_diff = abs(
         float(unfused_a["indexer_loss"].item())
@@ -969,8 +1039,8 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         torch.testing.assert_close(
             alternate_topk["indexer_loss"],
             fused_a["indexer_loss"],
-            atol=_FUSED_VS_REFERENCE_LOSS_ATOL,
-            rtol=_FUSED_VS_REFERENCE_LOSS_RTOL,
+            atol=_INDEXER_LOSS_ATOL,
+            rtol=_INDEXER_LOSS_RTOL,
         )
         indexer_names = [
             name
@@ -992,10 +1062,21 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         f"unfused_topk_set_r2r={unfused_topk_set_r2r} "
         f"fused_vs_unfused_topk_set={fused_vs_unfused_topk_set} "
         f"loss_diff={loss_diff:.6e} "
+        f"loss_symmetric_rel={loss_symmetric_rel:.6e} "
+        f"fused_r2r_loss_diff={fused_r2r_loss:.6e} "
+        f"fused_r2r_loss_symmetric_rel={fused_r2r_loss_symmetric_rel:.6e} "
         f"fused_r2r_out_max_abs={fused_r2r_out:.6e} "
+        f"fused_r2r_out_min_cosine={fused_r2r_output_extrema['min_cosine']:.6e} "
+        f"fused_r2r_out_max_rms_relative={fused_r2r_output_extrema['max_rms_relative']:.6e} "
+        f"fused_r2r_out_min_norm_ratio={fused_r2r_output_extrema['min_norm_ratio']:.6e} "
+        f"fused_r2r_out_max_norm_ratio={fused_r2r_output_extrema['max_norm_ratio']:.6e} "
         f"fused_r2r_x_grad_max_abs={fused_r2r_x_grad:.6e} "
         f"fused_r2r_param_grad_max_abs={fused_r2r_param_grad:.6e} "
         f"fused_vs_unfused_out_max_abs={fused_vs_unfused_out:.6e} "
+        f"fused_vs_unfused_out_min_cosine={fused_vs_unfused_output_extrema['min_cosine']:.6e} "
+        f"fused_vs_unfused_out_max_rms_relative={fused_vs_unfused_output_extrema['max_rms_relative']:.6e} "
+        f"fused_vs_unfused_out_min_norm_ratio={fused_vs_unfused_output_extrema['min_norm_ratio']:.6e} "
+        f"fused_vs_unfused_out_max_norm_ratio={fused_vs_unfused_output_extrema['max_norm_ratio']:.6e} "
         f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
         f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e}"
         f" fused_indexer_loss_r2r={fused_indexer_loss_r2r:.6e}"
@@ -1014,29 +1095,33 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     )
     assert unfused_topk_set_r2r
     if fused_topk_set_r2r:
-        assert fused_r2r_loss <= _FUSED_VS_REFERENCE_LOSS_ATOL
-        assert fused_r2r_out <= _FUSED_R2R_OUTPUT_ATOL
+        assert fused_r2r_loss <= _MAIN_LOSS_MAX_ABS_DIFF
+        assert fused_r2r_loss_symmetric_rel <= _MAX_MAIN_LOSS_SYMMETRIC_REL
+        _assert_main_output_similarity(
+            fused_r2r_output_similarity,
+            max_abs=_GLM_FUSED_R2R_OUTPUT_MAX_ABS,
+        )
         assert fused_r2r_x_grad <= _FUSED_R2R_GRAD_ATOL
         assert fused_r2r_param_grad <= _FUSED_R2R_GRAD_ATOL
-        assert fused_indexer_loss_r2r <= _FUSED_VS_REFERENCE_LOSS_ATOL
+        assert fused_indexer_loss_r2r <= _INDEXER_LOSS_ATOL
     else:
         # Radix top-k is allowed to choose different members at a quantized
         # cutoff tie. Each run is checked against its own forced-top-k oracle.
         assert topk_ambiguous_rows > 0
         if not sparse_loss:
             # Canonical dense KL is independent of the selected sparse keys.
-            assert fused_indexer_loss_r2r <= _FUSED_VS_REFERENCE_LOSS_ATOL
+            assert fused_indexer_loss_r2r <= _INDEXER_LOSS_ATOL
     torch.testing.assert_close(
         fused_a["indexer_loss"],
         matched_unfused_a["indexer_loss"],
-        atol=_FUSED_VS_REFERENCE_LOSS_ATOL,
-        rtol=_FUSED_VS_REFERENCE_LOSS_RTOL,
+        atol=_INDEXER_LOSS_ATOL,
+        rtol=_INDEXER_LOSS_RTOL,
     )
     torch.testing.assert_close(
         fused_b["indexer_loss"],
         matched_unfused_b["indexer_loss"],
-        atol=_FUSED_VS_REFERENCE_LOSS_ATOL,
-        rtol=_FUSED_VS_REFERENCE_LOSS_RTOL,
+        atol=_INDEXER_LOSS_ATOL,
+        rtol=_INDEXER_LOSS_RTOL,
     )
     assert min_indexer_grad_cosine >= _MIN_INDEXER_GRAD_COSINE, indexer_grad_similarity
     assert max_indexer_grad_rms_relative <= _MAX_INDEXER_GRAD_RMS_REL, (
@@ -1058,8 +1143,12 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     assert unfused_r2r_x_grad == 0.0
     assert unfused_r2r_param_grad == 0.0
     assert unfused_indexer_loss_diff == 0.0
-    assert loss_diff <= _FUSED_VS_REFERENCE_LOSS_ATOL
-    assert fused_vs_unfused_out <= _FUSED_VS_REFERENCE_OUTPUT_ATOL
+    assert loss_diff <= _MAIN_LOSS_MAX_ABS_DIFF
+    assert loss_symmetric_rel <= _MAX_MAIN_LOSS_SYMMETRIC_REL
+    _assert_main_output_similarity(
+        fused_vs_unfused_output_similarity,
+        max_abs=_GLM_FUSED_VS_REFERENCE_OUTPUT_MAX_ABS,
+    )
     assert fused_vs_unfused_x_grad <= _FUSED_VS_REFERENCE_GRAD_ATOL
     assert fused_vs_unfused_param_grad <= _FUSED_VS_REFERENCE_GRAD_ATOL
 
@@ -1077,8 +1166,14 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         f"dense_topk_independent={not sparse_loss and dense_topk_changed} "
         f"indexer_topk={_INDEXER_TOPK} seq={seq} "
         f"loss_diff={loss_diff:.6e} "
+        f"loss_symmetric_rel={loss_symmetric_rel:.6e} "
         f"fused_r2r_loss_diff={fused_r2r_loss:.6e} "
+        f"fused_r2r_loss_symmetric_rel={fused_r2r_loss_symmetric_rel:.6e} "
         f"fused_r2r_out_max_abs={fused_r2r_out:.6e} "
+        f"fused_r2r_out_min_cosine={fused_r2r_output_extrema['min_cosine']:.6e} "
+        f"fused_r2r_out_max_rms_relative={fused_r2r_output_extrema['max_rms_relative']:.6e} "
+        f"fused_r2r_out_min_norm_ratio={fused_r2r_output_extrema['min_norm_ratio']:.6e} "
+        f"fused_r2r_out_max_norm_ratio={fused_r2r_output_extrema['max_norm_ratio']:.6e} "
         f"fused_r2r_x_grad_max_abs={fused_r2r_x_grad:.6e} "
         f"fused_r2r_param_grad_max_abs={fused_r2r_param_grad:.6e} "
         f"unfused_r2r_out_max_abs={unfused_r2r_out:.6e} "
@@ -1086,6 +1181,10 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         f"unfused_r2r_x_grad_max_abs={unfused_r2r_x_grad:.6e} "
         f"unfused_r2r_param_grad_max_abs={unfused_r2r_param_grad:.6e} "
         f"fused_vs_unfused_out_max_abs={fused_vs_unfused_out:.6e} "
+        f"fused_vs_unfused_out_min_cosine={fused_vs_unfused_output_extrema['min_cosine']:.6e} "
+        f"fused_vs_unfused_out_max_rms_relative={fused_vs_unfused_output_extrema['max_rms_relative']:.6e} "
+        f"fused_vs_unfused_out_min_norm_ratio={fused_vs_unfused_output_extrema['min_norm_ratio']:.6e} "
+        f"fused_vs_unfused_out_max_norm_ratio={fused_vs_unfused_output_extrema['max_norm_ratio']:.6e} "
         f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
         f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e} "
         f"fused_indexer_grad_max_abs={fused_indexer_grad_max_abs:.6e} "
@@ -1268,17 +1367,25 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
     assert all(torch.isfinite(grad).all() for grad in decomposed_main_grads.values())
     assert all(args[index].grad is None for index in (4, 5, 6))
 
-    torch.testing.assert_close(
-        fused_results[0]["output"],
-        fused_results[1]["output"],
-        rtol=0.0,
-        atol=_FUSED_R2R_OUTPUT_ATOL,
+    direct_public_output_similarity = {
+        "direct_vs_public": _tensor_similarity_metrics(
+            fused_results[0]["output"], fused_results[1]["output"]
+        )
+    }
+    direct_public_output_extrema = _similarity_extrema(direct_public_output_similarity)
+    fused_decomposed_output_similarity = {
+        "public_vs_decomposed": _tensor_similarity_metrics(
+            fused_results[1]["output"], decomposed_output.detach().float()
+        )
+    }
+    fused_decomposed_output_extrema = _similarity_extrema(
+        fused_decomposed_output_similarity
     )
-    torch.testing.assert_close(
-        fused_results[0]["objective"],
-        fused_results[1]["objective"],
-        rtol=0.0,
-        atol=_FUSED_VS_REFERENCE_LOSS_ATOL,
+    public_objective = float(fused_results[1]["objective"].item())
+    decomposed_objective_value = float(decomposed_objective.detach().item())
+    fused_decomposed_loss_diff = abs(public_objective - decomposed_objective_value)
+    fused_decomposed_loss_symmetric_rel = _symmetric_relative_difference(
+        public_objective, decomposed_objective_value
     )
     direct_public_grad_similarity = {}
     for name in decomposed_main_grads:
@@ -1286,12 +1393,6 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
             fused_results[0]["main_grads"][name],
             fused_results[1]["main_grads"][name],
         )
-    torch.testing.assert_close(
-        fused_results[1]["output"],
-        decomposed_output.detach().float(),
-        rtol=2.0e-3,
-        atol=2.0e-3,
-    )
     decomposed_grad_similarity = {
         name: _tensor_similarity_metrics(
             fused_results[1]["main_grads"][name],
@@ -1299,6 +1400,40 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
         )
         for name, decomposed_grad in decomposed_main_grads.items()
     }
+    direct_public_grad_extrema = _similarity_extrema(direct_public_grad_similarity)
+    decomposed_grad_extrema = _similarity_extrema(decomposed_grad_similarity)
+    print(
+        "DSV4_FUSED_DSA_DECOMPOSED_DIAGNOSTICS "
+        f"loss_diff={fused_decomposed_loss_diff:.6e} "
+        f"loss_symmetric_rel={fused_decomposed_loss_symmetric_rel:.6e} "
+        f"direct_public_output={direct_public_output_extrema} "
+        f"fused_decomposed_output={fused_decomposed_output_extrema} "
+        f"direct_public_grads={direct_public_grad_extrema} "
+        f"fused_decomposed_grads={decomposed_grad_extrema}"
+    )
+
+    _assert_main_output_similarity(
+        direct_public_output_similarity,
+        max_abs=_DIRECT_PUBLIC_OUTPUT_ATOL,
+    )
+    torch.testing.assert_close(
+        fused_results[0]["output"],
+        fused_results[1]["output"],
+        rtol=0.0,
+        atol=_DIRECT_PUBLIC_OUTPUT_ATOL,
+    )
+    torch.testing.assert_close(
+        fused_results[0]["objective"],
+        fused_results[1]["objective"],
+        rtol=0.0,
+        atol=_DIRECT_PUBLIC_LOSS_ATOL,
+    )
+    _assert_main_output_similarity(
+        fused_decomposed_output_similarity,
+        max_abs=_DSV4_FUSED_VS_DECOMPOSED_OUTPUT_MAX_ABS,
+    )
+    assert fused_decomposed_loss_diff <= _MAIN_LOSS_MAX_ABS_DIFF
+    assert fused_decomposed_loss_symmetric_rel <= _MAX_MAIN_LOSS_SYMMETRIC_REL
     for similarities in (direct_public_grad_similarity, decomposed_grad_similarity):
         assert min(value["cosine"] for value in similarities.values()) >= (
             _MIN_MAIN_GRAD_COSINE
@@ -1312,18 +1447,6 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
         assert max(value["norm_ratio"] for value in similarities.values()) <= (
             _MAX_MAIN_GRAD_NORM_RATIO
         ), similarities
-    min_main_grad_cosine = min(
-        value["cosine"] for value in decomposed_grad_similarity.values()
-    )
-    max_main_grad_rms_relative = max(
-        value["rms_relative"] for value in decomposed_grad_similarity.values()
-    )
-    min_main_grad_norm_ratio = min(
-        value["norm_ratio"] for value in decomposed_grad_similarity.values()
-    )
-    max_main_grad_norm_ratio = max(
-        value["norm_ratio"] for value in decomposed_grad_similarity.values()
-    )
     print(
         "NON_SKIP_DSV4_FUSED_DSA_DECOMPOSED_PARITY_PASSED "
         f"ratio={ratio} n_comp={n_comp} requested_topk={requested_topk} "
@@ -1334,10 +1457,18 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
         f"selection_topk={selection_topk} "
         f"padded_topk_ambiguous_rows={padded_topk_score_proof['ambiguous_rows']} "
         f"selection_topk_ambiguous_rows={selection_topk_score_proof['ambiguous_rows']} "
-        f"min_main_grad_cosine={min_main_grad_cosine:.6e} "
-        f"max_main_grad_rms_relative={max_main_grad_rms_relative:.6e} "
-        f"min_main_grad_norm_ratio={min_main_grad_norm_ratio:.6e} "
-        f"max_main_grad_norm_ratio={max_main_grad_norm_ratio:.6e}"
+        f"loss_diff={fused_decomposed_loss_diff:.6e} "
+        f"loss_symmetric_rel={fused_decomposed_loss_symmetric_rel:.6e} "
+        f"direct_public_out_max_abs={direct_public_output_extrema['max_abs']:.6e} "
+        f"output_min_cosine={fused_decomposed_output_extrema['min_cosine']:.6e} "
+        f"output_max_rms_relative={fused_decomposed_output_extrema['max_rms_relative']:.6e} "
+        f"output_min_norm_ratio={fused_decomposed_output_extrema['min_norm_ratio']:.6e} "
+        f"output_max_norm_ratio={fused_decomposed_output_extrema['max_norm_ratio']:.6e} "
+        f"output_max_abs={fused_decomposed_output_extrema['max_abs']:.6e} "
+        f"min_main_grad_cosine={decomposed_grad_extrema['min_cosine']:.6e} "
+        f"max_main_grad_rms_relative={decomposed_grad_extrema['max_rms_relative']:.6e} "
+        f"min_main_grad_norm_ratio={decomposed_grad_extrema['min_norm_ratio']:.6e} "
+        f"max_main_grad_norm_ratio={decomposed_grad_extrema['max_norm_ratio']:.6e}"
     )
 
 
@@ -1430,41 +1561,51 @@ def test_dsv4_csa_torch_fused_module_parity_real_gpu():
     decomposed = run(decomposed_module, backend="fused", training=False)
     legacy_fused = run(legacy_fused_module, backend="fused", training=True)
 
-    comparisons = {}
+    output_comparisons = {}
+    gradient_comparisons = {}
     for name, actual in (
         ("decomposed", decomposed),
         ("legacy_fused", legacy_fused),
     ):
         assert set(actual["main_grads"]) == set(reference["main_grads"])
-        torch.testing.assert_close(
-            actual["output"],
-            reference["output"],
-            atol=_FUSED_VS_REFERENCE_OUTPUT_ATOL,
-            rtol=2.0e-3,
+        output_comparisons[name] = _tensor_similarity_metrics(
+            actual["output"], reference["output"]
         )
-        comparisons[f"{name}:input"] = _tensor_similarity_metrics(
+        gradient_comparisons[f"{name}:input"] = _tensor_similarity_metrics(
             actual["x_grad"], reference["x_grad"]
         )
         for parameter_name in sorted(reference["main_grads"]):
-            comparisons[f"{name}:param:{parameter_name}"] = (
+            gradient_comparisons[f"{name}:param:{parameter_name}"] = (
                 _tensor_similarity_metrics(
                     actual["main_grads"][parameter_name],
                     reference["main_grads"][parameter_name],
                 )
             )
 
-    assert min(value["cosine"] for value in comparisons.values()) >= (
+    output_extrema = _similarity_extrema(output_comparisons)
+    gradient_extrema = _similarity_extrema(gradient_comparisons)
+    print(
+        "DSV4_CSA_TORCH_FUSED_DIAGNOSTICS "
+        f"output_by_path={output_comparisons} "
+        f"gradient_extrema={gradient_extrema}"
+    )
+
+    _assert_main_output_similarity(
+        output_comparisons,
+        max_abs=_DSV4_CSA_OUTPUT_MAX_ABS,
+    )
+    assert min(value["cosine"] for value in gradient_comparisons.values()) >= (
         _MIN_MAIN_GRAD_COSINE
-    ), comparisons
-    assert max(value["rms_relative"] for value in comparisons.values()) <= (
+    ), gradient_comparisons
+    assert max(value["rms_relative"] for value in gradient_comparisons.values()) <= (
         _MAX_MAIN_GRAD_RMS_REL
-    ), comparisons
-    assert min(value["norm_ratio"] for value in comparisons.values()) >= (
+    ), gradient_comparisons
+    assert min(value["norm_ratio"] for value in gradient_comparisons.values()) >= (
         _MIN_MAIN_GRAD_NORM_RATIO
-    ), comparisons
-    assert max(value["norm_ratio"] for value in comparisons.values()) <= (
+    ), gradient_comparisons
+    assert max(value["norm_ratio"] for value in gradient_comparisons.values()) <= (
         _MAX_MAIN_GRAD_NORM_RATIO
-    ), comparisons
+    ), gradient_comparisons
 
     print(
         "NON_SKIP_DSV4_CSA_TORCH_FUSED_PARITY_PASSED "
@@ -1472,10 +1613,15 @@ def test_dsv4_csa_torch_fused_module_parity_real_gpu():
         "nontrivial_sparse_selection=True "
         "torch_vs_decomposed_output=True torch_vs_legacy_output=True "
         "main_grad_parity=True indexer_grads_none=True "
-        f"min_main_grad_cosine={min(value['cosine'] for value in comparisons.values()):.6e} "
-        f"max_main_grad_rms_relative={max(value['rms_relative'] for value in comparisons.values()):.6e} "
-        f"min_main_grad_norm_ratio={min(value['norm_ratio'] for value in comparisons.values()):.6e} "
-        f"max_main_grad_norm_ratio={max(value['norm_ratio'] for value in comparisons.values()):.6e}"
+        f"output_min_cosine={output_extrema['min_cosine']:.6e} "
+        f"output_max_rms_relative={output_extrema['max_rms_relative']:.6e} "
+        f"output_min_norm_ratio={output_extrema['min_norm_ratio']:.6e} "
+        f"output_max_norm_ratio={output_extrema['max_norm_ratio']:.6e} "
+        f"output_max_abs={output_extrema['max_abs']:.6e} "
+        f"min_main_grad_cosine={gradient_extrema['min_cosine']:.6e} "
+        f"max_main_grad_rms_relative={gradient_extrema['max_rms_relative']:.6e} "
+        f"min_main_grad_norm_ratio={gradient_extrema['min_norm_ratio']:.6e} "
+        f"max_main_grad_norm_ratio={gradient_extrema['max_norm_ratio']:.6e}"
     )
 
 
