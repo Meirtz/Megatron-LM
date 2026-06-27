@@ -61,6 +61,7 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     roll_packed_thd_left,
     scatter_to_sequence_parallel,
+    zigzag_position_ids_for_cp,
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
 from megatron.lite.primitive.utils.moe import (
@@ -221,11 +222,19 @@ class Glm5DSAAttention(nn.Module):
             # Compatibility fallback for direct callers that do not provide
             # positions. Packed/runtime paths pass their per-sequence positions
             # explicitly so resets at packed boundaries are preserved.
-            position_ids = (
-                torch.arange(seq_len, device=x_bsh.device, dtype=torch.long)
-                .unsqueeze(0)
-                .expand(batch, -1)
-            )
+            if self.ps.cp_size > 1:
+                position_ids = zigzag_position_ids_for_cp(
+                    seq_len * self.ps.cp_size,
+                    self.ps.cp_rank,
+                    self.ps.cp_size,
+                    x_bsh.device,
+                ).expand(batch, -1)
+            else:
+                position_ids = (
+                    torch.arange(seq_len, device=x_bsh.device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(batch, -1)
+                )
         else:
             if position_ids.dim() == 1:
                 position_ids = position_ids.unsqueeze(0)

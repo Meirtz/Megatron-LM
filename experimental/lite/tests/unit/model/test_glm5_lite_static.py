@@ -338,6 +338,8 @@ def test_glm51_gate_off_preserves_legacy_rope_layout(
 def test_glm5_dsa_attention_preserves_explicit_packed_position_resets(
     transformer_engine_import_stub,
 ):
+    from types import SimpleNamespace
+
     import torch
     import torch.nn as nn
 
@@ -362,6 +364,7 @@ def test_glm5_dsa_attention_preserves_explicit_packed_position_resets(
 
     attention = Glm5DSAAttention.__new__(Glm5DSAAttention)
     nn.Module.__init__(attention)
+    attention.ps = SimpleNamespace(cp_size=1, cp_rank=0)
     attention.qk_rope_head_dim = 4
     attention.rope_theta = 10_000.0
     capture = CaptureDSA()
@@ -395,6 +398,49 @@ def test_glm5_dsa_attention_preserves_explicit_packed_position_resets(
     assert torch.equal(
         capture.calls[1]["position_ids"], torch.arange(6).unsqueeze(0)
     )
+
+
+def test_glm5_dsa_attention_generates_global_zigzag_positions_for_cp(
+    transformer_engine_import_stub,
+):
+    from types import SimpleNamespace
+
+    import torch
+    import torch.nn as nn
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.lite.model import Glm5DSAAttention
+    from megatron.lite.primitive.parallel import zigzag_position_ids_for_cp
+
+    class CaptureDSA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.position_ids = None
+
+        def forward(self, x, **kwargs):
+            self.position_ids = kwargs["position_ids"].detach().clone()
+            return torch.zeros_like(x)
+
+    attention = Glm5DSAAttention.__new__(Glm5DSAAttention)
+    nn.Module.__init__(attention)
+    attention.ps = SimpleNamespace(cp_size=2, cp_rank=1)
+    attention.qk_rope_head_dim = 4
+    attention.rope_theta = 10_000.0
+    capture = CaptureDSA()
+    attention.self_attention = capture
+
+    local_seq = 4
+    x = torch.zeros(local_seq, 1, 8)
+    out = attention(x)
+
+    expected = zigzag_position_ids_for_cp(
+        local_seq * attention.ps.cp_size,
+        attention.ps.cp_rank,
+        attention.ps.cp_size,
+        x.device,
+    )
+    assert out.shape == x.shape
+    assert torch.equal(capture.position_ids, expected)
 
 
 def test_glm5_threads_positions_through_trunk_and_mtp(

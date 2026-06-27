@@ -323,6 +323,49 @@ def test_glm32_indexer_backward_padding_is_zero_and_reversible():
     assert unchanged_weights is padded_weights
 
 
+def test_glm5_nonpacked_cp_reconstructs_rank3_rotary_in_zigzag_order(monkeypatch):
+    from megatron.lite.primitive.modules.attention import dsa
+    from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
+
+    full_cos = torch.arange(1 * 8 * 4, dtype=torch.float32).view(1, 8, 4)
+    full_sin = full_cos + 100.0
+    cos_parts = [zigzag_slice_for_cp(full_cos, rank, 2, seq_dim=1) for rank in range(2)]
+    sin_parts = [zigzag_slice_for_cp(full_sin, rank, 2, seq_dim=1) for rank in range(2)]
+
+    def fake_all_gather(tensor, *, cp_size, cp_group):
+        assert cp_size == 2
+        assert cp_group == "cp-group"
+        return cos_parts if torch.equal(tensor, cos_parts[0]) else sin_parts
+
+    monkeypatch.setattr(dsa, "_all_gather_cp", fake_all_gather)
+    attention = dsa.DynamicSparseAttention.__new__(dsa.DynamicSparseAttention)
+    torch.nn.Module.__init__(attention)
+    attention.cp_size = 2
+    attention.cp_group = "cp-group"
+
+    gathered_cos, gathered_sin = attention._gather_cp_rotary(
+        cos_parts[0],
+        sin_parts[0],
+        local_seq=4,
+        full_seq=8,
+        device=torch.device("cpu"),
+    )
+    torch.testing.assert_close(gathered_cos, full_cos)
+    torch.testing.assert_close(gathered_sin, full_sin)
+
+    cache_cos = torch.ones(8, 2)
+    cache_sin = torch.zeros(8, 2)
+    same_cos, same_sin = attention._gather_cp_rotary(
+        cache_cos,
+        cache_sin,
+        local_seq=4,
+        full_seq=8,
+        device=torch.device("cpu"),
+    )
+    assert same_cos is cache_cos
+    assert same_sin is cache_sin
+
+
 def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():
     from megatron.lite.primitive.modules.attention.dsa import (
         validate_dsa_index_share_pipeline_split,

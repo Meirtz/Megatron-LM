@@ -222,7 +222,7 @@ def _glm52_indexshare():
         num_key_value_heads=64,
         head_dim=256,
         vocab_size=32,
-        max_position_embeddings=512,
+        max_position_embeddings=1024,
         initializer_range=0.002,
         q_lora_rank=16,
         kv_lora_rank=512,
@@ -593,7 +593,8 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
             assert mtp_dsa.indexer.rope_interleaved is True
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-    batch = _random_packed_batch(cfg.vocab_size, num_tokens=512)
+    batch = _random_packed_batch(cfg.vocab_size, num_tokens=1024)
+    assert cfg.index_topk < batch.input_ids.numel()
     runtime.zero_grad(handle)
     result = runtime.forward_backward(handle, iter([batch]), None, num_microbatches=1)
     runtime.optimizer_step(handle)
@@ -619,6 +620,7 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
             "NON_SKIP_GLM52_INDEXSHARE_UNEVEN_PP_PASSED "
             f"pp=8 num_layers=78 mtp_layers=1 splits={splits} "
             f"shared_pairs={shared_pairs} mtp_ranks={mtp_ranks} "
+            f"topk={cfg.index_topk} seq={batch.input_ids.numel()} "
             f"loss={float(loss.detach().item()):.6e}"
         )
 

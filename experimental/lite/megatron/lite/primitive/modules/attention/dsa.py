@@ -719,8 +719,16 @@ class DynamicSparseAttention(nn.Module):
 
         cp_restore = self.cp_size > 1
         if cp_restore:
+            local_seq = x.shape[1]
             x, position_ids, attention_mask = self._gather_cp_inputs(
                 x, position_ids, attention_mask
+            )
+            cos, sin = self._gather_cp_rotary(
+                cos,
+                sin,
+                local_seq=local_seq,
+                full_seq=x.shape[1],
+                device=x.device,
             )
 
         out = self._forward_dense_full(
@@ -1003,6 +1011,49 @@ class DynamicSparseAttention(nn.Module):
             pos_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
         )
         return full_x, full_position_ids
+
+    def _gather_cp_rotary(
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        local_seq: int,
+        full_seq: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct non-packed rank-3 rotary tensors in zigzag CP order."""
+
+        if cos.dim() != sin.dim():
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP cos/sin ranks must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.dim() != 3:
+            return cos, sin
+        if cos.shape != sin.shape:
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP rank-3 cos/sin shapes must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.shape[1] == full_seq:
+            return cos, sin
+        if cos.shape[1] != local_seq:
+            raise ValueError(
+                "GLM5 DynamicSparseAttention CP rank-3 rotary tensors must cover "
+                "either the local or reconstructed full sequence, "
+                f"got {tuple(cos.shape)} for local_seq={local_seq}, full_seq={full_seq}."
+            )
+
+        cos_parts = _all_gather_cp(
+            cos.to(device=device), cp_size=self.cp_size, cp_group=self.cp_group
+        )
+        sin_parts = _all_gather_cp(
+            sin.to(device=device), cp_size=self.cp_size, cp_group=self.cp_group
+        )
+        return (
+            zigzag_reconstruct_from_cp_parts(cos_parts, seq_dim=1),
+            zigzag_reconstruct_from_cp_parts(sin_parts, seq_dim=1),
+        )
 
     def _gather_packed_cp_rotary(
         self, cos: torch.Tensor, sin: torch.Tensor, packed_seq_params, device: torch.device

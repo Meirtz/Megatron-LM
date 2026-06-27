@@ -17,6 +17,8 @@ _INDEXER_TOPK = 512
 _SEQUENCE_LENGTH = 1024
 _INDEXER_LOSS_COEFF = 1.0e-2
 _MIN_INDEXER_GRAD_MAX_ABS = 1.0e-8
+_MIN_INDEXER_GRAD_COSINE = 0.97
+_MAX_INDEXER_GRAD_RMS_REL = 0.55
 
 
 def _make_dsa_pair(*, sparse_loss: bool):
@@ -93,6 +95,7 @@ def _run_once(modules, x, cos, sin, position_ids, *, fused_training: bool):
         position_ids=position_ids,
         index_share_state=index_share_state,
     )
+    indexer_loss = _saved_indexer_loss(source_out)
     assert index_share_state.cached_tensor_count == 1
     hidden = local_x + source_out
     shared_out = modules["shared"](
@@ -116,11 +119,29 @@ def _run_once(modules, x, cos, sin, position_ids, *, fused_training: bool):
     }
     return {
         "loss": loss.detach().float().clone(),
+        "indexer_loss": indexer_loss,
         "out": out.detach().float().clone(),
         "x_grad": local_x.grad.detach().float().clone(),
         "param_grads": param_grads,
         "topk_indices": index_share_state.consumed[0],
     }
+
+
+def _saved_indexer_loss(output: torch.Tensor) -> torch.Tensor:
+    """Extract the loss attached by DSAIndexerLossAutoScaler before backward."""
+
+    stack = [output.grad_fn]
+    visited: set[int] = set()
+    while stack:
+        grad_fn = stack.pop()
+        if grad_fn is None or id(grad_fn) in visited:
+            continue
+        visited.add(id(grad_fn))
+        if type(grad_fn).__name__ == "DSAIndexerLossAutoScalerBackward":
+            (indexer_loss,) = grad_fn.saved_tensors
+            return indexer_loss.detach().float().clone()
+        stack.extend(parent for parent, _index in grad_fn.next_functions)
+    raise AssertionError("DSAIndexerLossAutoScalerBackward was not found in the output graph")
 
 
 def _causal_mask(seq_q: int, seq_k: int, *, ratio: int, device: torch.device) -> torch.Tensor:
@@ -446,6 +467,12 @@ def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).abs().max().item())
 
 
+def _canonical_topk_set(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Canonicalize the vendor top-k's intentionally unspecified ordering."""
+
+    return torch.sort(topk_indices, dim=-1).values
+
+
 def _max_param_grad_abs(a: dict, b: dict) -> float:
     a_keys = set(a["param_grads"])
     b_keys = set(b["param_grads"])
@@ -481,6 +508,28 @@ def _assert_meaningful_indexer_grads(result: dict) -> float:
         grad_max_abs
     )
     return max(grad_max_abs.values())
+
+
+def _indexer_grad_similarity(actual: dict, expected: dict) -> dict[str, tuple[float, float]]:
+    names = sorted(
+        name for name in expected["param_grads"] if name.startswith("source.indexer.")
+    )
+    assert names
+    assert set(names) == {
+        name for name in actual["param_grads"] if name.startswith("source.indexer.")
+    }
+    similarities: dict[str, tuple[float, float]] = {}
+    for name in names:
+        actual_grad = actual["param_grads"][name].float().reshape(-1)
+        expected_grad = expected["param_grads"][name].float().reshape(-1)
+        actual_norm = torch.linalg.vector_norm(actual_grad)
+        expected_norm = torch.linalg.vector_norm(expected_grad)
+        cosine = torch.dot(actual_grad, expected_grad) / (actual_norm * expected_norm)
+        rms_diff = torch.sqrt(torch.mean((actual_grad - expected_grad).square()))
+        rms_expected = torch.sqrt(torch.mean(expected_grad.square()))
+        rms_relative = rms_diff / rms_expected
+        similarities[name] = (float(cosine.item()), float(rms_relative.item()))
+    return similarities
 
 
 @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse-loss", "dense-loss"])
@@ -532,14 +581,59 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
     _assert_meaningful_indexer_grads(fused_b)
     unfused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(unfused_a)
     _assert_meaningful_indexer_grads(unfused_b)
+    indexer_grad_similarity = _indexer_grad_similarity(fused_a, unfused_a)
+    min_indexer_grad_cosine = min(value[0] for value in indexer_grad_similarity.values())
+    max_indexer_grad_rms_relative = max(
+        value[1] for value in indexer_grad_similarity.values()
+    )
+    fused_indexer_loss_r2r = abs(
+        float(fused_a["indexer_loss"].item()) - float(fused_b["indexer_loss"].item())
+    )
+    fused_vs_unfused_indexer_loss = abs(
+        float(fused_a["indexer_loss"].item())
+        - float(unfused_a["indexer_loss"].item())
+    )
 
     assert torch.isfinite(fused_a["loss"])
+    assert torch.isfinite(fused_a["indexer_loss"])
+    assert float(fused_a["indexer_loss"].item()) > 0.0
     assert torch.isfinite(unfused_a["loss"])
     assert torch.isfinite(unfused_a["indexer_loss"])
     assert float(unfused_a["indexer_loss"].item()) > 0.0
-    assert torch.equal(fused_a["topk_indices"], fused_b["topk_indices"])
-    assert torch.equal(unfused_a["topk_indices"], unfused_b["topk_indices"])
-    assert torch.equal(fused_a["topk_indices"], unfused_a["topk_indices"])
+    fused_a_topk_set = _canonical_topk_set(fused_a["topk_indices"])
+    fused_b_topk_set = _canonical_topk_set(fused_b["topk_indices"])
+    unfused_a_topk_set = _canonical_topk_set(unfused_a["topk_indices"])
+    unfused_b_topk_set = _canonical_topk_set(unfused_b["topk_indices"])
+    fused_topk_set_r2r = torch.equal(fused_a_topk_set, fused_b_topk_set)
+    unfused_topk_set_r2r = torch.equal(unfused_a_topk_set, unfused_b_topk_set)
+    fused_vs_unfused_topk_set = torch.equal(fused_a_topk_set, unfused_a_topk_set)
+    print(
+        "GLM5_DSA_ACCEPTANCE_DIAGNOSTICS "
+        f"sparse_loss={sparse_loss} "
+        f"fused_topk_set_r2r={fused_topk_set_r2r} "
+        f"unfused_topk_set_r2r={unfused_topk_set_r2r} "
+        f"fused_vs_unfused_topk_set={fused_vs_unfused_topk_set} "
+        f"loss_diff={loss_diff:.6e} "
+        f"fused_r2r_out_max_abs={fused_r2r_out:.6e} "
+        f"fused_r2r_x_grad_max_abs={fused_r2r_x_grad:.6e} "
+        f"fused_r2r_param_grad_max_abs={fused_r2r_param_grad:.6e} "
+        f"fused_vs_unfused_out_max_abs={fused_vs_unfused_out:.6e} "
+        f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
+        f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e}"
+        f" fused_indexer_loss_r2r={fused_indexer_loss_r2r:.6e}"
+        f" fused_vs_unfused_indexer_loss={fused_vs_unfused_indexer_loss:.6e}"
+        f" min_indexer_grad_cosine={min_indexer_grad_cosine:.6e}"
+        f" max_indexer_grad_rms_relative={max_indexer_grad_rms_relative:.6e}"
+    )
+    assert fused_topk_set_r2r
+    assert unfused_topk_set_r2r
+    assert fused_vs_unfused_topk_set
+    assert fused_indexer_loss_r2r <= _FUSED_VS_REFERENCE_LOSS_ATOL
+    assert fused_vs_unfused_indexer_loss <= _FUSED_VS_REFERENCE_LOSS_ATOL
+    assert min_indexer_grad_cosine >= _MIN_INDEXER_GRAD_COSINE, indexer_grad_similarity
+    assert max_indexer_grad_rms_relative <= _MAX_INDEXER_GRAD_RMS_REL, (
+        indexer_grad_similarity
+    )
     valid_topk = (fused_a["topk_indices"] >= 0).sum(dim=-1)
     assert _INDEXER_TOPK < seq
     assert fused_a["topk_indices"].shape[-1] == _INDEXER_TOPK
@@ -564,7 +658,9 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
         f"fused_loss={float(fused_a['loss'].item()):.6e} "
         f"unfused_loss={float(unfused_a['loss'].item()):.6e} "
         f"unfused_indexer_loss={float(unfused_a['indexer_loss'].item()):.6e} "
+        f"fused_indexer_loss={float(fused_a['indexer_loss'].item()):.6e} "
         f"index_heads=32 sparse_loss={sparse_loss} "
+        "topk_set_exact=True "
         f"indexer_topk={_INDEXER_TOPK} seq={seq} "
         f"loss_diff={loss_diff:.6e} "
         f"fused_r2r_loss_diff={fused_r2r_loss:.6e} "
@@ -580,6 +676,8 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
         f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e} "
         f"fused_indexer_grad_max_abs={fused_indexer_grad_max_abs:.6e} "
         f"unfused_indexer_grad_max_abs={unfused_indexer_grad_max_abs:.6e}"
+        f" min_indexer_grad_cosine={min_indexer_grad_cosine:.6e}"
+        f" max_indexer_grad_rms_relative={max_indexer_grad_rms_relative:.6e}"
     )
 
 

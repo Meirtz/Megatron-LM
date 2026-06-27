@@ -147,7 +147,13 @@ def _hf_state_dict_for_glm5_loader(model):
     }
 
 
-def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
+def _make_dsa(
+    *,
+    cp_size: int = 1,
+    cp_rank: int = 0,
+    cp_group=None,
+    rope_interleaved: bool = False,
+):
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention
 
     return DynamicSparseAttention(
@@ -162,6 +168,8 @@ def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
         index_head_dim=128,
         index_topk=512,
         rms_norm_eps=1e-5,
+        rope_interleaved=rope_interleaved,
+        indexer_rope_interleaved=rope_interleaved,
         cp_size=cp_size,
         cp_rank=cp_rank,
         cp_group=cp_group,
@@ -169,11 +177,14 @@ def _make_dsa(*, cp_size: int = 1, cp_rank: int = 0, cp_group=None):
 
 
 @pytest.mark.gpu
-def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
+@pytest.mark.parametrize("rope_interleaved", [False, True], ids=["half-split", "interleaved"])
+def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
+    rope_interleaved: bool,
+):
     import torch
     import torch.distributed as dist
 
-    from megatron.lite.primitive.modules.attention import build_rope_cache
+    from megatron.lite.primitive.modules.attention import build_rotary_embeddings
     from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp, zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -183,11 +194,16 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(2026)
-    cp_attn = _make_dsa(cp_size=world, cp_rank=rank, cp_group=ps.cp_group).to(
+    cp_attn = _make_dsa(
+        cp_size=world,
+        cp_rank=rank,
+        cp_group=ps.cp_group,
+        rope_interleaved=rope_interleaved,
+    ).to(device=device, dtype=torch.bfloat16)
+    torch.manual_seed(2026)
+    ref_attn = _make_dsa(rope_interleaved=rope_interleaved).to(
         device=device, dtype=torch.bfloat16
     )
-    torch.manual_seed(2026)
-    ref_attn = _make_dsa().to(device=device, dtype=torch.bfloat16)
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(99)
@@ -195,14 +211,23 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     local_x = zigzag_slice_for_cp(full_x, rank, world, seq_dim=1).detach().requires_grad_(True)
     ref_x = full_x.detach().clone().requires_grad_(True)
 
-    cos, sin = build_rope_cache(
-        dim=64, max_position_embeddings=seq, rope_theta=1_000_000.0, device=device
-    )
     local_pos = zigzag_position_ids_for_cp(seq, rank, world, device).expand(batch, -1)
     full_pos = torch.arange(seq, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    local_cos, local_sin = build_rotary_embeddings(
+        position_ids=local_pos,
+        dim=64,
+        rope_theta=1_000_000.0,
+        dtype=torch.bfloat16,
+    )
+    full_cos, full_sin = build_rotary_embeddings(
+        position_ids=full_pos,
+        dim=64,
+        rope_theta=1_000_000.0,
+        dtype=torch.bfloat16,
+    )
 
-    cp_out = cp_attn(local_x, cos=cos, sin=sin, position_ids=local_pos)
-    ref_out = ref_attn(ref_x, cos=cos, sin=sin, position_ids=full_pos)
+    cp_out = cp_attn(local_x, cos=local_cos, sin=local_sin, position_ids=local_pos)
+    ref_out = ref_attn(ref_x, cos=full_cos, sin=full_sin, position_ids=full_pos)
     expected = zigzag_slice_for_cp(ref_out, rank, world, seq_dim=1)
     torch.testing.assert_close(cp_out, expected, atol=3e-2, rtol=3e-2)
 
@@ -211,6 +236,11 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad():
     expected_grad = zigzag_slice_for_cp(ref_x.grad, rank, world, seq_dim=1)
     assert local_x.grad is not None
     torch.testing.assert_close(local_x.grad, expected_grad, atol=8e-2, rtol=8e-2)
+    if rank == 0:
+        print(
+            "NON_SKIP_GLM5_NONPACKED_CP_RANK3_ROTARY_PASSED "
+            f"cp={world} rope_interleaved={rope_interleaved}"
+        )
 
 
 @pytest.mark.gpu
