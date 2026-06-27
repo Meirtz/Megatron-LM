@@ -87,7 +87,9 @@ def _tiny_hf_parity_config_kwargs():
 def _fused_dsa_seq_len(world: int) -> int:
     seq = 512
     if seq % (2 * world) != 0:
-        pytest.skip(f"GLM5 fused DSA CP smoke requires seq={seq} divisible by 2*world={2 * world}.")
+        pytest.skip(
+            f"GLM5 fused DSA CP smoke requires seq={seq} divisible by 2*world={2 * world}."
+        )
     return seq
 
 
@@ -102,7 +104,9 @@ def _sparse_fused_dsa_seq_len(world: int) -> int:
 
 
 def _to_hf_deepseek_v3_config(cfg):
-    from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
+    from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
+        DeepseekV3Config,
+    )
 
     return DeepseekV3Config(
         hidden_size=cfg.hidden_size,
@@ -147,7 +151,9 @@ def _distributed_diff_stats(actual, expected) -> tuple[float, float]:
 
     diff = (actual.float() - expected.float()).abs()
     max_abs = diff.max()
-    scale = torch.maximum(actual.float().abs().max(), expected.float().abs().max()).clamp_min(1e-6)
+    scale = torch.maximum(
+        actual.float().abs().max(), expected.float().abs().max()
+    ).clamp_min(1e-6)
     stats = torch.stack([max_abs, scale])
     if dist.is_initialized():
         dist.all_reduce(stats, op=dist.ReduceOp.MAX)
@@ -207,7 +213,9 @@ def _wrap_dsa(dsa, ps, *, rope_theta: float = 1_000_000.0):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("rope_interleaved", [False, True], ids=["half-split", "interleaved"])
+@pytest.mark.parametrize(
+    "rope_interleaved", [False, True], ids=["half-split", "interleaved"]
+)
 def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
     rope_interleaved: bool,
 ):
@@ -247,7 +255,11 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
     assert cp_attn.self_attention.index_topk < seq
     torch.manual_seed(99)
     full_x = torch.randn(batch, seq, 128, device=device, dtype=torch.bfloat16)
-    local_x = zigzag_slice_for_cp(full_x, rank, world, seq_dim=1).detach().requires_grad_(True)
+    local_x = (
+        zigzag_slice_for_cp(full_x, rank, world, seq_dim=1)
+        .detach()
+        .requires_grad_(True)
+    )
     ref_x = full_x.detach().clone().requires_grad_(True)
 
     # Exercise the exported wrapper's position_ids=None fallback, including
@@ -322,7 +334,9 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
 
     batch, seq = 1, _fused_dsa_seq_len(world)
     torch.manual_seed(100)
-    full_hidden = torch.randn(batch, seq, cfg.hidden_size, device=device, dtype=torch.bfloat16)
+    full_hidden = torch.randn(
+        batch, seq, cfg.hidden_size, device=device, dtype=torch.bfloat16
+    )
     local_hidden = zigzag_slice_for_cp(full_hidden, rank, world, seq_dim=1).contiguous()
 
     with torch.no_grad():
@@ -373,13 +387,16 @@ def test_glm5_tiny_model_cp2_forward_backward_smoke():
 
 
 @pytest.mark.gpu
-def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
+def test_glm5_packed_thd_variable_sequence_cp2_direct_forward_backward_smoke():
     import torch
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.primitive.parallel.state import ParallelState
-    from megatron.lite.primitive.parallel.thd import pack_nested_thd, unpack_packed_thd_to_nested
+    from megatron.lite.primitive.parallel.thd import (
+        pack_nested_thd,
+        unpack_packed_thd_to_nested,
+    )
 
     device = _init_dist_or_skip()
     world = dist.get_world_size()
@@ -447,8 +464,99 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
 
     if rank == 0:
         print(
-            "NON_SKIP_GLM5_THD_CP_SMOKE_PASSED "
+            "NON_SKIP_GLM5_THD_CP_DIRECT_SMOKE_PASSED "
             f"world_size={world} lengths={lengths} "
+            f"loss={float(out['loss'].detach().item()):.6e} "
+            f"grad_norm={float(grad_norm.detach().item()):.6e}"
+        )
+
+
+@pytest.mark.gpu
+def test_glm5_packed_thd_protocol_indexshare_mtp_cp2_forward_backward_smoke():
+    import torch
+    import torch.distributed as dist
+
+    device = _init_dist_or_skip()
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.protocol import (
+        _forward_step,
+        unpack_forward_output,
+    )
+    from megatron.lite.primitive.parallel.state import ParallelState
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    cfg_kwargs = _tiny_config_kwargs()
+    cfg_kwargs.update(
+        max_position_embeddings=64,
+        num_hidden_layers=6,
+        num_nextn_predict_layers=1,
+    )
+    indexer_types = ["full", "full", "full", "shared", "shared", "shared"]
+    cfg = Glm5Config(
+        **cfg_kwargs,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=indexer_types,
+    )
+    cfg.mlp_layer_types = ["dense"] * 7
+    ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
+
+    torch.manual_seed(20260614)
+    model = _make_glm5_model(cfg, ps=ps, mtp_enable=True, mtp_enable_train=True).to(
+        device=device, dtype=torch.bfloat16
+    )
+    model.train()
+
+    lengths = [16, 20, 24]
+    batch = PackedBatch(
+        input_ids=torch.cat(
+            [
+                torch.randint(
+                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
+                )
+                for length in lengths
+            ]
+        ),
+        labels=torch.cat(
+            [
+                torch.randint(
+                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
+                )
+                for length in lengths
+            ]
+        ),
+        seq_lens=torch.tensor(lengths, device=device, dtype=torch.int32),
+        loss_mask=torch.ones(sum(lengths), device=device, dtype=torch.float32),
+    )
+
+    out = _forward_step(model, batch)
+    assert torch.isfinite(out["loss"])
+    assert "mtp_loss" in out
+    assert model.layers[3].self_attention.self_attention.skip_topk is True
+    assert model.mtp is not None
+    assert (
+        model.mtp.layers[0].transformer_layer.self_attention.self_attention.skip_topk
+        is False
+    )
+    out["loss"].backward()
+
+    grad_norm = torch.zeros((), device=device)
+    for param in model.parameters():
+        if param.grad is not None:
+            grad_norm = grad_norm + param.grad.detach().float().norm()
+    assert torch.isfinite(grad_norm)
+
+    nested_log_probs = unpack_forward_output(model, batch, out["log_probs"])
+    assert nested_log_probs.offsets().numel() == len(lengths) + 1
+    assert [int(x) for x in nested_log_probs.offsets().diff().cpu()] == lengths
+
+    if rank == 0:
+        print(
+            "NON_SKIP_GLM5_THD_CP_SMOKE_PASSED "
+            f"world_size={world} lengths={lengths} index_share=true mtp_indexer=full "
             f"loss={float(out['loss'].detach().item()):.6e} "
             f"grad_norm={float(grad_norm.detach().item()):.6e}"
         )
@@ -458,7 +566,14 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
 def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     import torch
     import torch.distributed as dist
-    from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+
+    device = _init_dist_or_skip()
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+
+    from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+        DeepseekV3ForCausalLM,
+    )
 
     from megatron.lite.model.glm5.config import Glm5Config
     from megatron.lite.model.glm5.lite.checkpoint import load_hf_weights
@@ -466,9 +581,6 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
-    device = _init_dist_or_skip()
-    world = dist.get_world_size()
-    rank = dist.get_rank()
     cfg = Glm5Config(**_tiny_hf_parity_config_kwargs())
 
     torch.manual_seed(20260611)
@@ -526,19 +638,26 @@ def test_glm5_tiny_model_cp2_matches_hf_reference_logits(tmp_path):
     for layer_idx, (actual, full_expected) in enumerate(
         zip(native_layer_outputs, hf_layer_outputs, strict=True)
     ):
-        expected = zigzag_slice_for_cp(full_expected, rank, world, seq_dim=1).contiguous()
+        expected = zigzag_slice_for_cp(
+            full_expected, rank, world, seq_dim=1
+        ).contiguous()
         max_abs, max_rel = _distributed_diff_stats(actual, expected)
         if rank == 0:
             print(
                 f"glm5_hf_native_parity layer={layer_idx} "
                 f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
             )
-        torch.testing.assert_close(actual.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1)
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1
+        )
 
     expected = zigzag_slice_for_cp(hf_logits, rank, world, seq_dim=1).contiguous()
     max_abs, max_rel = _distributed_diff_stats(native_logits, expected)
     if rank == 0:
         print(
-            "glm5_hf_native_parity logits " f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
+            "glm5_hf_native_parity logits "
+            f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
         )
-    torch.testing.assert_close(native_logits.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1)
+    torch.testing.assert_close(
+        native_logits.float(), expected.float(), atol=1.5e-1, rtol=1.5e-1
+    )

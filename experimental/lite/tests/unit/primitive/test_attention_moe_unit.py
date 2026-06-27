@@ -56,7 +56,9 @@ def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     split_grouped_qkvg = _split_grouped_qkvg()
     qkv = torch.arange(24).reshape(1, 24)
 
-    query, gate, key, value = split_grouped_qkvg(qkv, num_heads=4, num_kv_heads=2, head_dim=2)
+    query, gate, key, value = split_grouped_qkvg(
+        qkv, num_heads=4, num_kv_heads=2, head_dim=2
+    )
 
     assert query.shape == (1, 4, 2)
     assert gate.shape == (1, 4, 2)
@@ -170,6 +172,35 @@ def test_dsa_index_share_schedule_and_state():
     assert state.cached_tensor_count == 0
     with pytest.raises(AssertionError, match="source layer 3"):
         state.get_topk(5, 3, sequence_key=1)
+
+
+def test_glm5_dsa_wrapper_forwards_explicit_position_ids():
+    from megatron.lite.model.glm5.lite.model import Glm5DSAAttention
+
+    class CaptureDSA(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.position_ids = None
+
+        def forward(self, x, **kwargs):
+            self.position_ids = kwargs["position_ids"]
+            return x
+
+    wrapper = Glm5DSAAttention.__new__(Glm5DSAAttention)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.ps = SimpleNamespace(cp_size=1, cp_rank=0)
+    wrapper.qk_rope_head_dim = 4
+    wrapper.rope_theta = 1_000_000.0
+    wrapper.self_attention = CaptureDSA()
+    hidden = torch.randn(5, 2, 8)
+    position_ids = torch.tensor([[0, 1, 2, 3, 4], [0, 1, 0, 1, 2]])
+
+    output = wrapper(hidden, position_ids=position_ids)
+
+    assert output.shape == hidden.shape
+    assert torch.equal(wrapper.self_attention.position_ids, position_ids)
+    with pytest.raises(ValueError, match="batch dimension"):
+        wrapper(hidden, position_ids=torch.zeros(3, 5, dtype=torch.long))
 
 
 def test_dsa_index_share_state_releases_final_packed_consumer():
@@ -554,9 +585,7 @@ def test_dsa_bottom_right_topk_lengths_cover_non_square_valid_keys():
 def test_dense_dsa_kl_matches_canonical_epsilon_placement():
     from megatron.lite.primitive.kernels import dsa_kernels
 
-    attn_score = torch.tensor(
-        [[[0.7, 0.3, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32
-    )
+    attn_score = torch.tensor([[[0.7, 0.3, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32)
     attn_l1norm = attn_score.sum(dim=-1)
     index_logits = torch.tensor(
         [[[1.2, -0.4, -torch.inf], [-torch.inf, -torch.inf, -torch.inf]]],
@@ -576,11 +605,7 @@ def test_dense_dsa_kl_matches_canonical_epsilon_placement():
     target = attn_score[0, 0] / attn_l1norm[0, 0]
     predict = torch.softmax(index_logits[0, 0, :2], dim=-1)
     expected_row = (
-        target[:2]
-        * (
-            torch.log(target[:2] + 1.0e-10)
-            - torch.log(predict + 1.0e-10)
-        )
+        target[:2] * (torch.log(target[:2] + 1.0e-10) - torch.log(predict + 1.0e-10))
     ).sum()
     expected = coeff * expected_row / 2
     torch.testing.assert_close(actual, expected, atol=1.0e-7, rtol=1.0e-7)
@@ -780,7 +805,9 @@ def test_glm5_cp_rejects_mixed_collective_input_representations(
         return [metadata, peer_metadata]
 
     monkeypatch.setattr(dsa, "_all_gather_cp", fake_all_gather)
-    with pytest.raises(ValueError, match="same local/full position and rotary representation"):
+    with pytest.raises(
+        ValueError, match="same local/full position and rotary representation"
+    ):
         attention._validate_cp_collective_input_metadata(
             torch.zeros(1, 4, 8),
             torch.arange(4).unsqueeze(0),
@@ -820,7 +847,9 @@ def test_dsa_index_share_pipeline_guard_uses_explicit_nearest_full_source(monkey
     from megatron.lite.primitive.modules.attention import dsa
 
     DynamicSparseAttention = dsa.DynamicSparseAttention
-    validate_dsa_index_share_pipeline_split = dsa.validate_dsa_index_share_pipeline_split
+    validate_dsa_index_share_pipeline_split = (
+        dsa.validate_dsa_index_share_pipeline_split
+    )
 
     indexer_types = ["full", "shared", "full", "shared", "shared", "full"]
     validate_dsa_index_share_pipeline_split(

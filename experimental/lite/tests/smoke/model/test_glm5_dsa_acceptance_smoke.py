@@ -158,7 +158,9 @@ def _saved_indexer_loss(output: torch.Tensor) -> torch.Tensor:
     return indexer_loss.detach().float().clone()
 
 
-def _causal_mask(seq_q: int, seq_k: int, *, ratio: int, device: torch.device) -> torch.Tensor:
+def _causal_mask(
+    seq_q: int, seq_k: int, *, ratio: int, device: torch.device
+) -> torch.Tensor:
     q_idx = torch.arange(seq_q, device=device)
     k_idx = torch.arange(seq_k, device=device)
     q_global_start = seq_k * ratio - seq_q
@@ -184,11 +186,15 @@ def _torch_indexer_scores(
     # scaled weights back to BF16 before the indexer GEMM. Reproduce that
     # boundary so exact top-k checks do not fail on an FP32/BF16 rank flip.
     w_bsh = (
-        weights.permute(1, 0, 2).float() * float(indexer_softmax_scale)
-    ).to(weights.dtype).float()
+        (weights.permute(1, 0, 2).float() * float(indexer_softmax_scale))
+        .to(weights.dtype)
+        .float()
+    )
     scores = torch.einsum("bqhd,bkd->bqhk", q_bshd, k_bsd)
     scores = torch.relu(scores).mul(w_bsh.unsqueeze(-1)).sum(dim=2)
-    causal = _causal_mask(scores.shape[1], scores.shape[2], ratio=ratio, device=scores.device)
+    causal = _causal_mask(
+        scores.shape[1], scores.shape[2], ratio=ratio, device=scores.device
+    )
     return torch.where(causal.unsqueeze(0), scores, torch.full_like(scores, -torch.inf))
 
 
@@ -211,9 +217,7 @@ def _torch_dense_indexer_scores(
     causal = _causal_mask(
         scores.shape[1], scores.shape[2], ratio=ratio, device=scores.device
     )
-    return torch.where(
-        causal.unsqueeze(0), scores, torch.full_like(scores, -torch.inf)
-    )
+    return torch.where(causal.unsqueeze(0), scores, torch.full_like(scores, -torch.inf))
 
 
 def _torch_topk_from_scores(scores: torch.Tensor, topk: int) -> torch.Tensor:
@@ -260,7 +264,11 @@ def _torch_sparse_attention(
     scores = torch.where(
         topk_indices.unsqueeze(2) >= 0, scores, torch.full_like(scores, -torch.inf)
     )
-    sink = attn_sink.float().view(1, 1, -1, 1).expand(scores.shape[0], scores.shape[1], -1, -1)
+    sink = (
+        attn_sink.float()
+        .view(1, 1, -1, 1)
+        .expand(scores.shape[0], scores.shape[1], -1, -1)
+    )
     probs = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :-1]
     out = torch.einsum("bqht,bqtr->bqhr", probs, selected_values)
     return out.permute(1, 0, 2, 3).reshape(
@@ -303,9 +311,7 @@ def _torch_sparse_indexer_loss(
     target_mass = attn_probs.sum(dim=2)
     target_mass = torch.where(valid, target_mass, torch.zeros_like(target_mass))
 
-    target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(
-        1.0e-10
-    )
+    target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(1.0e-10)
     target = target_mass / target_denom
 
     safe_indices = topk_indices.clamp(min=0).long()
@@ -318,9 +324,9 @@ def _torch_sparse_indexer_loss(
     predict = torch.softmax(selected_indexer_scores, dim=-1)
 
     eps = 1.0e-10
-    kl_per_row = (
-        target * (torch.log(target + eps) - torch.log(predict + eps))
-    ).sum(dim=-1)
+    kl_per_row = (target * (torch.log(target + eps) - torch.log(predict + eps))).sum(
+        dim=-1
+    )
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
     return float(loss_coeff) * kl_per_row.mean()
 
@@ -363,10 +369,10 @@ def _torch_dense_indexer_loss(
         torch.zeros_like(attn_probs),
     )
     target_mass = attn_probs.sum(dim=2)
-    target_mass = torch.where(causal.unsqueeze(0), target_mass, torch.zeros_like(target_mass))
-    target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(
-        1.0e-10
+    target_mass = torch.where(
+        causal.unsqueeze(0), target_mass, torch.zeros_like(target_mass)
     )
+    target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(1.0e-10)
     target = target_mass / target_denom
 
     safe_indexer_scores = torch.where(
@@ -391,10 +397,19 @@ def _torch_unfused_dsa_forward(
 
     batch, seq_len, _ = x.shape
     q_resid = module.q_a_layernorm(module.q_a_proj(x))
-    q = module.q_b_proj(q_resid).view(batch, seq_len, module.num_heads, module.qk_head_dim)
-    q_nope, q_pe = torch.split(q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1)
+    q = module.q_b_proj(q_resid).view(
+        batch, seq_len, module.num_heads, module.qk_head_dim
+    )
+    q_nope, q_pe = torch.split(
+        q, [module.qk_nope_head_dim, module.qk_rope_head_dim], dim=-1
+    )
     cos, sin = _rotary_embeddings_from_cache(
-        cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=module.qk_rope_head_dim
+        cos,
+        sin,
+        position_ids,
+        device=x.device,
+        dtype=x.dtype,
+        dim=module.qk_rope_head_dim,
     )
     q_pe = apply_rotary_pos_emb(
         q_pe,
@@ -409,7 +424,9 @@ def _torch_unfused_dsa_forward(
     query_states = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1).contiguous()
 
     kv_latent, k_pe = torch.split(
-        module.kv_a_proj_with_mqa(x), [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1
+        module.kv_a_proj_with_mqa(x),
+        [module.kv_lora_rank, module.qk_rope_head_dim],
+        dim=-1,
     )
     kv_latent = module.kv_a_layernorm(kv_latent)
     k_pe = apply_rotary_pos_emb(
@@ -498,15 +515,13 @@ def _run_once_torch_unfused(
     modules.zero_grad(set_to_none=True)
     modules.train(True)
     local_x = x.detach().clone().requires_grad_(True)
-    source_out, topk_indices, indexer_loss, indexer_scores = (
-        _torch_unfused_dsa_forward(
-            modules["source"],
-            local_x,
-            cos,
-            sin,
-            position_ids,
-            topk_indices=forced_source_topk,
-        )
+    source_out, topk_indices, indexer_loss, indexer_scores = _torch_unfused_dsa_forward(
+        modules["source"],
+        local_x,
+        cos,
+        sin,
+        position_ids,
+        topk_indices=forced_source_topk,
     )
     assert indexer_scores is not None
     hidden = local_x + source_out
@@ -565,15 +580,12 @@ def _assert_topk_matches_quantized_scores(
     actual_valid = actual_indices >= 0
     valid_count = torch.isfinite(scores).sum(dim=-1)
     expected_count = valid_count.clamp(max=topk)
-    torch.testing.assert_close(
-        actual_valid.sum(dim=-1), expected_count, atol=0, rtol=0
-    )
+    torch.testing.assert_close(actual_valid.sum(dim=-1), expected_count, atol=0, rtol=0)
     assert torch.all((actual_indices < seq_k) | ~actual_valid)
 
     canonical_actual = _canonical_topk_set(actual_indices)
-    duplicate = (
-        (canonical_actual[..., 1:] == canonical_actual[..., :-1])
-        & (canonical_actual[..., 1:] >= 0)
+    duplicate = (canonical_actual[..., 1:] == canonical_actual[..., :-1]) & (
+        canonical_actual[..., 1:] >= 0
     )
     assert not torch.any(duplicate), "vendor top-k returned duplicate valid indices"
 
@@ -660,7 +672,9 @@ def _max_param_grad_abs(a: dict, b: dict) -> float:
     )
     if not a_keys:
         return 0.0
-    return max(_max_abs(a["param_grads"][name], b["param_grads"][name]) for name in a_keys)
+    return max(
+        _max_abs(a["param_grads"][name], b["param_grads"][name]) for name in a_keys
+    )
 
 
 def _assert_meaningful_indexer_grads(result: dict) -> float:
@@ -717,7 +731,9 @@ def _indexer_grad_similarity(
     return similarities
 
 
-@pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse-loss", "dense-loss"])
+@pytest.mark.parametrize(
+    "sparse_loss", [True, False], ids=["sparse-loss", "dense-loss"]
+)
 def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for GLM5 DSA accept-with-proof smoke.")
@@ -736,7 +752,9 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         torch.ones((), device=device),
     )
     torch.manual_seed(20260626)
-    fused = _make_dsa_pair(sparse_loss=sparse_loss).to(device=device, dtype=torch.bfloat16)
+    fused = _make_dsa_pair(sparse_loss=sparse_loss).to(
+        device=device, dtype=torch.bfloat16
+    )
     unfused = copy.deepcopy(fused).to(device=device, dtype=torch.bfloat16)
 
     batch, seq, hidden = 1, _SEQUENCE_LENGTH, 128
@@ -773,9 +791,7 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     unfused_r2r_x_grad = _max_abs(unfused_a["x_grad"], unfused_b["x_grad"])
     unfused_r2r_param_grad = _max_param_grad_abs(unfused_a, unfused_b)
     fused_vs_unfused_out = _max_abs(fused_a["out"], matched_unfused_a["out"])
-    fused_vs_unfused_x_grad = _max_abs(
-        fused_a["x_grad"], matched_unfused_a["x_grad"]
-    )
+    fused_vs_unfused_x_grad = _max_abs(fused_a["x_grad"], matched_unfused_a["x_grad"])
     fused_vs_unfused_param_grad = _max_param_grad_abs(fused_a, matched_unfused_a)
     loss_diff = abs(
         float(fused_a["loss"].item()) - float(matched_unfused_a["loss"].item())
@@ -786,12 +802,12 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     )
     fused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(fused_a)
     _assert_meaningful_indexer_grads(fused_b)
-    unfused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(
-        matched_unfused_a
-    )
+    unfused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(matched_unfused_a)
     _assert_meaningful_indexer_grads(unfused_b)
     indexer_grad_similarity = _indexer_grad_similarity(fused_a, matched_unfused_a)
-    min_indexer_grad_cosine = min(value[0] for value in indexer_grad_similarity.values())
+    min_indexer_grad_cosine = min(
+        value[0] for value in indexer_grad_similarity.values()
+    )
     max_indexer_grad_rms_relative = max(
         value[1] for value in indexer_grad_similarity.values()
     )
@@ -835,16 +851,12 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
         original_topk = dsa_kernels._indexer_topk_bshd
 
         def lowest_valid_topk(q_bshd, k_bsd, w_bsh, topk, ratio=4):
-            _indices, _length, scores = original_topk(
-                q_bshd, k_bsd, w_bsh, topk, ratio
-            )
+            _indices, _length, scores = original_topk(q_bshd, k_bsd, w_bsh, topk, ratio)
             del _indices, _length
             low_rank_scores = torch.where(
                 torch.isfinite(scores), scores, torch.full_like(scores, torch.inf)
             )
-            values, indices = torch.topk(
-                low_rank_scores, k=topk, dim=-1, largest=False
-            )
+            values, indices = torch.topk(low_rank_scores, k=topk, dim=-1, largest=False)
             indices = torch.where(
                 torch.isfinite(values), indices, torch.full_like(indices, -1)
             ).int()
@@ -991,7 +1003,9 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused DSA API regression smoke.")
-    pytest.importorskip("cudnn", reason="Fused DSA API smoke needs the cuDNN DSA stack.")
+    pytest.importorskip(
+        "cudnn", reason="Fused DSA API smoke needs the cuDNN DSA stack."
+    )
     from megatron.lite.primitive.kernels import dsa_kernels
 
     device = torch.device("cuda", int(torch.cuda.current_device()))
@@ -1050,19 +1064,30 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
         objective = output.float().square().mean() + indexer_loss
         objective.backward()
         main_inputs = {"query": args[0], "kv_full": args[1], "attn_sink": args[2]}
-        indexer_inputs = {"q_indexer": args[4], "k_indexer": args[5], "weights": args[6]}
-        assert all(tensor.grad is not None for tensor in (*main_inputs.values(), *indexer_inputs.values()))
+        indexer_inputs = {
+            "q_indexer": args[4],
+            "k_indexer": args[5],
+            "weights": args[6],
+        }
+        assert all(
+            tensor.grad is not None
+            for tensor in (*main_inputs.values(), *indexer_inputs.values())
+        )
         assert all(
             torch.isfinite(tensor.grad).all()
             for tensor in (*main_inputs.values(), *indexer_inputs.values())
         )
-        assert all(torch.count_nonzero(tensor.grad).item() == 0 for tensor in indexer_inputs.values())
+        assert all(
+            torch.count_nonzero(tensor.grad).item() == 0
+            for tensor in indexer_inputs.values()
+        )
         fused_results.append(
             {
                 "output": output.detach().float(),
                 "objective": objective.detach().float(),
                 "main_grads": {
-                    key: tensor.grad.detach().float() for key, tensor in main_inputs.items()
+                    key: tensor.grad.detach().float()
+                    for key, tensor in main_inputs.items()
                 },
             }
         )
@@ -1089,9 +1114,7 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
     compressed_global = torch.where(
         topk_indices >= 0, topk_indices + kv_offset, topk_indices
     ).to(torch.int32)
-    assert torch.all(
-        (compressed_global < 0) | (compressed_global >= kv_offset)
-    )
+    assert torch.all((compressed_global < 0) | (compressed_global >= kv_offset))
     flat_indices, flat_length = dsa_kernels.build_flat_topk_idxs(
         args[3],
         compressed_global,
@@ -1246,9 +1269,7 @@ def test_glm52_model_preserves_multisegment_positions_through_indexshare_and_mtp
 
     attention_modules = [
         layer.self_attention.self_attention for layer in model.layers
-    ] + [
-        model.mtp.layers[0].transformer_layer.self_attention.self_attention
-    ]
+    ] + [model.mtp.layers[0].transformer_layer.self_attention.self_attention]
     for attention in attention_modules:
         handles.append(
             attention.register_forward_pre_hook(capture_positions, with_kwargs=True)
