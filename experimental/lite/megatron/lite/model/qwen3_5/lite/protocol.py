@@ -346,11 +346,20 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
 
 def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: Qwen35Config, ps: ParallelState
+    chunk: nn.Module | list[nn.Module],
+    hf_path: str,
+    model_cfg: Qwen35Config,
+    ps: ParallelState,
 ) -> None:
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
+
+
+def load_hf_weights_many(
+    chunks: list[nn.Module], hf_path: str, model_cfg: Qwen35Config, ps: ParallelState
+) -> None:
+    load_hf_weights(chunks, hf_path, model_cfg, ps)
 
 
 def export_hf_weights(

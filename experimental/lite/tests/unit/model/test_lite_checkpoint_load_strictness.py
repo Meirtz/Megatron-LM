@@ -211,6 +211,66 @@ def test_atomic_hf_copy_rolls_back_on_unexpected_copy_failure(monkeypatch) -> No
         torch.testing.assert_close(tensor, before[name], atol=0.0, rtol=0.0)
 
 
+def test_atomic_hf_vpp_preflight_rejects_later_chunk_before_any_mutation() -> None:
+    from megatron.lite.primitive.ckpt.hf_weights import copy_hf_states_atomically
+
+    first = _weight_module((2, 2))
+    second = _weight_module((2, 2))
+    first.weight.data.fill_(11.0)
+    second.weight.data.fill_(13.0)
+
+    with pytest.raises(RuntimeError, match=r"preflight failed.*chunk1"):
+        copy_hf_states_atomically(
+            [
+                (first, {"weight": torch.full((2, 2), 17.0)}),
+                (second, {}),
+            ],
+            context="VPP HF load",
+        )
+
+    torch.testing.assert_close(
+        first.weight, torch.full((2, 2), 11.0), atol=0.0, rtol=0.0
+    )
+    torch.testing.assert_close(
+        second.weight, torch.full((2, 2), 13.0), atol=0.0, rtol=0.0
+    )
+
+
+def test_atomic_hf_vpp_copy_failure_rolls_back_earlier_chunks(monkeypatch) -> None:
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    first = _weight_module((2, 2))
+    second = _weight_module((2, 2))
+    first.weight.data.fill_(11.0)
+    second.weight.data.fill_(13.0)
+    real_copy = hf_weights._copy_tensor_for_hf_load
+    calls = 0
+
+    def fail_second_chunk(target: torch.Tensor, source: torch.Tensor) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected VPP copy failure")
+        real_copy(target, source)
+
+    monkeypatch.setattr(hf_weights, "_copy_tensor_for_hf_load", fail_second_chunk)
+    with pytest.raises(RuntimeError, match=r"atomic copy failed.*chunk1.weight"):
+        hf_weights.copy_hf_states_atomically(
+            [
+                (first, {"weight": torch.full((2, 2), 17.0)}),
+                (second, {"weight": torch.full((2, 2), 19.0)}),
+            ],
+            context="VPP HF load",
+        )
+
+    torch.testing.assert_close(
+        first.weight, torch.full((2, 2), 11.0), atol=0.0, rtol=0.0
+    )
+    torch.testing.assert_close(
+        second.weight, torch.full((2, 2), 13.0), atol=0.0, rtol=0.0
+    )
+
+
 def _gloo_corrupt_one_stage_worker(rank: int, init_path: str) -> None:
     from megatron.lite.primitive.ckpt import hf_weights
 
@@ -316,4 +376,117 @@ def test_atomic_hf_load_corrupt_one_stage_gloo_consensus_no_hang(tmp_path) -> No
         process.terminate()
         process.join(timeout=5)
     assert not alive, "distributed HF load consensus hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+def _gloo_vpp_copy_failure_worker(rank: int, init_path: str) -> None:
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    try:
+        real_copy = hf_weights._copy_tensor_for_hf_load
+
+        # Exercise both possible failing ranks in one process-group lifetime.
+        # The injected failure is in chunk 2, after every rank has already
+        # mutated chunks 0 and 1. The transaction must restore all chunks on
+        # both ranks before it reports the peer failure.
+        for failing_rank in (0, 1):
+            chunks = [_weight_module((2, 2)) for _ in range(3)]
+            before: list[torch.Tensor] = []
+            model_states: list[tuple[nn.Module, dict[str, torch.Tensor]]] = []
+            for chunk_idx, chunk in enumerate(chunks):
+                baseline = float(100 * rank + 10 * failing_rank + chunk_idx)
+                chunk.weight.data.fill_(baseline)
+                before.append(chunk.weight.detach().clone())
+                model_states.append(
+                    (
+                        chunk,
+                        {
+                            "weight": torch.full(
+                                (2, 2), 1000.0 + baseline, dtype=torch.float32
+                            )
+                        },
+                    )
+                )
+
+            calls = 0
+
+            def fail_later_chunk(
+                target: torch.Tensor, source: torch.Tensor
+            ) -> None:
+                nonlocal calls
+                calls += 1
+                if rank == failing_rank and calls == 3:
+                    raise RuntimeError(
+                        f"rank-{failing_rank} injected VPP chunk-2 copy failure"
+                    )
+                real_copy(target, source)
+
+            hf_weights._copy_tensor_for_hf_load = fail_later_chunk
+            try:
+                try:
+                    hf_weights.copy_hf_states_atomically(
+                        model_states,
+                        context=f"distributed VPP test load failing rank {failing_rank}",
+                    )
+                except RuntimeError as exc:
+                    message = str(exc)
+                    assert f"rank-{failing_rank} injected VPP" in message
+                    assert "copying chunk2.weight" in message
+                else:
+                    raise AssertionError(
+                        "rank-local later-chunk copy error was not propagated"
+                    )
+            finally:
+                hf_weights._copy_tensor_for_hf_load = real_copy
+
+            local_restored = []
+            for chunk_idx, chunk in enumerate(chunks):
+                torch.testing.assert_close(
+                    chunk.weight.detach(), before[chunk_idx], atol=0.0, rtol=0.0
+                )
+                local_restored.append(chunk.weight.detach().clone())
+
+            # A collective readback explicitly covers both ranks x all chunks.
+            gathered: list[list[torch.Tensor] | None] = [None, None]
+            dist.all_gather_object(gathered, local_restored)
+            for peer_rank, peer_chunks in enumerate(gathered):
+                assert peer_chunks is not None
+                for chunk_idx, restored in enumerate(peer_chunks):
+                    expected = torch.full(
+                        (2, 2),
+                        float(100 * peer_rank + 10 * failing_rank + chunk_idx),
+                    )
+                    torch.testing.assert_close(
+                        restored, expected, atol=0.0, rtol=0.0
+                    )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is unavailable")
+def test_atomic_hf_vpp_copy_failure_gloo_rolls_back_all_chunks_on_all_ranks(
+    tmp_path,
+) -> None:
+    init_path = str(tmp_path / "gloo-vpp-init")
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(target=_gloo_vpp_copy_failure_worker, args=(rank, init_path))
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+    assert not alive, "distributed VPP HF load rollback consensus hung"
     assert [process.exitcode for process in processes] == [0, 0]

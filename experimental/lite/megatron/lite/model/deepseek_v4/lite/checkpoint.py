@@ -32,7 +32,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     _resolve_export_dtype,
     copy_hf_state_atomically,
     gather_pipeline_state_dict,
-    materialize_hf_load_state,
+    load_hf_model_chunks_atomically,
     named_persistent_buffers,
     parse_expert_idx,
     to_global_layer_name,
@@ -372,19 +372,16 @@ def _materialize_hf_weights(
 
 
 def load_hf_weights(
-    model: nn.Module, path: str, config: DeepseekV4Config, ps: ParallelState
+    model: nn.Module | list[nn.Module],
+    path: str,
+    config: DeepseekV4Config,
+    ps: ParallelState,
 ) -> None:
     participating_group = dist.group.WORLD if dist.is_initialized() else None
-    loaded = materialize_hf_load_state(
-        lambda: _materialize_hf_weights(model, path, config, ps),
+    loaded_count = load_hf_model_chunks_atomically(
+        model,
+        lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
         context="DeepSeek V4 HF load",
-        participating_group=participating_group,
-    )
-    base_model = unwrap_model(model)
-    loaded_count = len(loaded)
-    _copy_loaded_state(
-        base_model,
-        loaded,
         participating_group=participating_group,
     )
     log_rank0(f"DeepSeek V4 native loaded {loaded_count} tensors from {path}")

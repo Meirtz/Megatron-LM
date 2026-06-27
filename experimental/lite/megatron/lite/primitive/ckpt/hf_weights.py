@@ -317,91 +317,95 @@ def _distributed_any_error(
     return bool(failed.item())
 
 
-def copy_hf_state_atomically(
+def _prepare_hf_state_copy(
     model: nn.Module,
     loaded: dict[str, torch.Tensor],
+    *,
+    allow_missing_parameter: Callable[[str], bool],
+) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+    parameters = dict(model.named_parameters())
+    buffers = dict(named_persistent_buffers(model))
+    overlap = sorted(set(parameters).intersection(buffers))
+    if overlap:
+        raise RuntimeError(f"parameter/buffer name collision: {overlap}")
+    targets: dict[str, torch.Tensor] = {**parameters, **buffers}
+    resolved: dict[str, tuple[str, torch.Tensor]] = {}
+    for native_name, source in loaded.items():
+        if not isinstance(native_name, str):
+            raise TypeError(
+                f"checkpoint target name must be str, got {type(native_name).__name__}"
+            )
+        if not isinstance(source, torch.Tensor):
+            raise TypeError(
+                f"checkpoint tensor for {native_name} must be torch.Tensor, "
+                f"got {type(source).__name__}"
+            )
+        actual = _resolve_load_target(native_name, targets)
+        if actual is None:
+            raise RuntimeError(f"checkpoint tensor has no native target: {native_name}")
+        if actual in resolved:
+            previous = resolved[actual][0]
+            raise RuntimeError(
+                f"checkpoint tensors {previous!r} and {native_name!r} both "
+                f"resolve to native target {actual!r}"
+            )
+        target = targets[actual]
+        if source.shape != target.shape:
+            raise RuntimeError(
+                f"checkpoint shape mismatch for {actual}: "
+                f"source={tuple(source.shape)} target={tuple(target.shape)}"
+            )
+        if target.is_meta:
+            raise RuntimeError(
+                f"checkpoint target {actual} is still on the meta device"
+            )
+        _validate_load_dtype(actual, source, target)
+        resolved[actual] = (native_name, source)
+
+    missing_parameters = sorted(
+        name
+        for name in parameters
+        if name not in resolved and not allow_missing_parameter(name)
+    )
+    missing_buffers = sorted(name for name in buffers if name not in resolved)
+    if missing_parameters or missing_buffers:
+        details = []
+        if missing_parameters:
+            details.append(f"parameters={missing_parameters}")
+        if missing_buffers:
+            details.append(f"persistent_buffers={missing_buffers}")
+        raise RuntimeError(
+            "checkpoint does not cover all required native state: " + ", ".join(details)
+        )
+    return [(name, targets[name], resolved[name][1]) for name in sorted(resolved)]
+
+
+def copy_hf_states_atomically(
+    model_states: list[tuple[nn.Module, dict[str, torch.Tensor]]],
     *,
     context: str,
     participating_group: dist.ProcessGroup | None = None,
     allow_missing_parameter: Callable[[str], bool] = _is_adapter_parameter,
 ) -> int:
-    """Strictly preflight and transactionally copy a native HF load state.
-
-    The preflight resolves only exact names or a unique wrapper suffix, rejects
-    every unmapped/duplicate source, requires complete native parameter and
-    persistent-buffer coverage (apart from explicitly allowed adapters), and
-    checks exact shape plus the dtype policy without changing the model.
-
-    Once every rank passes preflight, copies are performed under ``no_grad``.
-    Old values are retained as CPU rollback snapshots.  If any rank observes a
-    copy failure, all participating ranks restore their old values before the
-    distributed error is raised, preventing a mixed old/new pipeline model.
-    Non-persistent/derived buffers are deliberately absent from the target set.
-    """
+    """Preflight and commit every VPP chunk as one distributed transaction."""
     prepared: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     local_error = None
     try:
-        parameters = dict(model.named_parameters())
-        buffers = dict(named_persistent_buffers(model))
-        overlap = sorted(set(parameters).intersection(buffers))
-        if overlap:
-            raise RuntimeError(f"parameter/buffer name collision: {overlap}")
-        targets: dict[str, torch.Tensor] = {**parameters, **buffers}
-        resolved: dict[str, tuple[str, torch.Tensor]] = {}
-        for native_name, source in loaded.items():
-            if not isinstance(native_name, str):
-                raise TypeError(
-                    f"checkpoint target name must be str, got {type(native_name).__name__}"
+        if not model_states:
+            raise ValueError("HF load transaction requires at least one model chunk")
+        for chunk_idx, (model, loaded) in enumerate(model_states):
+            try:
+                chunk_prepared = _prepare_hf_state_copy(
+                    model,
+                    loaded,
+                    allow_missing_parameter=allow_missing_parameter,
                 )
-            if not isinstance(source, torch.Tensor):
-                raise TypeError(
-                    f"checkpoint tensor for {native_name} must be torch.Tensor, "
-                    f"got {type(source).__name__}"
-                )
-            actual = _resolve_load_target(native_name, targets)
-            if actual is None:
-                raise RuntimeError(
-                    f"checkpoint tensor has no native target: {native_name}"
-                )
-            if actual in resolved:
-                previous = resolved[actual][0]
-                raise RuntimeError(
-                    f"checkpoint tensors {previous!r} and {native_name!r} both "
-                    f"resolve to native target {actual!r}"
-                )
-            target = targets[actual]
-            if source.shape != target.shape:
-                raise RuntimeError(
-                    f"checkpoint shape mismatch for {actual}: "
-                    f"source={tuple(source.shape)} target={tuple(target.shape)}"
-                )
-            if target.is_meta:
-                raise RuntimeError(
-                    f"checkpoint target {actual} is still on the meta device"
-                )
-            _validate_load_dtype(actual, source, target)
-            resolved[actual] = (native_name, source)
-
-        missing_parameters = sorted(
-            name
-            for name in parameters
-            if name not in resolved and not allow_missing_parameter(name)
-        )
-        missing_buffers = sorted(name for name in buffers if name not in resolved)
-        if missing_parameters or missing_buffers:
-            details = []
-            if missing_parameters:
-                details.append(f"parameters={missing_parameters}")
-            if missing_buffers:
-                details.append(f"persistent_buffers={missing_buffers}")
-            raise RuntimeError(
-                "checkpoint does not cover all required native state: "
-                + ", ".join(details)
+            except Exception as exc:
+                raise RuntimeError(f"chunk{chunk_idx}: {exc}") from exc
+            prepared.extend(
+                (f"chunk{chunk_idx}.{name}", target, source)
+                for name, target, source in chunk_prepared
             )
-
-        prepared = [
-            (name, targets[name], resolved[name][1]) for name in sorted(resolved)
-        ]
     except Exception as exc:  # every rank still enters the consensus below
         local_error = f"{type(exc).__name__}: {exc}"
 
@@ -411,11 +415,10 @@ def copy_hf_state_atomically(
         participating_group=participating_group,
     )
 
-    # The source dictionary is private load staging state in all model loaders.
-    # Releasing its references as copies complete lets CPU rollback snapshots
-    # reuse approximately the same host-memory envelope instead of retaining a
-    # second full checkpoint copy.
-    loaded.clear()
+    # The source dictionaries are private staging state. Releasing their keys
+    # before commit lets rollback snapshots reuse that host-memory envelope.
+    for _model, loaded in model_states:
+        loaded.clear()
     backups: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     local_error = None
     with torch.no_grad():
@@ -458,6 +461,54 @@ def copy_hf_state_atomically(
         raise AssertionError("unreachable after distributed HF load failure")
 
     return len(prepared)
+
+
+def copy_hf_state_atomically(
+    model: nn.Module,
+    loaded: dict[str, torch.Tensor],
+    *,
+    context: str,
+    participating_group: dist.ProcessGroup | None = None,
+    allow_missing_parameter: Callable[[str], bool] = _is_adapter_parameter,
+) -> int:
+    """Strictly preflight and transactionally copy one native HF load state.
+
+    The multi-chunk implementation retains CPU rollback snapshots until the
+    complete transaction succeeds, so this wrapper preserves the original
+    single-model API without weakening VPP atomicity.
+    """
+    return copy_hf_states_atomically(
+        [(model, loaded)],
+        context=context,
+        participating_group=participating_group,
+        allow_missing_parameter=allow_missing_parameter,
+    )
+
+
+def load_hf_model_chunks_atomically(
+    models: nn.Module | list[nn.Module],
+    builder: Callable[[nn.Module], dict[str, torch.Tensor]],
+    *,
+    context: str,
+    participating_group: dist.ProcessGroup | None = None,
+    allow_missing_parameter: Callable[[str], bool] = _is_adapter_parameter,
+) -> int:
+    """Materialize all VPP chunks before committing any native model state."""
+    chunks = [models] if isinstance(models, nn.Module) else list(models)
+    staged: list[tuple[nn.Module, dict[str, torch.Tensor]]] = []
+    for chunk_idx, chunk in enumerate(chunks):
+        loaded = materialize_hf_load_state(
+            lambda chunk=chunk: builder(chunk),
+            context=f"{context} chunk {chunk_idx}",
+            participating_group=participating_group,
+        )
+        staged.append((unwrap_model(chunk), loaded))
+    return copy_hf_states_atomically(
+        staged,
+        context=context,
+        participating_group=participating_group,
+        allow_missing_parameter=allow_missing_parameter,
+    )
 
 
 def materialize_hf_weights_distributed(
@@ -612,6 +663,16 @@ def _cast_export_tensor(
     if export_dtype is None or not tensor.is_floating_point():
         return tensor
     return tensor.to(dtype=export_dtype)
+
+
+def _is_vocab_parallel_state(name: str) -> bool:
+    return name in {
+        "embed.embedding.weight",
+        "embed_tokens.embedding.weight",
+        "mtp_embed.embedding.weight",
+        "head.col.linear.weight",
+        "lm_head.col.linear.weight",
+    }
 
 
 # ======================================================================
@@ -784,7 +845,7 @@ def load_hf_weights(
         if tp_info is not None:
             split_d, tp_or_etp = tp_info
             if tp_or_etp == 0:
-                if vocab_size is not None and ("embed" in mapped or "head" in mapped):
+                if vocab_size is not None and _is_vocab_parallel_state(mapped):
                     padded = pad_vocab_for_tp(vocab_size, ps.tp_size)
                     if tensor.size(0) < padded:
                         pad = torch.zeros(
@@ -926,8 +987,8 @@ def export_hf_weights(
                 exported_params += 1
                 if not rank0_only or rank == 0:
                     for native_name, gathered_tensor in gathered_one.items():
-                        if vocab_size is not None and (
-                            "embed" in native_name or "head" in native_name
+                        if vocab_size is not None and _is_vocab_parallel_state(
+                            native_name
                         ):
                             gathered_tensor = gathered_tensor[:vocab_size]
                         for hf_name, hf_tensor in spec.native_to_hf(
@@ -1038,7 +1099,7 @@ def export_hf_weights(
     # Vocab trim
     if vocab_size is not None:
         for key in list(gathered.keys()):
-            if "embed" in key or "head" in key:
+            if _is_vocab_parallel_state(key):
                 gathered[key] = gathered[key][:vocab_size]
 
     # Convert Megatron Lite names → HF names via spec

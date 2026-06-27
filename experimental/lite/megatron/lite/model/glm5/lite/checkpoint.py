@@ -35,7 +35,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     _resolve_export_dtype,
     copy_hf_state_atomically,
     gather_pipeline_state_dict,
-    materialize_hf_load_state,
+    load_hf_model_chunks_atomically,
     named_persistent_buffers,
     parse_expert_idx,
     to_global_layer_name,
@@ -663,17 +663,16 @@ def _materialize_hf_weights(
 
 
 def load_hf_weights(
-    model: nn.Module, path: str, config: Glm5Config, ps: ParallelState
+    model: nn.Module | list[nn.Module],
+    path: str,
+    config: Glm5Config,
+    ps: ParallelState,
 ) -> None:
     participating_group = dist.group.WORLD if dist.is_initialized() else None
-    loaded = materialize_hf_load_state(
-        lambda: _materialize_hf_weights(model, path, config, ps),
+    load_hf_model_chunks_atomically(
+        model,
+        lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
         context="GLM-5 HF load",
-        participating_group=participating_group,
-    )
-    _copy_loaded_state(
-        unwrap_model(model),
-        loaded,
         participating_group=participating_group,
     )
 

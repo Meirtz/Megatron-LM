@@ -1,8 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
 import math
+import os
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -20,6 +22,36 @@ from megatron.lite.model.registry import (
     TRAIN_RUNTIME_MODULES,
     resolve_runtime_model_name,
 )
+
+
+_QWEN35_VISION_EXACT_REQUIRED_ENV = "MLITE_REQUIRE_QWEN35_VISION_EXACT"
+_QWEN35_VISION_EXACT_PASS_MARKER = "QWEN35_VISION_EXACT_PASS"
+
+
+def _transformers_5_12_for_vision_exact():
+    required = os.getenv(_QWEN35_VISION_EXACT_REQUIRED_ENV) == "1"
+    try:
+        transformers = __import__("transformers")
+    except (ImportError, OSError) as exc:
+        message = (
+            "Qwen3.5 vision exact parity requires Transformers 5.12.0; "
+            f"import failed: {type(exc).__name__}: {exc}"
+        )
+        if required:
+            pytest.fail(message, pytrace=False)
+        pytest.skip(message)
+
+    version = getattr(transformers, "__version__", "unknown")
+    if version != "5.12.0":
+        message = (
+            "Qwen3.5 vision exact parity is pinned to Transformers 5.12.0; "
+            f"found {version}. Set {_QWEN35_VISION_EXACT_REQUIRED_ENV}=1 in "
+            "Phase A to make this prerequisite fail instead of skip."
+        )
+        if required:
+            pytest.fail(message, pytrace=False)
+        pytest.skip(message)
+    return transformers
 
 
 def _tiny_config() -> Qwen35Config:
@@ -181,6 +213,87 @@ def test_qwen35_protocol_registers_vllm_export_entrypoint() -> None:
 
     assert key == "qwen3_5"
     assert callable(module.export_hf_weights)
+
+
+def test_qwen35_official_vision_checkpoint_load_export_exact(tmp_path) -> None:
+    transformers = _transformers_5_12_for_vision_exact()
+    from safetensors.torch import save_file
+    from transformers import Qwen3_5VisionConfig, Qwen3_5VisionModel
+
+    from megatron.lite.model.qwen3_5.lite import checkpoint
+
+    vision_cfg = Qwen3_5VisionConfig(
+        depth=1,
+        hidden_size=16,
+        intermediate_size=32,
+        num_heads=4,
+        patch_size=2,
+        temporal_patch_size=1,
+        spatial_merge_size=1,
+        out_hidden_size=8,
+        num_position_embeddings=16,
+    )
+    torch.manual_seed(20260628)
+    authority = Qwen3_5VisionModel(vision_cfg)
+    source = {
+        f"model.visual.{name}": tensor.detach().clone()
+        for name, tensor in authority.state_dict().items()
+    }
+    save_file(source, tmp_path / "model.safetensors")
+
+    class VisionOnlyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_indices: list[int] = []
+            self.vision_model = Qwen3_5VisionModel(vision_cfg).to(torch.bfloat16)
+            self.mtp = None
+
+    target = VisionOnlyModel()
+    # Keep this deliberately smaller than the vision patch-embedding output.
+    # Generic vocab trimming must never truncate ``vision_model.patch_embed``.
+    cfg = SimpleNamespace(vocab_size=1)
+    ps = _single_rank_parallel_state()
+    checkpoint.load_hf_weights(target, str(tmp_path), cfg, ps)
+
+    target_state = target.vision_model.state_dict()
+    assert target_state.keys() == authority.state_dict().keys()
+    for name, expected in authority.state_dict().items():
+        torch.testing.assert_close(
+            target_state[name], expected.to(torch.bfloat16), atol=0.0, rtol=0.0
+        )
+
+    exported = dict(checkpoint.export_hf_weights(target, cfg, ps))
+    assert exported.keys() == source.keys()
+    for hf_name, expected in source.items():
+        torch.testing.assert_close(
+            exported[hf_name], expected.to(torch.bfloat16), atol=0.0, rtol=0.0
+        )
+
+    placements = PLACEMENT_FN("vision_model.patch_embed.proj.weight")
+    assert all(type(placement).__name__ == "Replicate" for placement in placements)
+    spec = Qwen35WeightSpec(cfg, target="vllm")
+    with pytest.raises(NotImplementedError, match="vision export"):
+        spec.native_to_hf("vision_model.patch_embed.proj.weight", torch.ones(1))
+    print(f"{_QWEN35_VISION_EXACT_PASS_MARKER} transformers={transformers.__version__}")
+
+
+def test_qwen35_public_vllm_export_rejects_vision_before_first_yield() -> None:
+    class TextThenVisionModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_indices: list[int] = []
+            self.embed = nn.Module()
+            self.embed.embedding = nn.Embedding(4, 2)
+            self.vision_model = nn.Linear(2, 2, bias=False)
+
+    generator = export_hf_weights(
+        TextThenVisionModel(),
+        SimpleNamespace(vocab_size=4),
+        _single_rank_parallel_state(),
+        target="vllm",
+    )
+    with pytest.raises(NotImplementedError, match="vision export"):
+        next(generator)
 
 
 def test_qwen35_export_uses_hf_checkpoint_names_without_module_prefix() -> None:

@@ -18,7 +18,8 @@ from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.ckpt.hf_weights import (
     SafeTensorReader,
     copy_hf_state_atomically,
-    materialize_hf_load_state,
+    load_hf_model_chunks_atomically,
+    named_persistent_buffers,
     unwrap_model,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -30,6 +31,10 @@ def EXPERT_CLASSIFIER(name: str) -> bool:
 
 
 def PLACEMENT_FN(param_name: str) -> list:
+    if param_name.startswith("vision_model."):
+        # The mounted HF vision tower is replicated across the language-model
+        # TP domain; its gradients are averaged by the model hook.
+        return [Replicate(), Replicate(), Replicate(), Replicate()]
     if (
         "experts" in param_name
         and "router" not in param_name
@@ -366,6 +371,13 @@ class Qwen35WeightSpec:
     def native_to_hf(
         self, native_name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
+        if native_name.startswith("vision_model."):
+            if self.target != "hf":
+                raise NotImplementedError(
+                    "Qwen3.5 mounted vision export is supported only for the HF target."
+                )
+            suffix = native_name.removeprefix("vision_model.")
+            return [(f"model.visual.{suffix}", tensor)]
         if self.target == "vllm":
             return self._native_to_vllm(native_name, tensor)
 
@@ -825,6 +837,13 @@ def _materialize_hf_weights(
     reader = SafeTensorReader(path)
     out: dict[str, torch.Tensor] = {}
 
+    vision_model = getattr(base_model, "vision_model", None)
+    if vision_model is not None:
+        for name, _target in vision_model.named_parameters():
+            out[f"vision_model.{name}"] = _get(reader, f"model.visual.{name}")
+        for name, _target in named_persistent_buffers(vision_model):
+            out[f"vision_model.{name}"] = _get(reader, f"model.visual.{name}")
+
     prefix = "model.language_model"
     if getattr(base_model, "embed", None) is not None:
         out["embed.embedding.weight"] = _load_vocab(
@@ -949,17 +968,16 @@ def _materialize_hf_weights(
 
 
 def load_hf_weights(
-    model: nn.Module, path: str, config: Qwen35Config, ps: ParallelState
+    model: nn.Module | list[nn.Module],
+    path: str,
+    config: Qwen35Config,
+    ps: ParallelState,
 ) -> None:
     participating_group = dist.group.WORLD if dist.is_initialized() else None
-    loaded = materialize_hf_load_state(
-        lambda: _materialize_hf_weights(model, path, config, ps),
+    load_hf_model_chunks_atomically(
+        model,
+        lambda chunk: _materialize_hf_weights(chunk, path, config, ps),
         context="Qwen3.5 HF load",
-        participating_group=participating_group,
-    )
-    _copy_loaded_state(
-        unwrap_model(model),
-        loaded,
         participating_group=participating_group,
     )
 
@@ -977,6 +995,14 @@ def export_hf_weights(
     target = kwargs.pop("target", "hf")
     if include_mtp_only:
         return
+    chunks = list(model) if isinstance(model, nn.ModuleList | list) else [model]
+    if target != "hf" and any(
+        getattr(unwrap_model(chunk), "vision_model", None) is not None
+        for chunk in chunks
+    ):
+        raise NotImplementedError(
+            "Qwen3.5 mounted vision export is supported only for the HF target."
+        )
     yield from _export(
         model,
         Qwen35WeightSpec(config, target=target),
