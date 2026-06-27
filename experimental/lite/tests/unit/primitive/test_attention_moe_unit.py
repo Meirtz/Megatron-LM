@@ -298,6 +298,31 @@ def test_dsv4_fused_dsa_legacy_two_output_api_cpu_mock(monkeypatch):
     assert with_topk_result[2].dtype == torch.int32
 
 
+def test_glm32_indexer_backward_padding_is_zero_and_reversible():
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    query = torch.arange(2 * 3 * 32 * 4, dtype=torch.float32).view(2, 3, 32, 4)
+    weights = torch.arange(2 * 3 * 32, dtype=torch.float32).view(2, 3, 32)
+    padded_query, padded_weights, original_heads = (
+        dsa_kernels._pad_indexer_heads_for_backward(query, weights)
+    )
+
+    assert original_heads == 32
+    assert padded_query.shape == (2, 3, 64, 4)
+    assert padded_weights.shape == (2, 3, 64)
+    torch.testing.assert_close(padded_query[:, :, :32], query)
+    torch.testing.assert_close(padded_weights[:, :, :32], weights)
+    assert torch.count_nonzero(padded_query[:, :, 32:]).item() == 0
+    assert torch.count_nonzero(padded_weights[:, :, 32:]).item() == 0
+
+    unchanged_query, unchanged_weights, original_heads = (
+        dsa_kernels._pad_indexer_heads_for_backward(padded_query, padded_weights)
+    )
+    assert original_heads == 64
+    assert unchanged_query is padded_query
+    assert unchanged_weights is padded_weights
+
+
 def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():
     from megatron.lite.primitive.modules.attention.dsa import (
         validate_dsa_index_share_pipeline_split,

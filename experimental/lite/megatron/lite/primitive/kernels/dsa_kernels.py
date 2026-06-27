@@ -775,6 +775,36 @@ def _kl_loss_from_dense_scores(
     return loss_coeff * loss
 
 
+_MIN_INDEXER_BACKWARD_HEADS = 64
+
+
+def _pad_indexer_heads_for_backward(
+    q_indexer_bshd: Tensor, weights_bsh: Tensor
+) -> Tuple[Tensor, Tensor, int]:
+    """Pad released GLM's 32 heads to the vendor backward minimum of 64.
+
+    Zero-valued query and weight heads contribute exactly zero to the indexer
+    score and its key gradient.  This preserves the released checkpoint math
+    while allowing the current SM90/SM100 cuDNN kernels, which assert
+    ``heads >= 64``, to execute.  Returned query/weight gradients are sliced
+    back to ``original_heads`` immediately after the kernel call.
+    """
+
+    original_heads = q_indexer_bshd.shape[2]
+    if weights_bsh.shape[2] != original_heads:
+        raise ValueError(
+            "indexer query/weight head mismatch: "
+            f"q={original_heads}, weights={weights_bsh.shape[2]}"
+        )
+    if original_heads >= _MIN_INDEXER_BACKWARD_HEADS:
+        return q_indexer_bshd, weights_bsh, original_heads
+
+    pad_heads = _MIN_INDEXER_BACKWARD_HEADS - original_heads
+    q_padded = torch.nn.functional.pad(q_indexer_bshd, (0, 0, 0, pad_heads))
+    weights_padded = torch.nn.functional.pad(weights_bsh, (0, pad_heads))
+    return q_padded.contiguous(), weights_padded.contiguous(), original_heads
+
+
 class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
     """Internal Path B autograd that additionally returns top-k indices.
 
@@ -930,12 +960,15 @@ class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
         unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
 
         if loss_coeff > 0:
+            q_idx_bwd, w_bwd, original_index_heads = _pad_indexer_heads_for_backward(
+                q_idx_bshd, w_bsh
+            )
             if sparse_loss:
                 attn_score_for_bwd = target.clone()
                 index_score_for_bwd = predict.clone()
                 ig = _DSA.indexer_backward_wrapper(
-                    q_idx_bshd,
-                    w_bsh,
+                    q_idx_bwd,
+                    w_bwd,
                     k_idx_bsd,
                     attn_score_for_bwd,
                     index_score_for_bwd,
@@ -949,8 +982,8 @@ class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
                 attn_score_for_bwd = attn_score.clone()
                 index_score_for_bwd = index_score.clone()
                 ig = _DSA.dense_indexer_backward_wrapper(
-                    q_idx_bshd,
-                    w_bsh,
+                    q_idx_bwd,
+                    w_bwd,
                     k_idx_bsd,
                     attn_score_for_bwd,
                     attn_l1norm,
@@ -962,10 +995,19 @@ class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
                     ratio=ratio,
                     block_I=128,
                 )
-            # BSHD -> SBHD (match input layout).
-            precomputed_grad_q_indexer = ig["d_index_q"].permute(1, 0, 2, 3).contiguous()
+            # Remove any compatibility padding, then BSHD -> SBHD to match
+            # the original autograd inputs.  dK already sums across heads.
+            precomputed_grad_q_indexer = (
+                ig["d_index_q"][:, :, :original_index_heads, :]
+                .permute(1, 0, 2, 3)
+                .contiguous()
+            )
             precomputed_grad_k_indexer = ig["d_index_k"].permute(1, 0, 2).contiguous()
-            precomputed_grad_weights = ig["d_weights"].permute(1, 0, 2).contiguous()
+            precomputed_grad_weights = (
+                ig["d_weights"][:, :, :original_index_heads]
+                .permute(1, 0, 2)
+                .contiguous()
+            )
         else:
             precomputed_grad_q_indexer = torch.zeros_like(q_indexer)
             precomputed_grad_k_indexer = torch.zeros_like(k_indexer)

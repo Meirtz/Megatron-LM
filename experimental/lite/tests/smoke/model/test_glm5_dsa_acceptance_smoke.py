@@ -19,7 +19,7 @@ _INDEXER_LOSS_COEFF = 1.0e-2
 _MIN_INDEXER_GRAD_MAX_ABS = 1.0e-8
 
 
-def _make_dsa_pair():
+def _make_dsa_pair(*, sparse_loss: bool):
     pytest.importorskip("cudnn", reason="GLM5 DSA accept-with-proof needs cudnn DSA.")
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention
 
@@ -41,7 +41,7 @@ def _make_dsa_pair():
         index_skip_topk_offset=1,
         index_share_enabled=True,
         indexer_loss_coeff=_INDEXER_LOSS_COEFF,
-        indexer_use_sparse_loss=True,
+        indexer_use_sparse_loss=sparse_loss,
     )
     source = DynamicSparseAttention(
         **common,
@@ -252,6 +252,66 @@ def _torch_sparse_indexer_loss(
     return float(loss_coeff) * kl_per_row.mean()
 
 
+def _torch_dense_indexer_loss(
+    indexer_scores: torch.Tensor,
+    query_states: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_indices: torch.Tensor,
+    *,
+    softmax_scale: float,
+    loss_coeff: float,
+) -> torch.Tensor:
+    """Independent full-KV KL oracle for GLM's default dense loss."""
+
+    query_bshd = query_states.detach().permute(1, 0, 2, 3).float()
+    kv_bsd = kv_full.detach().permute(1, 0, 2).float()
+    attn_scores = torch.einsum("bqhd,bkd->bqhk", query_bshd, kv_bsd)
+    attn_scores = attn_scores * float(softmax_scale)
+    causal = _causal_mask(
+        attn_scores.shape[1], attn_scores.shape[-1], ratio=1, device=attn_scores.device
+    )
+    attn_scores = torch.where(
+        causal.view(1, causal.shape[0], 1, causal.shape[1]),
+        attn_scores,
+        torch.full_like(attn_scores, -torch.inf),
+    )
+    # FlashMLA reports the per-head LSE over the selected sparse keys plus
+    # sink.  Dense DSA then recomputes all-key scores against that same LSE
+    # before L1-normalising the head-summed target over the full KV axis.
+    selected_keys = _gather_sequence(kv_bsd, topk_indices)
+    selected_scores = torch.einsum("bqhd,bqtd->bqht", query_bshd, selected_keys)
+    selected_scores = selected_scores * float(softmax_scale)
+    selected_scores = torch.where(
+        topk_indices.unsqueeze(2) >= 0,
+        selected_scores,
+        torch.full_like(selected_scores, -torch.inf),
+    )
+    sink = attn_sink.detach().float().view(1, 1, -1, 1)
+    sink = sink.expand(selected_scores.shape[0], selected_scores.shape[1], -1, -1)
+    selected_lse = torch.logsumexp(torch.cat([selected_scores, sink], dim=-1), dim=-1)
+    target_mass = torch.exp(attn_scores - selected_lse.unsqueeze(-1)).sum(dim=2)
+    target_mass = torch.where(causal.unsqueeze(0), target_mass, torch.zeros_like(target_mass))
+    target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    target = target_mass / target_denom
+
+    row_valid = causal.any(dim=-1).unsqueeze(0)
+    safe_indexer_scores = torch.where(
+        row_valid.unsqueeze(-1), indexer_scores, torch.zeros_like(indexer_scores)
+    )
+    predict = torch.softmax(safe_indexer_scores, dim=-1)
+    eps = torch.finfo(torch.float32).tiny
+    terms = target.clamp_min(eps) * (
+        torch.log(target.clamp_min(eps)) - torch.log(predict.clamp_min(eps))
+    )
+    terms = torch.where(causal.unsqueeze(0), terms, torch.zeros_like(terms))
+    kl_per_row = terms.sum(dim=-1)
+    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+    return float(loss_coeff) * kl_per_row.mean()
+
+
 def _torch_unfused_dsa_forward(
     module, x, cos, sin, position_ids, *, topk_indices: torch.Tensor | None = None
 ):
@@ -308,15 +368,26 @@ def _torch_unfused_dsa_forward(
         topk_indices = _torch_topk_from_scores(
             indexer_scores, min(module.index_topk, indexer_scores.shape[-1])
         )
-        indexer_loss = _torch_sparse_indexer_loss(
-            indexer_scores,
-            query_states,
-            kv_full,
-            module.attn_sink,
-            topk_indices,
-            softmax_scale=module.softmax_scale,
-            loss_coeff=module.indexer_loss_coeff,
-        )
+        if module.indexer_use_sparse_loss:
+            indexer_loss = _torch_sparse_indexer_loss(
+                indexer_scores,
+                query_states,
+                kv_full,
+                module.attn_sink,
+                topk_indices,
+                softmax_scale=module.softmax_scale,
+                loss_coeff=module.indexer_loss_coeff,
+            )
+        else:
+            indexer_loss = _torch_dense_indexer_loss(
+                indexer_scores,
+                query_states,
+                kv_full,
+                module.attn_sink,
+                topk_indices,
+                softmax_scale=module.softmax_scale,
+                loss_coeff=module.indexer_loss_coeff,
+            )
     else:
         assert topk_indices is not None
     out = _torch_sparse_attention(
@@ -412,7 +483,8 @@ def _assert_meaningful_indexer_grads(result: dict) -> float:
     return max(grad_max_abs.values())
 
 
-def test_glm5_dsa_run_to_run_accept_with_proof():
+@pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse-loss", "dense-loss"])
+def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for GLM5 DSA accept-with-proof smoke.")
 
@@ -420,7 +492,7 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
 
     device = torch.device("cuda", int(torch.cuda.current_device()))
     torch.manual_seed(20260626)
-    fused = _make_dsa_pair().to(device=device, dtype=torch.bfloat16)
+    fused = _make_dsa_pair(sparse_loss=sparse_loss).to(device=device, dtype=torch.bfloat16)
     unfused = copy.deepcopy(fused).to(device=device, dtype=torch.bfloat16)
 
     batch, seq, hidden = 1, _SEQUENCE_LENGTH, 128
@@ -492,6 +564,7 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
         f"fused_loss={float(fused_a['loss'].item()):.6e} "
         f"unfused_loss={float(unfused_a['loss'].item()):.6e} "
         f"unfused_indexer_loss={float(unfused_a['indexer_loss'].item()):.6e} "
+        f"index_heads=32 sparse_loss={sparse_loss} "
         f"indexer_topk={_INDEXER_TOPK} seq={seq} "
         f"loss_diff={loss_diff:.6e} "
         f"fused_r2r_loss_diff={fused_r2r_loss:.6e} "
