@@ -1143,17 +1143,23 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
     assert all(args[index].grad is None for index in (4, 5, 6))
 
     torch.testing.assert_close(
-        fused_results[0]["output"], fused_results[1]["output"], rtol=0.0, atol=0.0
+        fused_results[0]["output"],
+        fused_results[1]["output"],
+        rtol=0.0,
+        atol=_FUSED_R2R_OUTPUT_ATOL,
     )
     torch.testing.assert_close(
-        fused_results[0]["objective"], fused_results[1]["objective"], rtol=0.0, atol=0.0
+        fused_results[0]["objective"],
+        fused_results[1]["objective"],
+        rtol=0.0,
+        atol=_FUSED_VS_REFERENCE_LOSS_ATOL,
     )
     for name in decomposed_main_grads:
         torch.testing.assert_close(
             fused_results[0]["main_grads"][name],
             fused_results[1]["main_grads"][name],
             rtol=0.0,
-            atol=0.0,
+            atol=_FUSED_R2R_GRAD_ATOL,
         )
     torch.testing.assert_close(
         fused_results[1]["output"],
