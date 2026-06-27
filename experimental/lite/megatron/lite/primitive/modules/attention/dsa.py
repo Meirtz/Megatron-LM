@@ -340,7 +340,24 @@ def validate_dsa_index_share_pipeline_split(
         if indexer_type != "shared":
             continue
 
-        source_idx = source_dsa_compute_layer(layer_idx + 1, skip_topk_offset, topk_freq) - 1
+        if indexer_types is not None and layer_idx < len(indexer_types):
+            source_idx = next(
+                (
+                    candidate
+                    for candidate in range(layer_idx - 1, -1, -1)
+                    if indexer_types[candidate] == "full"
+                ),
+                None,
+            )
+            if source_idx is None:
+                raise ValueError(
+                    "DSA IndexShare schedule makes layer "
+                    f"{layer_idx} shared before any full source layer."
+                )
+        else:
+            source_idx = (
+                source_dsa_compute_layer(layer_idx + 1, skip_topk_offset, topk_freq) - 1
+            )
         if source_idx not in positions:
             raise ValueError(
                 "DSA IndexShare cannot cross pipeline stages: layer "
@@ -508,6 +525,8 @@ class DynamicSparseAttention(nn.Module):
         index_topk_freq: int = 1,
         index_skip_topk_offset: int = 0,
         indexer_type: str | None = None,
+        index_share_enabled: bool | None = None,
+        index_share_source_layer: int | None = None,
         indexer_loss_coeff: float = 0.0,
         indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
@@ -540,24 +559,34 @@ class DynamicSparseAttention(nn.Module):
         self.layer_number = 1 if layer_number is None else layer_number
         self.index_topk_freq = index_topk_freq
         self.index_skip_topk_offset = index_skip_topk_offset
-        inferred_indexer_type = dsa_indexer_type_for_layer(
-            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
-        )
         if indexer_type is None:
-            indexer_type = inferred_indexer_type
+            indexer_type = dsa_indexer_type_for_layer(
+                self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+            )
         if indexer_type not in {"full", "shared"}:
             raise ValueError(f"indexer_type must be 'full' or 'shared', got {indexer_type!r}")
-        if indexer_type != inferred_indexer_type:
-            raise ValueError(
-                f"indexer_type={indexer_type!r} for layer {self.layer_number} does not match "
-                f"IndexShare schedule {inferred_indexer_type!r}."
-            )
         self.indexer_type = indexer_type
-        self.index_share_enabled = self.index_topk_freq > 1
-        self.skip_topk = indexer_type == "shared"
-        self.index_share_source_layer = source_dsa_compute_layer(
-            self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+        self.index_share_enabled = (
+            self.index_topk_freq > 1 or indexer_type == "shared"
+            if index_share_enabled is None
+            else bool(index_share_enabled)
         )
+        self.skip_topk = indexer_type == "shared"
+        if self.skip_topk and not self.index_share_enabled:
+            raise ValueError("A shared DSA layer requires index_share_enabled=True")
+        if self.skip_topk:
+            if index_share_source_layer is None:
+                index_share_source_layer = source_dsa_compute_layer(
+                    self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
+                )
+            if not 1 <= index_share_source_layer < self.layer_number:
+                raise ValueError(
+                    "A shared DSA layer requires an earlier 1-indexed source layer, got "
+                    f"source={index_share_source_layer}, layer={self.layer_number}."
+                )
+        else:
+            index_share_source_layer = self.layer_number
+        self.index_share_source_layer = index_share_source_layer
         latent_rms_norm_eps = rms_norm_eps if latent_rms_norm_eps is None else latent_rms_norm_eps
         indexer_rope_interleaved = (
             rope_interleaved if indexer_rope_interleaved is None else indexer_rope_interleaved

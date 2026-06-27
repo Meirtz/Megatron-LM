@@ -239,7 +239,6 @@ def _glm52_indexshare():
         index_topk_freq=4,
         index_skip_topk_offset=3,
         indexer_types=_glm52_indexer_types(),
-        index_share_for_mtp_iteration=True,
     )
     return cfg, protocol
 

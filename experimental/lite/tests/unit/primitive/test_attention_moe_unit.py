@@ -192,3 +192,50 @@ def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():
             topk_freq=4,
             skip_topk_offset=3,
         )
+
+
+def test_dsa_index_share_pipeline_guard_uses_explicit_nearest_full_source(monkeypatch):
+    from megatron.lite.primitive.modules.attention import dsa
+
+    DynamicSparseAttention = dsa.DynamicSparseAttention
+    validate_dsa_index_share_pipeline_split = dsa.validate_dsa_index_share_pipeline_split
+
+    indexer_types = ["full", "shared", "full", "shared", "shared", "full"]
+    validate_dsa_index_share_pipeline_split(
+        [2, 3, 4],
+        topk_freq=1,
+        skip_topk_offset=0,
+        indexer_types=indexer_types,
+    )
+    with pytest.raises(ValueError, match="cannot cross pipeline stages"):
+        validate_dsa_index_share_pipeline_split(
+            [3, 4],
+            topk_freq=1,
+            skip_topk_offset=0,
+            indexer_types=indexer_types,
+        )
+
+    # A canonical explicit schedule may intentionally contradict freq/offset.
+    # The primitive accepts the caller-provided type and source instead of
+    # silently recomputing a different schedule.
+    monkeypatch.setattr(dsa, "RMSNorm", torch.nn.LayerNorm)
+    shared = DynamicSparseAttention(
+        hidden_size=16,
+        num_attention_heads=2,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=4,
+        v_head_dim=4,
+        index_n_heads=2,
+        index_head_dim=8,
+        index_topk=2,
+        rms_norm_eps=1e-5,
+        layer_number=5,
+        index_topk_freq=1,
+        indexer_type="shared",
+        index_share_enabled=True,
+        index_share_source_layer=3,
+    )
+    assert shared.indexer is None
+    assert shared.index_share_source_layer == 3
