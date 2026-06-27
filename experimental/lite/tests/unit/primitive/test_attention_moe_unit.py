@@ -52,6 +52,35 @@ def _walk_grad_fn_names(tensor: torch.Tensor) -> set[str]:
     return names
 
 
+def test_attention_public_api_is_narrow():
+    from megatron.lite.primitive.modules import attention
+
+    assert attention.__all__ == [
+        "DSAIndexShareState",
+        "DynamicSparseAttention",
+        "MultiLatentAttention",
+        "RMSNorm",
+        "build_rope_cache",
+        "build_rotary_embeddings",
+    ]
+    assert attention.DynamicSparseAttention is attention.dsa.DynamicSparseAttention
+    assert attention.DSAIndexShareState is attention.dsa.DSAIndexShareState
+    for internal_name in (
+        "dsa_indexer_type_for_layer",
+        "is_dsa_skip_topk_layer",
+        "source_dsa_compute_layer",
+        "validate_dsa_index_share_pipeline_split",
+    ):
+        assert not hasattr(attention, internal_name)
+    for internal_name in (
+        "dsa_indexer_type_for_layer",
+        "is_dsa_skip_topk_layer",
+        "source_dsa_compute_layer",
+    ):
+        assert internal_name not in attention.dsa.__all__
+    assert "validate_dsa_index_share_pipeline_split" in attention.dsa.__all__
+
+
 def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     split_grouped_qkvg = _split_grouped_qkvg()
     qkv = torch.arange(24).reshape(1, 24)
@@ -163,8 +192,13 @@ def test_dsv4_zero_loss_fused_selector_does_not_create_optimizer_grads():
 
     inputs = tuple(torch.nn.Parameter(torch.randn(2, 3)) for _ in range(3))
     detached = _prepare_indexer_inputs_for_fused_loss(*inputs, loss_coeff=0.0)
-    assert all(not tensor.requires_grad and tensor.grad_fn is None for tensor in detached)
-    assert all(actual.data_ptr() == source.data_ptr() for actual, source in zip(detached, inputs))
+    assert all(
+        not tensor.requires_grad and tensor.grad_fn is None for tensor in detached
+    )
+    assert all(
+        actual.data_ptr() == source.data_ptr()
+        for actual, source in zip(detached, inputs)
+    )
 
     before_step = tuple(parameter.detach().clone() for parameter in inputs)
     optimizer = torch.optim.AdamW(inputs, lr=0.1, weight_decay=0.5)

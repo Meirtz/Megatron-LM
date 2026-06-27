@@ -39,7 +39,7 @@ from megatron.lite.primitive.modules.attention import (
     DSAIndexShareState,
     DynamicSparseAttention,
     build_rotary_embeddings,
-    validate_dsa_index_share_pipeline_split,
+    dsa,
 )
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -883,11 +883,27 @@ class Glm5Model(nn.Module):
         self.layer_indices = layout.layer_indices
         self.pre_process = layout.has_embed
         self.post_process = layout.has_head
-        validate_dsa_index_share_pipeline_split(
-            self.layer_indices,
+        local_dsa_layer_indices = list(self.layer_indices)
+        resolved_indexer_types = list(config.resolved_dsa_indexer_types)
+        if layout.has_mtp:
+            mtp_layers_to_build = (
+                1 if config.mtp_use_repeated_layer else config.num_nextn_predict_layers
+            )
+            local_dsa_layer_indices.extend(
+                range(
+                    config.num_hidden_layers,
+                    config.num_hidden_layers + mtp_layers_to_build,
+                )
+            )
+            # MTP predictors always own full indexers. Extending the explicit
+            # schedule avoids accidentally reapplying the trunk frequency
+            # pattern to appended predictor indices during PP validation.
+            resolved_indexer_types.extend(["full"] * mtp_layers_to_build)
+        dsa.validate_dsa_index_share_pipeline_split(
+            local_dsa_layer_indices,
             topk_freq=config.index_topk_freq,
             skip_topk_offset=config.index_skip_topk_offset,
-            indexer_types=list(config.resolved_dsa_indexer_types),
+            indexer_types=resolved_indexer_types,
         )
         # GLM-5 does not tie embeddings (no tie_word_embeddings HF field); the
         # attribute is preserved for the dist-opt / distckpt interface.
