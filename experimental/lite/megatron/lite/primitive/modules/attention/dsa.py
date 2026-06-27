@@ -148,10 +148,42 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rotary_pos_emb(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, unsqueeze_dim: int
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    unsqueeze_dim: int,
+    mla_interleaved: bool = False,
 ) -> torch.Tensor:
+    """Apply half-split or MLA-style interleaved RoPE.
+
+    MLA checkpoints lay each frequency pair out as adjacent even/odd values.
+    The reference implementation rotates those pairs and returns the first
+    value from every pair followed by the second value from every pair.  This
+    is deliberately different from merely applying ``rotate_half`` to the
+    checkpoint layout.
+
+    ``mla_interleaved=False`` retains the original half-split implementation
+    byte-for-byte for GLM-5.1 and other existing callers.
+    """
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
+    if mla_interleaved:
+        if x.shape[-1] % 2:
+            raise ValueError(
+                "MLA-style interleaved RoPE requires an even rotary dimension, "
+                f"got {x.shape[-1]}."
+            )
+        # ``cos``/``sin`` come from cat(freqs, freqs); one angle is shared by
+        # each adjacent even/odd pair in the checkpoint layout.
+        pair_dim = x.shape[-1] // 2
+        cos = cos[..., :pair_dim]
+        sin = sin[..., :pair_dim]
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        return torch.cat(
+            (x_even * cos - x_odd * sin, x_odd * cos + x_even * sin), dim=-1
+        )
     return (x * cos) + (rotate_half(x) * sin)
 
 
@@ -387,8 +419,20 @@ class DSAIndexer(nn.Module):
         else:
             q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_pe = torch.split(k, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2)
+        q_pe = apply_rotary_pos_emb(
+            q_pe,
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        )
+        k_pe = apply_rotary_pos_emb(
+            k_pe.unsqueeze(2),
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        )
         k_pe = k_pe.squeeze(2)
 
         if self.rope_first:
@@ -659,7 +703,13 @@ class DynamicSparseAttention(nn.Module):
             cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim
         )
 
-        q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
+        q_pe = apply_rotary_pos_emb(
+            q_pe,
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        )
         k_up_weight, v_up_weight = self._split_kv_b_weights()
         q_nope = torch.einsum("bshd,hdr->bshr", q_nope, k_up_weight)
         query_states = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1).contiguous()
@@ -668,7 +718,13 @@ class DynamicSparseAttention(nn.Module):
             self.kv_a_proj_with_mqa(x), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         kv_latent = self.kv_a_layernorm(kv_latent)
-        k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
+        k_pe = apply_rotary_pos_emb(
+            k_pe.unsqueeze(2),
+            cos,
+            sin,
+            unsqueeze_dim=2,
+            mla_interleaved=self.rope_interleaved,
+        ).squeeze(2)
         kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
         topk_indices: torch.Tensor | None = None

@@ -139,7 +139,13 @@ def _torch_unfused_dsa_forward(module, x, cos, sin, position_ids):
     cos, sin = _rotary_embeddings_from_cache(
         cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=module.qk_rope_head_dim
     )
-    q_pe = apply_rotary_pos_emb(q_pe, cos, sin, unsqueeze_dim=2)
+    q_pe = apply_rotary_pos_emb(
+        q_pe,
+        cos,
+        sin,
+        unsqueeze_dim=2,
+        mla_interleaved=module.rope_interleaved,
+    )
 
     k_up_weight, v_up_weight = module._split_kv_b_weights()
     q_nope = torch.einsum("bshd,hdr->bshr", q_nope, k_up_weight)
@@ -149,7 +155,13 @@ def _torch_unfused_dsa_forward(module, x, cos, sin, position_ids):
         module.kv_a_proj_with_mqa(x), [module.kv_lora_rank, module.qk_rope_head_dim], dim=-1
     )
     kv_latent = module.kv_a_layernorm(kv_latent)
-    k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
+    k_pe = apply_rotary_pos_emb(
+        k_pe.unsqueeze(2),
+        cos,
+        sin,
+        unsqueeze_dim=2,
+        mla_interleaved=module.rope_interleaved,
+    ).squeeze(2)
     kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
     assert module.indexer is not None
