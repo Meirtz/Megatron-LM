@@ -695,6 +695,45 @@ def _dsa_index_share_decoder_layer_groups(config: Glm5Config) -> list[list[int]]
     return config.dsa_index_share_decoder_layer_groups()
 
 
+def _local_dsa_index_share_consumer_counts(
+    layers: nn.ModuleList,
+    mtp: Glm5MTPBlock | None,
+) -> dict[int, int]:
+    """Count local shared-layer executions for each 1-indexed source layer."""
+    consumer_counts: dict[int, int] = {}
+
+    def register(layer: Glm5Layer, *, executions: int = 1) -> None:
+        dsa = layer.self_attention.self_attention
+        if not dsa.skip_topk:
+            return
+        source_layer = dsa.index_share_source_layer
+        consumer_counts[source_layer] = consumer_counts.get(source_layer, 0) + executions
+
+    for layer in layers:
+        register(layer)
+
+    if mtp is not None and mtp.layers:
+        if mtp.repeated_layer:
+            register(mtp.layers[0].transformer_layer, executions=mtp.num_layers)
+        else:
+            for mtp_layer in mtp.layers:
+                register(mtp_layer.transformer_layer)
+
+    return consumer_counts
+
+
+def _validate_dsa_index_share_recompute(
+    consumer_counts: dict[int, int], recompute_modules: list[str]
+) -> None:
+    unsafe = {"full", "self_attn", "dsa"} & set(recompute_modules)
+    if consumer_counts and unsafe:
+        raise ValueError(
+            "DSA IndexShare is incompatible with per-layer attention recompute "
+            f"{sorted(unsafe)}: backward recomputes shared layers before their "
+            "source layer. A source+shared group-aware checkpoint is required."
+        )
+
+
 class Glm5Model(nn.Module):
     def __init__(
         self,
@@ -793,6 +832,13 @@ class Glm5Model(nn.Module):
                 repeated_layer=config.mtp_use_repeated_layer,
             )
 
+        self._dsa_index_share_consumer_counts = _local_dsa_index_share_consumer_counts(
+            self.layers, self.mtp
+        )
+        _validate_dsa_index_share_recompute(
+            self._dsa_index_share_consumer_counts, recompute_modules
+        )
+
         self.sp_params: list[nn.Parameter] = []
         if ps.tp_size > 1:
             self.sp_params = _collect_sp_grad_params(self)
@@ -832,7 +878,9 @@ class Glm5Model(nn.Module):
         )
         with fp8_ctx:
             dsa_index_share_state = (
-                DSAIndexShareState() if self.config.uses_dsa_index_share else None
+                DSAIndexShareState(self._dsa_index_share_consumer_counts)
+                if self._dsa_index_share_consumer_counts
+                else None
             )
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)

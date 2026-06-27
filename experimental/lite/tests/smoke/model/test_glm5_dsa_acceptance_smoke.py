@@ -8,6 +8,12 @@ import torch
 
 pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu]
 
+_FUSED_R2R_OUTPUT_ATOL = 2.0e-3
+_FUSED_R2R_GRAD_ATOL = 5.0e-2
+_FUSED_VS_REFERENCE_OUTPUT_ATOL = 2.0e-3
+_FUSED_VS_REFERENCE_GRAD_ATOL = 5.0e-2
+_FUSED_VS_REFERENCE_LOSS_ATOL = 1.0e-5
+
 
 def _make_dsa():
     pytest.importorskip("cudnn", reason="GLM5 DSA accept-with-proof needs cudnn DSA.")
@@ -26,14 +32,28 @@ def _make_dsa():
         index_topk=512,
         rms_norm_eps=1e-5,
         layer_number=1,
+        index_topk_freq=2,
     )
 
 
 def _run_once(module, x, cos, sin, position_ids, *, fused_training: bool):
+    from megatron.lite.primitive.modules.attention import DSAIndexShareState
+
     module.zero_grad(set_to_none=True)
     module.train(fused_training)
     local_x = x.detach().clone().requires_grad_(True)
-    out = module(local_x, cos=cos, sin=sin, position_ids=position_ids)
+    index_share_state = DSAIndexShareState({module.layer_number: 1})
+    out = module(
+        local_x,
+        cos=cos,
+        sin=sin,
+        position_ids=position_ids,
+        index_share_state=index_share_state,
+    )
+    topk_indices = index_share_state.get_topk(
+        module.layer_number + 1, module.layer_number
+    ).detach().clone()
+    assert index_share_state.cached_tensor_count == 0
     loss = out.float().square().mean()
     loss.backward()
     param_grads = {
@@ -46,6 +66,7 @@ def _run_once(module, x, cos, sin, position_ids, *, fused_training: bool):
         "out": out.detach().float().clone(),
         "x_grad": local_x.grad.detach().float().clone(),
         "param_grads": param_grads,
+        "topk_indices": topk_indices,
     }
 
 
@@ -190,14 +211,21 @@ def _torch_unfused_dsa_forward(module, x, cos, sin, position_ids):
     out = out.permute(1, 0, 2, 3).contiguous()
     out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
     out = out.reshape(batch, seq_len, module.num_heads * module.v_head_dim)
-    return module.o_proj(out)
+    out = module.o_proj(out)
+    # Fused loss_coeff=0 returns explicit zero indexer gradients. Keep the
+    # same parameters in the independent reference graph so keys are checked.
+    zero_indexer_dependency = (
+        q_indexer.float().sum() + k_indexer.float().sum() + weights_indexer.float().sum()
+    ) * 0.0
+    out = out + zero_indexer_dependency.to(out.dtype)
+    return out, topk_indices
 
 
 def _run_once_torch_unfused(module, x, cos, sin, position_ids):
     module.zero_grad(set_to_none=True)
     module.train(True)
     local_x = x.detach().clone().requires_grad_(True)
-    out = _torch_unfused_dsa_forward(module, local_x, cos, sin, position_ids)
+    out, topk_indices = _torch_unfused_dsa_forward(module, local_x, cos, sin, position_ids)
     loss = out.float().square().mean()
     loss.backward()
     param_grads = {
@@ -210,6 +238,7 @@ def _run_once_torch_unfused(module, x, cos, sin, position_ids):
         "out": out.detach().float().clone(),
         "x_grad": local_x.grad.detach().float().clone(),
         "param_grads": param_grads,
+        "topk_indices": topk_indices.detach().clone(),
     }
 
 
@@ -218,10 +247,15 @@ def _max_abs(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _max_param_grad_abs(a: dict, b: dict) -> float:
-    common = set(a["param_grads"]) & set(b["param_grads"])
-    if not common:
+    a_keys = set(a["param_grads"])
+    b_keys = set(b["param_grads"])
+    assert a_keys == b_keys, (
+        f"gradient key mismatch: only_a={sorted(a_keys - b_keys)}, "
+        f"only_b={sorted(b_keys - a_keys)}"
+    )
+    if not a_keys:
         return 0.0
-    return max(_max_abs(a["param_grads"][name], b["param_grads"][name]) for name in common)
+    return max(_max_abs(a["param_grads"][name], b["param_grads"][name]) for name in a_keys)
 
 
 def test_glm5_dsa_run_to_run_accept_with_proof():
@@ -251,9 +285,13 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
     unfused_b = _run_once_torch_unfused(unfused, x, cos, sin, position_ids)
 
     fused_r2r_out = _max_abs(fused_a["out"], fused_b["out"])
+    fused_r2r_loss = abs(float(fused_a["loss"].item()) - float(fused_b["loss"].item()))
     fused_r2r_x_grad = _max_abs(fused_a["x_grad"], fused_b["x_grad"])
     fused_r2r_param_grad = _max_param_grad_abs(fused_a, fused_b)
     unfused_r2r_out = _max_abs(unfused_a["out"], unfused_b["out"])
+    unfused_r2r_loss = abs(
+        float(unfused_a["loss"].item()) - float(unfused_b["loss"].item())
+    )
     unfused_r2r_x_grad = _max_abs(unfused_a["x_grad"], unfused_b["x_grad"])
     unfused_r2r_param_grad = _max_param_grad_abs(unfused_a, unfused_b)
     fused_vs_unfused_out = _max_abs(fused_a["out"], unfused_a["out"])
@@ -261,34 +299,38 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
     fused_vs_unfused_param_grad = _max_param_grad_abs(fused_a, unfused_a)
     loss_diff = abs(float(fused_a["loss"].item()) - float(unfused_a["loss"].item()))
 
-    noise_floor = max(
-        fused_r2r_x_grad,
-        fused_r2r_param_grad,
-        unfused_r2r_x_grad,
-        unfused_r2r_param_grad,
-    )
     assert torch.isfinite(fused_a["loss"])
     assert torch.isfinite(unfused_a["loss"])
+    assert torch.equal(fused_a["topk_indices"], fused_b["topk_indices"])
+    assert torch.equal(unfused_a["topk_indices"], unfused_b["topk_indices"])
+    assert torch.equal(fused_a["topk_indices"], unfused_a["topk_indices"])
+    assert fused_r2r_loss <= _FUSED_VS_REFERENCE_LOSS_ATOL
+    assert fused_r2r_out <= _FUSED_R2R_OUTPUT_ATOL
+    assert fused_r2r_x_grad <= _FUSED_R2R_GRAD_ATOL
+    assert fused_r2r_param_grad <= _FUSED_R2R_GRAD_ATOL
+    assert unfused_r2r_loss == 0.0
     assert unfused_r2r_out == 0.0
     assert unfused_r2r_x_grad == 0.0
     assert unfused_r2r_param_grad == 0.0
-    assert fused_vs_unfused_out <= 5.0e-2
-    assert fused_vs_unfused_x_grad <= max(5.0e-1, 16.0 * noise_floor)
-    assert fused_vs_unfused_param_grad <= max(5.0e-1, 16.0 * noise_floor)
+    assert loss_diff <= _FUSED_VS_REFERENCE_LOSS_ATOL
+    assert fused_vs_unfused_out <= _FUSED_VS_REFERENCE_OUTPUT_ATOL
+    assert fused_vs_unfused_x_grad <= _FUSED_VS_REFERENCE_GRAD_ATOL
+    assert fused_vs_unfused_param_grad <= _FUSED_VS_REFERENCE_GRAD_ATOL
 
     print(
         "NON_SKIP_GLM5_DSA_RUN_TO_RUN_ACCEPT_WITH_PROOF "
         f"fused_loss={float(fused_a['loss'].item()):.6e} "
         f"unfused_loss={float(unfused_a['loss'].item()):.6e} "
         f"loss_diff={loss_diff:.6e} "
+        f"fused_r2r_loss_diff={fused_r2r_loss:.6e} "
         f"fused_r2r_out_max_abs={fused_r2r_out:.6e} "
         f"fused_r2r_x_grad_max_abs={fused_r2r_x_grad:.6e} "
         f"fused_r2r_param_grad_max_abs={fused_r2r_param_grad:.6e} "
         f"unfused_r2r_out_max_abs={unfused_r2r_out:.6e} "
+        f"unfused_r2r_loss_diff={unfused_r2r_loss:.6e} "
         f"unfused_r2r_x_grad_max_abs={unfused_r2r_x_grad:.6e} "
         f"unfused_r2r_param_grad_max_abs={unfused_r2r_param_grad:.6e} "
         f"fused_vs_unfused_out_max_abs={fused_vs_unfused_out:.6e} "
         f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
-        f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e} "
-        f"noise_floor={noise_floor:.6e}"
+        f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e}"
     )
