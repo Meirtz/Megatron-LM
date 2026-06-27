@@ -13,7 +13,8 @@ _FUSED_R2R_GRAD_ATOL = 5.0e-2
 _FUSED_VS_REFERENCE_OUTPUT_ATOL = 2.0e-3
 _FUSED_VS_REFERENCE_GRAD_ATOL = 5.0e-2
 _FUSED_VS_REFERENCE_LOSS_ATOL = 1.0e-5
-_INDEXER_TOPK = 64
+_INDEXER_TOPK = 512
+_SEQUENCE_LENGTH = 1024
 _INDEXER_LOSS_COEFF = 1.0e-2
 _MIN_INDEXER_GRAD_MAX_ABS = 1.0e-8
 
@@ -422,7 +423,7 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
     fused = _make_dsa_pair().to(device=device, dtype=torch.bfloat16)
     unfused = copy.deepcopy(fused).to(device=device, dtype=torch.bfloat16)
 
-    batch, seq, hidden = 1, 512, 128
+    batch, seq, hidden = 1, _SEQUENCE_LENGTH, 128
     x = torch.randn(batch, seq, hidden, device=device, dtype=torch.bfloat16)
     cos, sin = build_rope_cache(
         dim=64,
