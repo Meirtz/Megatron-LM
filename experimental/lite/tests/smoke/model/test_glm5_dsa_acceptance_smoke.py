@@ -13,6 +13,9 @@ _FUSED_R2R_GRAD_ATOL = 5.0e-2
 _FUSED_VS_REFERENCE_OUTPUT_ATOL = 2.0e-3
 _FUSED_VS_REFERENCE_GRAD_ATOL = 5.0e-2
 _FUSED_VS_REFERENCE_LOSS_ATOL = 1.0e-5
+_INDEXER_TOPK = 64
+_INDEXER_LOSS_COEFF = 1.0e-2
+_MIN_INDEXER_GRAD_MAX_ABS = 1.0e-8
 
 
 def _make_dsa_pair():
@@ -29,13 +32,15 @@ def _make_dsa_pair():
         v_head_dim=256,
         index_n_heads=32,
         index_head_dim=128,
-        index_topk=512,
+        index_topk=_INDEXER_TOPK,
         rms_norm_eps=1e-5,
         rope_interleaved=True,
         indexer_rope_interleaved=True,
         index_topk_freq=2,
         index_skip_topk_offset=1,
         index_share_enabled=True,
+        indexer_loss_coeff=_INDEXER_LOSS_COEFF,
+        indexer_use_sparse_loss=True,
     )
     source = DynamicSparseAttention(
         **common,
@@ -194,6 +199,58 @@ def _torch_sparse_attention(
     )
 
 
+def _torch_sparse_indexer_loss(
+    indexer_scores: torch.Tensor,
+    query_states: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_indices: torch.Tensor,
+    *,
+    softmax_scale: float,
+    loss_coeff: float,
+) -> torch.Tensor:
+    """Independent sparse KL oracle for the fused indexer-loss backward."""
+
+    valid = topk_indices >= 0
+    query_bshd = query_states.detach().permute(1, 0, 2, 3).float()
+    kv_bsd = kv_full.detach().permute(1, 0, 2).float()
+    selected_keys = _gather_sequence(kv_bsd, topk_indices)
+    attn_scores = torch.einsum("bqhd,bqtd->bqht", query_bshd, selected_keys)
+    attn_scores = attn_scores * float(softmax_scale)
+    attn_scores = torch.where(
+        valid.unsqueeze(2), attn_scores, torch.full_like(attn_scores, -torch.inf)
+    )
+    sink = attn_sink.detach().float().view(1, 1, -1, 1)
+    sink = sink.expand(attn_scores.shape[0], attn_scores.shape[1], -1, -1)
+    attn_probs = torch.softmax(torch.cat([attn_scores, sink], dim=-1), dim=-1)[..., :-1]
+    target_mass = attn_probs.sum(dim=2)
+    target_mass = torch.where(valid, target_mass, torch.zeros_like(target_mass))
+
+    row_valid = valid.any(dim=-1)
+    target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    target = target_mass / target_denom
+
+    safe_indices = topk_indices.clamp(min=0).long()
+    selected_indexer_scores = torch.gather(indexer_scores, dim=-1, index=safe_indices)
+    selected_indexer_scores = torch.where(
+        valid,
+        selected_indexer_scores,
+        torch.full_like(selected_indexer_scores, torch.finfo(torch.float32).min),
+    )
+    predict = torch.softmax(selected_indexer_scores, dim=-1)
+
+    eps = torch.finfo(torch.float32).tiny
+    target_clamped = target.clamp_min(eps)
+    predict_clamped = predict.clamp_min(eps)
+    kl_per_row = (
+        target_clamped * (torch.log(target_clamped) - torch.log(predict_clamped))
+    ).sum(dim=-1)
+    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+    return float(loss_coeff) * kl_per_row.mean()
+
+
 def _torch_unfused_dsa_forward(
     module, x, cos, sin, position_ids, *, topk_indices: torch.Tensor | None = None
 ):
@@ -234,11 +291,11 @@ def _torch_unfused_dsa_forward(
     ).squeeze(2)
     kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
-    zero_indexer_dependency = None
+    indexer_loss = x.new_zeros((), dtype=torch.float32)
     if module.indexer is not None:
         assert topk_indices is None
         q_indexer, k_indexer, weights_indexer = module.indexer.forward_before_topk(
-            x, q_resid, cos, sin, position_ids
+            x.detach(), q_resid.detach(), cos, sin, position_ids
         )
         indexer_scores = _torch_indexer_scores(
             q_indexer,
@@ -250,13 +307,15 @@ def _torch_unfused_dsa_forward(
         topk_indices = _torch_topk_from_scores(
             indexer_scores, min(module.index_topk, indexer_scores.shape[-1])
         )
-        # Fused loss_coeff=0 returns explicit zero indexer gradients. Keep the
-        # same parameters in the independent reference graph so keys are checked.
-        zero_indexer_dependency = (
-            q_indexer.float().sum()
-            + k_indexer.float().sum()
-            + weights_indexer.float().sum()
-        ) * 0.0
+        indexer_loss = _torch_sparse_indexer_loss(
+            indexer_scores,
+            query_states,
+            kv_full,
+            module.attn_sink,
+            topk_indices,
+            softmax_scale=module.softmax_scale,
+            loss_coeff=module.indexer_loss_coeff,
+        )
     else:
         assert topk_indices is not None
     out = _torch_sparse_attention(
@@ -272,20 +331,18 @@ def _torch_unfused_dsa_forward(
     out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
     out = out.reshape(batch, seq_len, module.num_heads * module.v_head_dim)
     out = module.o_proj(out)
-    if zero_indexer_dependency is not None:
-        out = out + zero_indexer_dependency.to(out.dtype)
-    return out, topk_indices
+    return out, topk_indices, indexer_loss
 
 
 def _run_once_torch_unfused(modules, x, cos, sin, position_ids):
     modules.zero_grad(set_to_none=True)
     modules.train(True)
     local_x = x.detach().clone().requires_grad_(True)
-    source_out, topk_indices = _torch_unfused_dsa_forward(
+    source_out, topk_indices, indexer_loss = _torch_unfused_dsa_forward(
         modules["source"], local_x, cos, sin, position_ids
     )
     hidden = local_x + source_out
-    shared_out, reused_topk_indices = _torch_unfused_dsa_forward(
+    shared_out, reused_topk_indices, shared_indexer_loss = _torch_unfused_dsa_forward(
         modules["shared"],
         hidden,
         cos,
@@ -294,9 +351,10 @@ def _run_once_torch_unfused(modules, x, cos, sin, position_ids):
         topk_indices=topk_indices,
     )
     assert torch.equal(reused_topk_indices, topk_indices)
+    assert float(shared_indexer_loss.item()) == 0.0
     out = hidden + shared_out
     loss = out.float().square().mean()
-    loss.backward()
+    (loss + indexer_loss).backward()
     param_grads = {
         name: param.grad.detach().float().clone()
         for name, param in modules.named_parameters()
@@ -304,6 +362,7 @@ def _run_once_torch_unfused(modules, x, cos, sin, position_ids):
     }
     return {
         "loss": loss.detach().float().clone(),
+        "indexer_loss": indexer_loss.detach().float().clone(),
         "out": out.detach().float().clone(),
         "x_grad": local_x.grad.detach().float().clone(),
         "param_grads": param_grads,
@@ -325,6 +384,31 @@ def _max_param_grad_abs(a: dict, b: dict) -> float:
     if not a_keys:
         return 0.0
     return max(_max_abs(a["param_grads"][name], b["param_grads"][name]) for name in a_keys)
+
+
+def _assert_meaningful_indexer_grads(result: dict) -> float:
+    expected = {
+        "source.indexer.wq_b.weight",
+        "source.indexer.wk.weight",
+        "source.indexer.k_norm.weight",
+        "source.indexer.k_norm.bias",
+        "source.indexer.weights_proj.weight",
+    }
+    grads = {
+        name: grad
+        for name, grad in result["param_grads"].items()
+        if name.startswith("source.indexer.")
+    }
+    assert set(grads) == expected
+    assert all(torch.isfinite(grad).all() for grad in grads.values())
+    assert all(torch.count_nonzero(grad).item() > 0 for grad in grads.values())
+    grad_max_abs = {
+        name: float(grad.abs().max().item()) for name, grad in grads.items()
+    }
+    assert all(value > _MIN_INDEXER_GRAD_MAX_ABS for value in grad_max_abs.values()), (
+        grad_max_abs
+    )
+    return max(grad_max_abs.values())
 
 
 def test_glm5_dsa_run_to_run_accept_with_proof():
@@ -367,12 +451,27 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
     fused_vs_unfused_x_grad = _max_abs(fused_a["x_grad"], unfused_a["x_grad"])
     fused_vs_unfused_param_grad = _max_param_grad_abs(fused_a, unfused_a)
     loss_diff = abs(float(fused_a["loss"].item()) - float(unfused_a["loss"].item()))
+    unfused_indexer_loss_diff = abs(
+        float(unfused_a["indexer_loss"].item())
+        - float(unfused_b["indexer_loss"].item())
+    )
+    fused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(fused_a)
+    _assert_meaningful_indexer_grads(fused_b)
+    unfused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(unfused_a)
+    _assert_meaningful_indexer_grads(unfused_b)
 
     assert torch.isfinite(fused_a["loss"])
     assert torch.isfinite(unfused_a["loss"])
+    assert torch.isfinite(unfused_a["indexer_loss"])
+    assert float(unfused_a["indexer_loss"].item()) > 0.0
     assert torch.equal(fused_a["topk_indices"], fused_b["topk_indices"])
     assert torch.equal(unfused_a["topk_indices"], unfused_b["topk_indices"])
     assert torch.equal(fused_a["topk_indices"], unfused_a["topk_indices"])
+    valid_topk = (fused_a["topk_indices"] >= 0).sum(dim=-1)
+    assert _INDEXER_TOPK < seq
+    assert fused_a["topk_indices"].shape[-1] == _INDEXER_TOPK
+    assert int(valid_topk[0, -1].item()) == _INDEXER_TOPK
+    assert int(valid_topk.max().item()) < seq
     assert fused_r2r_loss <= _FUSED_VS_REFERENCE_LOSS_ATOL
     assert fused_r2r_out <= _FUSED_R2R_OUTPUT_ATOL
     assert fused_r2r_x_grad <= _FUSED_R2R_GRAD_ATOL
@@ -381,6 +480,7 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
     assert unfused_r2r_out == 0.0
     assert unfused_r2r_x_grad == 0.0
     assert unfused_r2r_param_grad == 0.0
+    assert unfused_indexer_loss_diff == 0.0
     assert loss_diff <= _FUSED_VS_REFERENCE_LOSS_ATOL
     assert fused_vs_unfused_out <= _FUSED_VS_REFERENCE_OUTPUT_ATOL
     assert fused_vs_unfused_x_grad <= _FUSED_VS_REFERENCE_GRAD_ATOL
@@ -390,6 +490,8 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
         "NON_SKIP_GLM5_DSA_RUN_TO_RUN_ACCEPT_WITH_PROOF "
         f"fused_loss={float(fused_a['loss'].item()):.6e} "
         f"unfused_loss={float(unfused_a['loss'].item()):.6e} "
+        f"unfused_indexer_loss={float(unfused_a['indexer_loss'].item()):.6e} "
+        f"indexer_topk={_INDEXER_TOPK} seq={seq} "
         f"loss_diff={loss_diff:.6e} "
         f"fused_r2r_loss_diff={fused_r2r_loss:.6e} "
         f"fused_r2r_out_max_abs={fused_r2r_out:.6e} "
@@ -401,7 +503,9 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
         f"unfused_r2r_param_grad_max_abs={unfused_r2r_param_grad:.6e} "
         f"fused_vs_unfused_out_max_abs={fused_vs_unfused_out:.6e} "
         f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
-        f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e}"
+        f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e} "
+        f"fused_indexer_grad_max_abs={fused_indexer_grad_max_abs:.6e} "
+        f"unfused_indexer_grad_max_abs={unfused_indexer_grad_max_abs:.6e}"
     )
 
 

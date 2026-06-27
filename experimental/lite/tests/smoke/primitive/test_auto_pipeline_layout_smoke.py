@@ -196,6 +196,10 @@ def _glm5():
         n_routed_experts=4,
         n_shared_experts=1,
         num_experts_per_tok=2,
+        # GLM-5/5.1 publishes these flags, but without an IndexShare schedule
+        # MLite must preserve its pre-PR half-split behavior.
+        rope_interleave=True,
+        indexer_rope_interleave=True,
     )
     return cfg, protocol
 
@@ -239,6 +243,8 @@ def _glm52_indexshare():
         index_topk_freq=4,
         index_skip_topk_offset=3,
         indexer_types=_glm52_indexer_types(),
+        rope_interleave=True,
+        indexer_rope_interleave=True,
     )
     return cfg, protocol
 
@@ -480,6 +486,18 @@ def test_uneven_pp_builds_trains_and_exports(model_name):
     assert local and all(0 <= i < _NUM_LAYERS for i in local), local
     assert local == list(range(local[0], local[0] + len(local))), local
 
+    if model_name == "glm5":
+        assert cfg.rope_interleave is True
+        assert cfg.indexer_rope_interleave is True
+        assert cfg.dsa_rope_layout_revision == "legacy"
+        assert cfg.uses_configured_dsa_rope_layout is False
+        local_model = unwrap_model(handle._extras["model_chunks"][0])
+        for layer in local_model.layers:
+            dsa = layer.self_attention.self_attention
+            assert dsa.rope_interleaved is False
+            assert dsa.indexer is not None
+            assert dsa.indexer.rope_interleaved is False
+
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     batch = _random_packed_batch(cfg.vocab_size)
     runtime.zero_grad(handle)
@@ -526,6 +544,10 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
     set_deterministic(2026)
 
     cfg, protocol = _glm52_indexshare()
+    assert cfg.rope_interleave is True
+    assert cfg.indexer_rope_interleave is True
+    assert cfg.dsa_rope_layout_revision == "configured"
+    assert cfg.uses_configured_dsa_rope_layout is True
     parallel = ParallelConfig(tp=1, ep=1, etp=1, pp=8, cp=1)
     handle, cfg = _build_handle_from_config(
         "glm5",
@@ -555,6 +577,20 @@ def test_glm52_indexshare_78_layer_uneven_pp_builds_trains_and_keeps_share_group
         if cfg.dsa_indexer_type(layer_idx) == "shared"
     ]
     assert all(source_idx in local for _, source_idx in local_shared_sources), local_shared_sources
+
+    local_model = unwrap_model(handle._extras["model_chunks"][0])
+    for layer_idx, layer in zip(local_model.layer_indices, local_model.layers, strict=True):
+        dsa = layer.self_attention.self_attention
+        assert dsa.rope_interleaved is True
+        assert (dsa.indexer is not None) is (cfg.dsa_indexer_type(layer_idx) == "full")
+        if dsa.indexer is not None:
+            assert dsa.indexer.rope_interleaved is True
+    if local_model.mtp is not None:
+        for mtp_layer in local_model.mtp.layers:
+            mtp_dsa = mtp_layer.transformer_layer.self_attention.self_attention
+            assert mtp_dsa.rope_interleaved is True
+            assert mtp_dsa.indexer is not None
+            assert mtp_dsa.indexer.rope_interleaved is True
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     batch = _random_packed_batch(cfg.vocab_size, num_tokens=512)
