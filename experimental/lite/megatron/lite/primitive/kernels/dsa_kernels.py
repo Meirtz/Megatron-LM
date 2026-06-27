@@ -775,8 +775,8 @@ def _kl_loss_from_dense_scores(
     return loss_coeff * loss
 
 
-class FusedIndexerSparseAttnFunc(torch.autograd.Function):
-    """Path B: fused indexer (+KL loss) + sparse attention in one autograd.
+class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
+    """Internal Path B autograd that additionally returns top-k indices.
 
     Differentiable w.r.t. ``query``, ``kv_full``, ``attn_sink``,
     ``q_indexer``, ``k_indexer``, ``weights``.
@@ -1062,7 +1062,65 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
 
-def _fused_indexer_sparse_attn_apply(
+class FusedIndexerSparseAttnFunc(_FusedIndexerSparseAttnWithTopKFunc):
+    """Legacy two-output fused DSA autograd function.
+
+    Direct callers historically unpacked ``FusedIndexerSparseAttnFunc.apply``
+    as ``(output, indexer_loss)``. Keep that contract stable; IndexShare uses
+    the explicitly named private three-output function instead.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: Tensor,
+        kv_full: Tensor,
+        attn_sink: Tensor,
+        window_idxs: Tensor,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        indexer_topk: int,
+        ratio: int,
+        softmax_scale: float,
+        indexer_softmax_scale: float,
+        loss_coeff: float,
+        sparse_loss: bool,
+        kv_offset: int,
+        calculate_per_token_loss: bool,
+        value_dim: Optional[int],
+    ) -> Tuple[Tensor, Tensor]:
+        output, indexer_loss, _topk_indices = (
+            _FusedIndexerSparseAttnWithTopKFunc.forward(
+                ctx,
+                query,
+                kv_full,
+                attn_sink,
+                window_idxs,
+                q_indexer,
+                k_indexer,
+                weights,
+                indexer_topk,
+                ratio,
+                softmax_scale,
+                indexer_softmax_scale,
+                loss_coeff,
+                sparse_loss,
+                kv_offset,
+                calculate_per_token_loss,
+                value_dim,
+            )
+        )
+        return output, indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_loss):
+        return _FusedIndexerSparseAttnWithTopKFunc.backward(
+            ctx, grad_output, grad_loss, None
+        )
+
+
+def _fused_indexer_sparse_attn_with_topk_apply(
     query: Tensor,
     kv_full: Tensor,
     attn_sink: Tensor,
@@ -1080,7 +1138,7 @@ def _fused_indexer_sparse_attn_apply(
     calculate_per_token_loss: bool = False,
     value_dim: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    return FusedIndexerSparseAttnFunc.apply(
+    return _FusedIndexerSparseAttnWithTopKFunc.apply(
         query,
         kv_full,
         attn_sink,
@@ -1156,7 +1214,7 @@ def fused_indexer_sparse_attn(
         ``(output, indexer_loss)`` where ``output`` is ``(sq, b, np * d_v)``
         bf16 and ``indexer_loss`` is a scalar f32.
     """
-    output, indexer_loss, _topk_indices = _fused_indexer_sparse_attn_apply(
+    output, indexer_loss = FusedIndexerSparseAttnFunc.apply(
         query,
         kv_full,
         attn_sink,
@@ -1196,7 +1254,7 @@ def fused_indexer_sparse_attn_with_topk(
     value_dim: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Path B plus the fused top-k indices for DSA IndexShare source layers."""
-    return _fused_indexer_sparse_attn_apply(
+    return _fused_indexer_sparse_attn_with_topk_apply(
         query,
         kv_full,
         attn_sink,

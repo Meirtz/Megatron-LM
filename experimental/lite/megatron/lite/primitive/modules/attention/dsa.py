@@ -7,6 +7,7 @@ keep model config classes out of the primitive layer.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Hashable
 
 import torch
@@ -250,14 +251,48 @@ def dsa_indexer_type_for_layer(layer_number: int, skip_topk_offset: int, topk_fr
 
 
 class DSAIndexShareState:
-    """Per-forward top-k holder for DSA cross-layer IndexShare."""
+    """Per-forward, bounded top-k holder for DSA cross-layer IndexShare.
 
-    def __init__(self):
+    ``consumer_counts`` maps each 1-indexed full/source layer to the number of
+    shared-layer executions that consume its top-k indices. Each packed segment
+    gets an independent cache entry and consumer count. The final consumer
+    removes that segment's entry immediately.
+    """
+
+    def __init__(self, consumer_counts: Mapping[int, int] | None = None):
+        consumer_counts = {} if consumer_counts is None else consumer_counts
+        self._consumer_counts: dict[int, int] = {}
+        for layer_number, consumer_count in consumer_counts.items():
+            if layer_number < 1:
+                raise ValueError(
+                    f"DSA IndexShare source layer must be >= 1, got {layer_number}"
+                )
+            if consumer_count < 0:
+                raise ValueError(
+                    "DSA IndexShare consumer count must be non-negative, got "
+                    f"{consumer_count} for source layer {layer_number}"
+                )
+            if consumer_count:
+                self._consumer_counts[layer_number] = consumer_count
         self._topk_by_layer: dict[tuple[int, Hashable | None], torch.Tensor] = {}
+        self._remaining_consumers: dict[tuple[int, Hashable | None], int] = {}
+        self._completed_sources: set[int] = set()
 
     @staticmethod
     def _key(layer_number: int, sequence_key: Hashable | None) -> tuple[int, Hashable | None]:
         return layer_number, sequence_key
+
+    def needs_topk(self, source_layer: int) -> bool:
+        """Return whether ``source_layer`` has any local shared consumers."""
+        return (
+            self._consumer_counts.get(source_layer, 0) > 0
+            and source_layer not in self._completed_sources
+        )
+
+    @property
+    def cached_tensor_count(self) -> int:
+        """Number of currently live top-k tensors."""
+        return len(self._topk_by_layer)
 
     def save_topk(
         self,
@@ -266,7 +301,20 @@ class DSAIndexShareState:
         *,
         sequence_key: Hashable | None = None,
     ) -> None:
-        self._topk_by_layer[self._key(layer_number, sequence_key)] = topk_indices.detach()
+        consumer_count = self._consumer_counts.get(layer_number, 0)
+        if consumer_count == 0:
+            raise AssertionError(
+                "DSA IndexShare attempted to save top-k indices for source layer "
+                f"{layer_number}, but no shared consumer is registered."
+            )
+        key = self._key(layer_number, sequence_key)
+        if key in self._topk_by_layer:
+            raise AssertionError(
+                "DSA IndexShare attempted to overwrite live top-k indices for "
+                f"cache key {key}."
+            )
+        self._topk_by_layer[key] = topk_indices.detach()
+        self._remaining_consumers[key] = consumer_count
 
     def get_topk(
         self,
@@ -285,7 +333,15 @@ class DSAIndexShareState:
                 "Cross-PP top-k sharing is not supported. "
                 f"Available cache keys: {available}."
             )
-        return self._topk_by_layer[key]
+        topk_indices = self._topk_by_layer[key]
+        remaining = self._remaining_consumers[key] - 1
+        if remaining == 0:
+            del self._topk_by_layer[key]
+            del self._remaining_consumers[key]
+            self._completed_sources.add(source_layer)
+        else:
+            self._remaining_consumers[key] = remaining
+        return topk_indices
 
 
 def validate_dsa_index_share_pipeline_split(
@@ -689,11 +745,16 @@ class DynamicSparseAttention(nn.Module):
                 x.detach(), q_resid.detach(), cos, sin, position_ids
             )
         effective_indexer_topk = min(self.index_topk, seq_len)
+        share_topk_with_later_layers = (
+            index_share_state is not None
+            and index_share_state.needs_topk(self.layer_number)
+        )
 
         if self.training and torch.is_grad_enabled() and not self.skip_topk:
             window_idxs = torch.empty(batch, seq_len, 0, device=x.device, dtype=torch.int32)
             assert q_indexer is not None and k_indexer is not None and weights_indexer is not None
-            if self.index_share_enabled:
+            if share_topk_with_later_layers:
+                assert index_share_state is not None
                 out, indexer_loss, topk_indices = _fused_indexer_sparse_attn_with_topk(
                     query_states,
                     kv_full,
@@ -712,12 +773,11 @@ class DynamicSparseAttention(nn.Module):
                     calculate_per_token_loss=self.calculate_per_token_loss,
                     value_dim=self.kv_lora_rank,
                 )
-                if index_share_state is not None:
-                    index_share_state.save_topk(
-                        self.layer_number,
-                        topk_indices,
-                        sequence_key=index_share_cache_key,
-                    )
+                index_share_state.save_topk(
+                    self.layer_number,
+                    topk_indices,
+                    sequence_key=index_share_cache_key,
+                )
             else:
                 out, indexer_loss = _fused_indexer_sparse_attn(
                     query_states,
@@ -752,7 +812,8 @@ class DynamicSparseAttention(nn.Module):
                     1,
                     indexer_softmax_scale=self.indexer_softmax_scale,
                 )
-                if self.index_share_enabled and index_share_state is not None:
+                if share_topk_with_later_layers:
+                    assert index_share_state is not None
                     index_share_state.save_topk(
                         self.layer_number,
                         topk_indices,

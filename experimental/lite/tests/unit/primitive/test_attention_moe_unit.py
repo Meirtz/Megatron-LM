@@ -162,12 +162,129 @@ def test_dsa_index_share_schedule_and_state():
     assert dsa_indexer_type_for_layer(7, skip_topk_offset=3, topk_freq=4) == "full"
     assert source_dsa_compute_layer(6, skip_topk_offset=3, topk_freq=4) == 3
 
-    state = DSAIndexShareState()
+    state = DSAIndexShareState({3: 1})
     topk = torch.tensor([[[0, 1], [1, 2]]], dtype=torch.int32)
     state.save_topk(3, topk, sequence_key=0)
+    assert state.cached_tensor_count == 1
     assert torch.equal(state.get_topk(6, 3, sequence_key=0), topk)
+    assert state.cached_tensor_count == 0
     with pytest.raises(AssertionError, match="source layer 3"):
         state.get_topk(5, 3, sequence_key=1)
+
+
+def test_dsa_index_share_state_releases_final_packed_consumer():
+    from megatron.lite.primitive.modules.attention.dsa import DSAIndexShareState
+
+    state = DSAIndexShareState({3: 2})
+    segment_0 = torch.tensor([[[0, 1]]], dtype=torch.int32)
+    segment_1 = torch.tensor([[[1, 0]]], dtype=torch.int32)
+    state.save_topk(3, segment_0, sequence_key=0)
+    state.save_topk(3, segment_1, sequence_key=1)
+    assert state.cached_tensor_count == 2
+
+    assert torch.equal(state.get_topk(4, 3, sequence_key=0), segment_0)
+    assert torch.equal(state.get_topk(4, 3, sequence_key=1), segment_1)
+    assert state.cached_tensor_count == 2
+    assert torch.equal(state.get_topk(5, 3, sequence_key=0), segment_0)
+    assert state.cached_tensor_count == 1
+    assert torch.equal(state.get_topk(5, 3, sequence_key=1), segment_1)
+    assert state.cached_tensor_count == 0
+
+
+def test_dsa_index_share_state_rejects_unconsumed_source_save():
+    from megatron.lite.primitive.modules.attention.dsa import DSAIndexShareState
+
+    state = DSAIndexShareState()
+    assert state.needs_topk(3) is False
+    with pytest.raises(AssertionError, match="no shared consumer"):
+        state.save_topk(3, torch.zeros(1, 1, 1, dtype=torch.int32))
+
+
+def test_glm5_counts_local_index_share_consumers_including_repeated_mtp():
+    from megatron.lite.model.glm5.lite.model import (
+        _local_dsa_index_share_consumer_counts,
+        _validate_dsa_index_share_recompute,
+    )
+
+    def layer(*, shared: bool, source_layer: int):
+        dsa = SimpleNamespace(skip_topk=shared, index_share_source_layer=source_layer)
+        return SimpleNamespace(self_attention=SimpleNamespace(self_attention=dsa))
+
+    trunk_layers = [
+        layer(shared=False, source_layer=3),
+        layer(shared=True, source_layer=3),
+        layer(shared=True, source_layer=3),
+    ]
+    mtp = SimpleNamespace(
+        layers=[SimpleNamespace(transformer_layer=layer(shared=True, source_layer=7))],
+        repeated_layer=True,
+        num_layers=3,
+    )
+
+    consumer_counts = _local_dsa_index_share_consumer_counts(trunk_layers, mtp)
+    assert consumer_counts == {3: 2, 7: 3}
+    _validate_dsa_index_share_recompute(consumer_counts, ["moe", "attn_proj"])
+    _validate_dsa_index_share_recompute({}, ["full", "self_attn", "dsa"])
+    for unsafe_mode in ("full", "self_attn", "dsa"):
+        with pytest.raises(ValueError, match="group-aware checkpoint"):
+            _validate_dsa_index_share_recompute(consumer_counts, [unsafe_mode])
+
+
+def test_dsv4_fused_dsa_legacy_two_output_api_cpu_mock(monkeypatch):
+    """DSv4's public fused wrapper and direct Function keep two outputs."""
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    def fake_forward(ctx, *args):
+        query = args[0]
+        ctx.input_count = len(args)
+        output = query * 2.0
+        loss = query.float().sum() * 0.0
+        topk = torch.zeros(query.shape[:2] + (1,), dtype=torch.int32)
+        return output, loss, topk
+
+    def fake_backward(ctx, grad_output, grad_loss, grad_topk=None):
+        del grad_loss, grad_topk
+        grads = [None] * ctx.input_count
+        grads[0] = grad_output * 2.0
+        return tuple(grads)
+
+    with_topk_func = dsa_kernels._FusedIndexerSparseAttnWithTopKFunc
+    monkeypatch.setattr(with_topk_func, "forward", staticmethod(fake_forward))
+    monkeypatch.setattr(with_topk_func, "backward", staticmethod(fake_backward))
+
+    query = torch.ones(2, 1, 1, 2, requires_grad=True)
+    args = (
+        query,
+        torch.ones(2, 1, 2),
+        torch.zeros(1),
+        torch.empty(1, 2, 0, dtype=torch.int32),
+        torch.ones(2, 1, 1, 2),
+        torch.ones(2, 1, 2),
+        torch.ones(2, 1, 1),
+        1,
+        1,
+        0.5,
+        1.0,
+        0.0,
+        False,
+        0,
+        False,
+        2,
+    )
+
+    direct_result = dsa_kernels.FusedIndexerSparseAttnFunc.apply(*args)
+    assert isinstance(direct_result, tuple)
+    assert len(direct_result) == 2
+
+    output, indexer_loss = dsa_kernels.fused_indexer_sparse_attn(*args)
+    assert output.shape == query.shape
+    assert indexer_loss.ndim == 0
+    (output.sum() + indexer_loss).backward()
+    torch.testing.assert_close(query.grad, torch.full_like(query, 2.0))
+
+    with_topk_result = dsa_kernels.fused_indexer_sparse_attn_with_topk(*args)
+    assert len(with_topk_result) == 3
+    assert with_topk_result[2].dtype == torch.int32
 
 
 def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():
