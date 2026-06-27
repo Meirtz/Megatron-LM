@@ -1346,7 +1346,9 @@ def test_dsv4_csa_torch_fused_module_parity_real_gpu():
     from megatron.lite.primitive.parallel import ParallelState
 
     device = torch.device("cuda", int(torch.cuda.current_device()))
-    seq = 512
+    # Keep the released top-k while making the module genuinely sparse:
+    # 2560 / ratio 4 = 640 compressed entries, so topk=512 excludes 128.
+    seq = 2560
     cfg = DeepseekV4Config(
         num_hidden_layers=1,
         hidden_size=128,
@@ -1458,6 +1460,7 @@ def test_dsv4_csa_torch_fused_module_parity_real_gpu():
     print(
         "NON_SKIP_DSV4_CSA_TORCH_FUSED_PARITY_PASSED "
         f"seq={seq} ratio=4 n_comp={seq // 4} indexer_topk={cfg.index_topk} "
+        "nontrivial_sparse_selection=True "
         "torch_vs_decomposed_output=True torch_vs_legacy_output=True "
         "main_grad_parity=True indexer_grads_none=True "
         f"min_main_grad_cosine={min(value['cosine'] for value in comparisons.values()):.6e} "
