@@ -335,6 +335,154 @@ def test_glm51_gate_off_preserves_legacy_rope_layout(
     assert all_full_dsa.indexer.rope_interleaved is True
 
 
+def test_glm5_dsa_attention_preserves_explicit_packed_position_resets(
+    transformer_engine_import_stub,
+):
+    import torch
+    import torch.nn as nn
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.lite.model import Glm5DSAAttention
+    from megatron.lite.primitive.modules.attention import build_rotary_embeddings
+
+    class CaptureDSA(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, x, **kwargs):
+            self.calls.append(
+                {
+                    "position_ids": kwargs["position_ids"].detach().clone(),
+                    "cos": kwargs["cos"].detach().clone(),
+                    "sin": kwargs["sin"].detach().clone(),
+                }
+            )
+            return torch.zeros_like(x)
+
+    attention = Glm5DSAAttention.__new__(Glm5DSAAttention)
+    nn.Module.__init__(attention)
+    attention.qk_rope_head_dim = 4
+    attention.rope_theta = 10_000.0
+    capture = CaptureDSA()
+    attention.self_attention = capture
+
+    x = torch.zeros(6, 1, 8)
+    reset_positions = torch.tensor([[0, 1, 2, 0, 1, 2]], dtype=torch.long)
+    out = attention(
+        x,
+        packed_seq_params=object(),
+        position_ids=reset_positions,
+    )
+
+    assert out.shape == x.shape
+    assert torch.equal(capture.calls[0]["position_ids"], reset_positions)
+    segment_cos, segment_sin = build_rotary_embeddings(
+        position_ids=reset_positions[:, :3],
+        dim=attention.qk_rope_head_dim,
+        rope_theta=attention.rope_theta,
+        dtype=x.dtype,
+    )
+    torch.testing.assert_close(
+        capture.calls[0]["cos"], torch.cat((segment_cos, segment_cos), dim=1)
+    )
+    torch.testing.assert_close(
+        capture.calls[0]["sin"], torch.cat((segment_sin, segment_sin), dim=1)
+    )
+
+    # Direct legacy callers still get the historical monotonic fallback.
+    attention(x)
+    assert torch.equal(
+        capture.calls[1]["position_ids"], torch.arange(6).unsqueeze(0)
+    )
+
+
+def test_glm5_threads_positions_through_trunk_and_mtp(
+    transformer_engine_import_stub,
+):
+    from types import SimpleNamespace
+
+    import torch
+    import torch.nn as nn
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.lite.model import Glm5MTPLayer, Glm5Model
+    from megatron.lite.primitive.parallel import ParallelState
+
+    class RecordingLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.position_ids = None
+
+        def forward(
+            self,
+            x,
+            packed_seq_params=None,
+            dsa_index_share_state=None,
+            position_ids=None,
+        ):
+            del packed_seq_params, dsa_index_share_state
+            self.position_ids = None if position_ids is None else position_ids.detach().clone()
+            return x
+
+    positions = torch.tensor([[0, 1, 2, 0, 1, 2]], dtype=torch.long)
+    packed = SimpleNamespace(
+        cu_seqlens_q=torch.tensor([0, 3, 6], dtype=torch.int32),
+        local_cp_size=None,
+        cp_rank=0,
+        cp_group=None,
+    )
+
+    # Exercise Glm5Model -> Glm5Layer argument propagation without requiring
+    # Transformer Engine kernels in this CPU unit test.
+    model = Glm5Model.__new__(Glm5Model)
+    nn.Module.__init__(model)
+    trunk = RecordingLayer()
+    model.layers = nn.ModuleList([trunk])
+    model.embed = None
+    model.norm = None
+    model.head = None
+    model.mtp = None
+    model._input_tensor = None
+    model._dsa_index_share_consumer_counts = {}
+    model.train_config = SimpleNamespace(fp8=False)
+    model.ps = ParallelState()
+    hidden = torch.zeros(6, 1, 4)
+    model(hidden_states=hidden, position_ids=positions, packed_seq_params=packed)
+    assert torch.equal(trunk.position_ids, positions)
+
+    class FakeEmbedding(nn.Module):
+        def forward(self, input_ids):
+            return input_ids.transpose(0, 1).unsqueeze(-1).expand(-1, -1, 4).float()
+
+    class KeepHiddenWidth(nn.Module):
+        def forward(self, value):
+            return value[..., :4]
+
+    # Exercise the MTP layer's packed, per-sequence left roll and verify that
+    # the rolled positions reach its transformer layer.
+    mtp = Glm5MTPLayer.__new__(Glm5MTPLayer)
+    nn.Module.__init__(mtp)
+    mtp.ps = ParallelState()
+    mtp.embedding = FakeEmbedding()
+    mtp.detach_encoder = False
+    mtp.enorm = nn.Identity()
+    mtp.hnorm = nn.Identity()
+    mtp.eh_proj = KeepHiddenWidth()
+    mtp.transformer_layer = RecordingLayer()
+    mtp.final_layernorm = nn.Identity()
+    mtp(
+        input_ids=torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long),
+        position_ids=positions,
+        hidden_states=hidden,
+        packed_seq_params=packed,
+    )
+    assert torch.equal(
+        mtp.transformer_layer.position_ids,
+        torch.tensor([[1, 2, 0, 1, 2, 0]], dtype=torch.long),
+    )
+
+
 def test_glm52_serving_mtp_share_metadata_is_ignored_and_mtp_is_always_full():
     from megatron.lite.model.glm5.config import Glm5Config
 

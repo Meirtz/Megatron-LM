@@ -466,3 +466,136 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
         )
 
     torch.testing.assert_close(results[0], results[1], rtol=0.0, atol=0.0)
+
+
+def test_glm52_model_preserves_multisegment_positions_through_indexshare_and_mtp():
+    """A real packed model must not replace reset positions with flat arange."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the GLM5 packed-position smoke.")
+    pytest.importorskip("cudnn", reason="GLM5 packed-position smoke needs cudnn DSA.")
+
+    from types import SimpleNamespace
+
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.model import Glm5Model
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+    device = torch.device("cuda", int(torch.cuda.current_device()))
+    cfg = Glm5Config(
+        num_hidden_layers=2,
+        hidden_size=128,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        head_dim=256,
+        vocab_size=32,
+        max_position_embeddings=1024,
+        initializer_range=0.002,
+        q_lora_rank=16,
+        kv_lora_rank=512,
+        qk_head_dim=256,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        index_head_dim=128,
+        index_n_heads=32,
+        index_topk=512,
+        intermediate_size=20,
+        moe_intermediate_size=6,
+        first_k_dense_replace=3,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        num_nextn_predict_layers=1,
+        index_topk_freq=2,
+        index_skip_topk_offset=1,
+        indexer_types=["full", "shared"],
+        rope_interleave=True,
+        indexer_rope_interleave=True,
+    )
+    ps = ParallelState()
+    train_cfg = SimpleNamespace(
+        tp=1,
+        ep=1,
+        etp=1,
+        pp=1,
+        cp=1,
+        vpp=None,
+        use_deepep=False,
+        fp8=False,
+        recompute_modules=[],
+        deterministic=True,
+    )
+
+    torch.manual_seed(20260627)
+    model = Glm5Model(
+        cfg,
+        train_cfg,
+        ps,
+        mtp_enable=True,
+        mtp_enable_train=False,
+    ).to(device=device, dtype=torch.bfloat16)
+    model.eval()
+    assert model.mtp is not None
+
+    segment_length = 512
+    total_tokens = segment_length * 2
+    input_ids = torch.randint(
+        0, cfg.vocab_size, (1, total_tokens), device=device, dtype=torch.long
+    )
+    segment_positions = torch.arange(segment_length, device=device, dtype=torch.long)
+    reset_positions = torch.cat((segment_positions, segment_positions)).unsqueeze(0)
+    cu_seqlens = torch.tensor(
+        [0, segment_length, total_tokens], device=device, dtype=torch.int32
+    )
+    packed_seq_params = PackedSeqParams.from_cu_seqlens(
+        cu_seqlens, max_seqlen=segment_length
+    )
+
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def capture_positions(module, _args, kwargs):
+        captured[module.layer_number] = kwargs["position_ids"].detach().clone()
+
+    attention_modules = [
+        layer.self_attention.self_attention for layer in model.layers
+    ] + [
+        model.mtp.layers[0].transformer_layer.self_attention.self_attention
+    ]
+    for attention in attention_modules:
+        handles.append(
+            attention.register_forward_pre_hook(capture_positions, with_kwargs=True)
+        )
+
+    try:
+        with torch.no_grad():
+            output = model(
+                input_ids=input_ids,
+                position_ids=reset_positions,
+                packed_seq_params=packed_seq_params,
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert output["logits"].shape == (1, total_tokens, cfg.vocab_size)
+    assert torch.isfinite(output["logits"].float()).all()
+    assert "mtp_logits" in output and len(output["mtp_logits"]) == 1
+    assert torch.equal(captured[1], reset_positions)
+    assert torch.equal(captured[2], reset_positions)
+
+    rolled_segment_positions = torch.cat(
+        (segment_positions[1:], torch.zeros(1, device=device, dtype=torch.long))
+    )
+    expected_mtp_positions = torch.cat(
+        (rolled_segment_positions, rolled_segment_positions)
+    ).unsqueeze(0)
+    assert torch.equal(captured[3], expected_mtp_positions)
+    print(
+        "NON_SKIP_GLM52_PACKED_POSITION_IDS_PASSED "
+        f"segments=2 segment_length={segment_length} "
+        f"trunk_reset={torch.equal(captured[2], reset_positions)} "
+        f"mtp_segment_roll={torch.equal(captured[3], expected_mtp_positions)}"
+    )

@@ -212,17 +212,29 @@ class Glm5DSAAttention(nn.Module):
         x: torch.Tensor,
         packed_seq_params=None,
         dsa_index_share_state: DSAIndexShareState | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Kimi feeds SBHD [S, B, H]; DSA needs batch-first [B, S, H].
         x_bsh = x.transpose(0, 1).contiguous()
         batch, seq_len, _ = x_bsh.shape
-        # Local (this-rank) position ids; DSA reconstructs the full sequence
-        # itself when CP > 1.
-        position_ids = (
-            torch.arange(seq_len, device=x_bsh.device, dtype=torch.long)
-            .unsqueeze(0)
-            .expand(batch, -1)
-        )
+        if position_ids is None:
+            # Compatibility fallback for direct callers that do not provide
+            # positions. Packed/runtime paths pass their per-sequence positions
+            # explicitly so resets at packed boundaries are preserved.
+            position_ids = (
+                torch.arange(seq_len, device=x_bsh.device, dtype=torch.long)
+                .unsqueeze(0)
+                .expand(batch, -1)
+            )
+        else:
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+            if position_ids.dim() != 2:
+                raise ValueError(
+                    "GLM5 DSA position_ids must be rank-1 or rank-2, got "
+                    f"shape={tuple(position_ids.shape)}."
+                )
+            position_ids = position_ids.to(device=x_bsh.device, dtype=torch.long)
         cos, sin = build_rotary_embeddings(
             position_ids=position_ids,
             dim=self.qk_rope_head_dim,
@@ -501,11 +513,13 @@ class Glm5Layer(nn.Module):
         x: torch.Tensor,
         packed_seq_params=None,
         dsa_index_share_state: DSAIndexShareState | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.self_attention(
             self.input_layernorm(x),
             packed_seq_params=packed_seq_params,
             dsa_index_share_state=dsa_index_share_state,
+            position_ids=position_ids,
         )
         if self.moe is not None:
             assert self.mlp_norm is not None
@@ -601,6 +615,7 @@ class Glm5MTPLayer(nn.Module):
             hidden_states,
             packed_seq_params=packed_seq_params,
             dsa_index_share_state=dsa_index_share_state,
+            position_ids=position_ids,
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
@@ -919,6 +934,7 @@ class Glm5Model(nn.Module):
                     h,
                     packed_seq_params=packed_seq_params,
                     dsa_index_share_state=dsa_index_share_state,
+                    position_ids=position_ids,
                 )
 
         output = {"hidden_states": h}
