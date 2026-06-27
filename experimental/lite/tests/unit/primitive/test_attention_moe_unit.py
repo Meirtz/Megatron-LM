@@ -127,6 +127,55 @@ def test_topk_router_does_not_attach_aux_scaler_in_eval(monkeypatch):
     assert not any("MoEAuxLoss" in name for name in _walk_grad_fn_names(scores))
 
 
+def test_dsv4_indexer_is_a_pure_topk_mask_not_an_attention_bias():
+    from megatron.lite.primitive.modules.attention.csa import (
+        _mask_compressed_scores_with_indexer,
+    )
+
+    compressed_scores = torch.tensor(
+        [
+            [
+                [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                [[9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]],
+            ]
+        ]
+    )
+    index_scores = torch.tensor([[[100.0, -4.0, 3.0, 2.0], [1.0, 8.0, 7.0, 0.0]]])
+    actual = _mask_compressed_scores_with_indexer(
+        compressed_scores, index_scores, index_topk=2
+    )
+
+    selected = torch.zeros_like(index_scores, dtype=torch.bool)
+    selected.scatter_(-1, index_scores.topk(2, dim=-1).indices, True)
+    selected = selected.unsqueeze(1).expand_as(compressed_scores)
+    torch.testing.assert_close(actual[selected], compressed_scores[selected])
+    assert torch.isneginf(actual[~selected]).all()
+    with pytest.raises(ValueError, match="must be positive"):
+        _mask_compressed_scores_with_indexer(
+            compressed_scores, index_scores, index_topk=0
+        )
+
+
+def test_dsv4_zero_loss_fused_selector_does_not_create_optimizer_grads():
+    from megatron.lite.primitive.modules.attention.csa import (
+        _prepare_indexer_inputs_for_fused_loss,
+    )
+
+    inputs = tuple(torch.nn.Parameter(torch.randn(2, 3)) for _ in range(3))
+    detached = _prepare_indexer_inputs_for_fused_loss(*inputs, loss_coeff=0.0)
+    assert all(not tensor.requires_grad and tensor.grad_fn is None for tensor in detached)
+    assert all(actual.data_ptr() == source.data_ptr() for actual, source in zip(detached, inputs))
+
+    before_step = tuple(parameter.detach().clone() for parameter in inputs)
+    optimizer = torch.optim.AdamW(inputs, lr=0.1, weight_decay=0.5)
+    optimizer.step()
+    for actual, expected in zip(inputs, before_step):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    differentiable = _prepare_indexer_inputs_for_fused_loss(*inputs, loss_coeff=1.0e-2)
+    assert all(actual is source for actual, source in zip(differentiable, inputs))
+
+
 def test_topk_router_aux_loss_contributes_gate_gradient(monkeypatch):
     TopKRouter, ParallelState = _router_and_parallel_state(monkeypatch)
     config = _router_config()
@@ -561,6 +610,81 @@ def test_dsa_score_memory_estimate_exposes_202k_training_boundary():
     assert sparse_bytes / gib > 150.0
     assert dense_bytes / gib > 300.0
     assert dense_bytes > 2 * sparse_bytes
+
+
+def test_dsa_score_memory_guard_raises_before_predictable_cuda_oom(monkeypatch):
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    gib = 1024**3
+    fake_cuda_tensor = SimpleNamespace(
+        is_cuda=True,
+        device=torch.device("cuda", 0),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (80 * gib, 288 * gib),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"DSA indexer top-k.*estimated peak of 153\.[0-9] GiB",
+    ):
+        dsa_kernels._guard_dsa_score_memory(
+            fake_cuda_tensor,
+            1,
+            202_752,
+            202_752,
+            dense_loss=False,
+        )
+
+
+def test_dsa_score_memory_guard_is_wired_to_indexer_and_fused_paths(monkeypatch):
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    calls = []
+
+    def fail_from_guard(_tensor, batch, seq_q, seq_k, *, dense_loss):
+        calls.append((batch, seq_q, seq_k, dense_loss))
+        raise RuntimeError("score-memory guard wired")
+
+    monkeypatch.setattr(dsa_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_kernels, "_guard_dsa_score_memory", fail_from_guard)
+
+    q_bshd = torch.zeros(1, 4, 2, 8)
+    k_bsd = torch.zeros(1, 1, 8)
+    w_bsh = torch.zeros(1, 4, 2)
+    with pytest.raises(RuntimeError, match="score-memory guard wired"):
+        dsa_kernels._indexer_topk_bshd(q_bshd, k_bsd, w_bsh, 1, ratio=4)
+
+    query = torch.zeros(4, 1, 2, 8)
+    kv_full = torch.zeros(5, 1, 8)
+    attn_sink = torch.zeros(2)
+    window_idxs = torch.zeros(1, 4, 1, dtype=torch.int32)
+    q_indexer = torch.zeros(4, 1, 2, 8)
+    k_indexer = torch.zeros(1, 1, 8)
+    weights = torch.zeros(4, 1, 2)
+    with pytest.raises(RuntimeError, match="score-memory guard wired"):
+        dsa_kernels.FusedIndexerSparseAttnFunc.apply(
+            query,
+            kv_full,
+            attn_sink,
+            window_idxs,
+            q_indexer,
+            k_indexer,
+            weights,
+            1,
+            4,
+            8**-0.5,
+            8**-0.5,
+            1.0,
+            False,
+            4,
+            False,
+            8,
+        )
+
+    assert calls == [(1, 4, 1, False), (1, 4, 1, True)]
 
 
 def test_dsa_bottom_right_topk_lengths_cover_non_square_valid_keys():

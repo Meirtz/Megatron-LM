@@ -210,6 +210,47 @@ def _window_topk_indices(
     return indices.unsqueeze(0).expand(batch, -1, -1).to(torch.int32)
 
 
+def _mask_compressed_scores_with_indexer(
+    compressed_scores: torch.Tensor,
+    index_scores: torch.Tensor,
+    index_topk: int,
+) -> torch.Tensor:
+    """Apply the Lightning Indexer's selection as a pure block mask.
+
+    The released DSv4 reference uses indexer scores only to select compressed
+    KV blocks. They are not an additive attention bias; selected logits remain
+    the ordinary scaled QK scores.
+    """
+
+    topk = min(int(index_topk), index_scores.size(-1))
+    if topk <= 0:
+        raise ValueError(f"DSv4 index_topk must be positive, got {index_topk}.")
+    topk_indices = index_scores.topk(topk, dim=-1).indices
+    topk_mask = torch.zeros_like(index_scores, dtype=torch.bool)
+    topk_mask.scatter_(-1, topk_indices, True)
+    return compressed_scores.masked_fill(~topk_mask.unsqueeze(1), -float("inf"))
+
+
+def _prepare_indexer_inputs_for_fused_loss(
+    q_indexer: torch.Tensor,
+    k_indexer: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    loss_coeff: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Keep a zero-loss selector out of autograd and optimizer weight decay.
+
+    Torch ``topk`` is non-differentiable, so the eager CSA path leaves these
+    gradients as ``None``.  The fused autograd wrapper returns explicit zero
+    tensors when ``loss_coeff == 0``; without detaching, AdamW would therefore
+    decay indexer parameters only for the fused backend.
+    """
+
+    if loss_coeff > 0:
+        return q_indexer, k_indexer, weights
+    return q_indexer.detach(), k_indexer.detach(), weights.detach()
+
+
 def _load_dsa_kernels():
     from megatron.lite.primitive.kernels import dsa_kernels
 
@@ -442,13 +483,10 @@ class CompressedSparseAttention(nn.Module):
                         ratio=self.compress_ratio,
                     )
                     index_scores = index_scores.masked_fill(~index_valid, -float("inf"))
-                    topk = min(self.indexer.index_topk, index_scores.size(-1))
-                    topk_indices = index_scores.topk(topk, dim=-1).indices
-                    topk_mask = torch.zeros_like(index_scores, dtype=torch.bool)
-                    topk_mask.scatter_(-1, topk_indices, True)
-                    compressed_scores = compressed_scores + index_scores.unsqueeze(1)
-                    compressed_scores = compressed_scores.masked_fill(
-                        ~topk_mask.unsqueeze(1), -float("inf")
+                    compressed_scores = _mask_compressed_scores_with_indexer(
+                        compressed_scores,
+                        index_scores,
+                        self.indexer.index_topk,
                     )
             score_parts.append(compressed_scores)
             value_parts.append(compressed_values)
@@ -659,19 +697,28 @@ class CompressedSparseAttention(nn.Module):
         sink = self.sinks.float()
 
         if self.training and torch.is_grad_enabled():
+            indexer_loss_coeff = 0.0
+            fused_q_indexer, fused_index_k, fused_weights_indexer = (
+                _prepare_indexer_inputs_for_fused_loss(
+                    q_indexer,
+                    index_k,
+                    weights_indexer,
+                    loss_coeff=indexer_loss_coeff,
+                )
+            )
             out, _indexer_loss = dsa_kernels.fused_indexer_sparse_attn(
                 query,
                 kv_full,
                 sink,
                 window_idxs,
-                q_indexer,
-                index_k,
-                weights_indexer,
+                fused_q_indexer,
+                fused_index_k,
+                fused_weights_indexer,
                 indexer_topk,
                 self.compress_ratio,
                 self.head_dim**-0.5,
                 self.indexer.softmax_scale,
-                0.0,
+                indexer_loss_coeff,
                 sparse_loss=False,
                 kv_offset=seq_len,
                 calculate_per_token_loss=False,
