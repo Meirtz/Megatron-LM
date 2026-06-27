@@ -27,6 +27,7 @@ def _make_glm5_model(cfg, ps, **kwargs):
 
 
 def _init_dist_or_skip():
+    from datetime import timedelta
     import os
 
     import torch
@@ -40,7 +41,10 @@ def _init_dist_or_skip():
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group("nccl")
+        timeout_s = int(os.environ.get("MLITE_DIST_TIMEOUT_S", "180"))
+        if timeout_s <= 0:
+            raise ValueError(f"MLITE_DIST_TIMEOUT_S must be positive, got {timeout_s}.")
+        dist.init_process_group("nccl", timeout=timedelta(seconds=timeout_s))
     if dist.get_world_size() < 2:
         pytest.skip("GLM5 CP smoke requires at least 2 ranks.")
     return torch.device("cuda", local_rank)
@@ -84,6 +88,16 @@ def _fused_dsa_seq_len(world: int) -> int:
     seq = 512
     if seq % (2 * world) != 0:
         pytest.skip(f"GLM5 fused DSA CP smoke requires seq={seq} divisible by 2*world={2 * world}.")
+    return seq
+
+
+def _sparse_fused_dsa_seq_len(world: int) -> int:
+    seq = 1024
+    if seq % (2 * world) != 0:
+        pytest.skip(
+            f"GLM5 sparse fused DSA CP smoke requires seq={seq} "
+            f"divisible by 2*world={2 * world}."
+        )
     return seq
 
 
@@ -153,6 +167,7 @@ def _make_dsa(
     cp_rank: int = 0,
     cp_group=None,
     rope_interleaved: bool = False,
+    indexer_loss_coeff: float = 0.0,
 ):
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention
 
@@ -170,10 +185,25 @@ def _make_dsa(
         rms_norm_eps=1e-5,
         rope_interleaved=rope_interleaved,
         indexer_rope_interleaved=rope_interleaved,
+        indexer_loss_coeff=indexer_loss_coeff,
         cp_size=cp_size,
         cp_rank=cp_rank,
         cp_group=cp_group,
     )
+
+
+def _wrap_dsa(dsa, ps, *, rope_theta: float = 1_000_000.0):
+    import torch.nn as nn
+
+    from megatron.lite.model.glm5.lite.model import Glm5DSAAttention
+
+    attention = Glm5DSAAttention.__new__(Glm5DSAAttention)
+    nn.Module.__init__(attention)
+    attention.ps = ps
+    attention.qk_rope_head_dim = dsa.qk_rope_head_dim
+    attention.rope_theta = rope_theta
+    attention.self_attention = dsa
+    return attention
 
 
 @pytest.mark.gpu
@@ -184,8 +214,7 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
     import torch
     import torch.distributed as dist
 
-    from megatron.lite.primitive.modules.attention import build_rotary_embeddings
-    from megatron.lite.primitive.parallel.cp import zigzag_position_ids_for_cp, zigzag_slice_for_cp
+    from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
     from megatron.lite.primitive.parallel.state import ParallelState
 
     device = _init_dist_or_skip()
@@ -194,40 +223,37 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
 
     torch.manual_seed(2026)
-    cp_attn = _make_dsa(
-        cp_size=world,
-        cp_rank=rank,
-        cp_group=ps.cp_group,
-        rope_interleaved=rope_interleaved,
+    cp_attn = _wrap_dsa(
+        _make_dsa(
+            cp_size=world,
+            cp_rank=rank,
+            cp_group=ps.cp_group,
+            rope_interleaved=rope_interleaved,
+            indexer_loss_coeff=1.0e-2,
+        ),
+        ps,
     ).to(device=device, dtype=torch.bfloat16)
     torch.manual_seed(2026)
-    ref_attn = _make_dsa(rope_interleaved=rope_interleaved).to(
-        device=device, dtype=torch.bfloat16
-    )
+    ref_ps = ParallelState()
+    ref_attn = _wrap_dsa(
+        _make_dsa(
+            rope_interleaved=rope_interleaved,
+            indexer_loss_coeff=1.0e-2,
+        ),
+        ref_ps,
+    ).to(device=device, dtype=torch.bfloat16)
 
-    batch, seq = 1, _fused_dsa_seq_len(world)
+    batch, seq = 1, _sparse_fused_dsa_seq_len(world)
+    assert cp_attn.self_attention.index_topk < seq
     torch.manual_seed(99)
     full_x = torch.randn(batch, seq, 128, device=device, dtype=torch.bfloat16)
     local_x = zigzag_slice_for_cp(full_x, rank, world, seq_dim=1).detach().requires_grad_(True)
     ref_x = full_x.detach().clone().requires_grad_(True)
 
-    local_pos = zigzag_position_ids_for_cp(seq, rank, world, device).expand(batch, -1)
-    full_pos = torch.arange(seq, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
-    local_cos, local_sin = build_rotary_embeddings(
-        position_ids=local_pos,
-        dim=64,
-        rope_theta=1_000_000.0,
-        dtype=torch.bfloat16,
-    )
-    full_cos, full_sin = build_rotary_embeddings(
-        position_ids=full_pos,
-        dim=64,
-        rope_theta=1_000_000.0,
-        dtype=torch.bfloat16,
-    )
-
-    cp_out = cp_attn(local_x, cos=local_cos, sin=local_sin, position_ids=local_pos)
-    ref_out = ref_attn(ref_x, cos=full_cos, sin=full_sin, position_ids=full_pos)
+    # Exercise the exported wrapper's position_ids=None fallback, including
+    # global zigzag positions and rank-3 rotary reconstruction inside DSA.
+    cp_out = cp_attn(local_x.transpose(0, 1).contiguous()).transpose(0, 1).contiguous()
+    ref_out = ref_attn(ref_x.transpose(0, 1).contiguous()).transpose(0, 1).contiguous()
     expected = zigzag_slice_for_cp(ref_out, rank, world, seq_dim=1)
     torch.testing.assert_close(cp_out, expected, atol=3e-2, rtol=3e-2)
 
@@ -236,10 +262,36 @@ def test_glm5_dsa_cp2_matches_full_sequence_reference_forward_and_grad(
     expected_grad = zigzag_slice_for_cp(ref_x.grad, rank, world, seq_dim=1)
     assert local_x.grad is not None
     torch.testing.assert_close(local_x.grad, expected_grad, atol=8e-2, rtol=8e-2)
+
+    ref_params = dict(ref_attn.named_parameters())
+    for name, param in cp_attn.named_parameters():
+        assert param.grad is not None, name
+        assert ref_params[name].grad is not None, name
+        cp_grad = param.grad.detach().float().clone()
+        dist.all_reduce(cp_grad, op=dist.ReduceOp.SUM)
+        is_indexer_param = ".indexer." in name
+        if is_indexer_param:
+            # Every CP rank reconstructs the same full sequence, so the
+            # detached indexer auxiliary loss produces replicated gradients.
+            # Runtime replicated-gradient synchronization averages these.
+            cp_grad.div_(world)
+            assert torch.count_nonzero(cp_grad).item() > 0, name
+        torch.testing.assert_close(
+            cp_grad,
+            ref_params[name].grad.detach().float(),
+            atol=8e-2,
+            rtol=8e-2,
+            msg=(
+                f"CP-averaged indexer gradient mismatch for {name}"
+                if is_indexer_param
+                else f"CP-summed parameter gradient mismatch for {name}"
+            ),
+        )
     if rank == 0:
         print(
             "NON_SKIP_GLM5_NONPACKED_CP_RANK3_ROTARY_PASSED "
-            f"cp={world} rope_interleaved={rope_interleaved}"
+            f"cp={world} rope_interleaved={rope_interleaved} "
+            "indexer_loss_coeff=1.0e-2 indexer_topk=512 seq=1024"
         )
 
 

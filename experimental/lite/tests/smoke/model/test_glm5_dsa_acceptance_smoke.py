@@ -12,13 +12,18 @@ _FUSED_R2R_OUTPUT_ATOL = 2.0e-3
 _FUSED_R2R_GRAD_ATOL = 5.0e-2
 _FUSED_VS_REFERENCE_OUTPUT_ATOL = 2.0e-3
 _FUSED_VS_REFERENCE_GRAD_ATOL = 5.0e-2
-_FUSED_VS_REFERENCE_LOSS_ATOL = 1.0e-5
+_FUSED_VS_REFERENCE_LOSS_ATOL = 1.0e-6
+_FUSED_VS_REFERENCE_LOSS_RTOL = 5.0e-3
 _INDEXER_TOPK = 512
 _SEQUENCE_LENGTH = 1024
 _INDEXER_LOSS_COEFF = 1.0e-2
 _MIN_INDEXER_GRAD_MAX_ABS = 1.0e-8
-_MIN_INDEXER_GRAD_COSINE = 0.97
-_MAX_INDEXER_GRAD_RMS_REL = 0.55
+_MIN_INDEXER_GRAD_COSINE = 0.99
+_MAX_INDEXER_GRAD_RMS_REL = 0.20
+_MIN_INDEXER_GRAD_NORM_RATIO = 0.90
+_MAX_INDEXER_GRAD_NORM_RATIO = 1.10
+_TOPK_SCORE_ATOL = 1.0e-5
+_TOPK_SCORE_RTOL = 1.0e-4
 
 
 def _make_dsa_pair(*, sparse_loss: bool):
@@ -131,23 +136,37 @@ def _saved_indexer_loss(output: torch.Tensor) -> torch.Tensor:
     """Extract the loss attached by DSAIndexerLossAutoScaler before backward."""
 
     stack = [output.grad_fn]
-    visited: set[int] = set()
+    # Keep strong references to visited nodes. Storing only ids permits an
+    # autograd wrapper to be collected and its id reused during traversal.
+    visited: dict[int, object] = {}
+    matches: list[torch.Tensor] = []
     while stack:
         grad_fn = stack.pop()
         if grad_fn is None or id(grad_fn) in visited:
             continue
-        visited.add(id(grad_fn))
+        visited[id(grad_fn)] = grad_fn
         if type(grad_fn).__name__ == "DSAIndexerLossAutoScalerBackward":
             (indexer_loss,) = grad_fn.saved_tensors
-            return indexer_loss.detach().float().clone()
+            matches.append(indexer_loss)
         stack.extend(parent for parent, _index in grad_fn.next_functions)
-    raise AssertionError("DSAIndexerLossAutoScalerBackward was not found in the output graph")
+    assert len(matches) == 1, (
+        f"expected exactly one DSAIndexerLossAutoScalerBackward, found {len(matches)}"
+    )
+    indexer_loss = matches[0]
+    assert indexer_loss.ndim == 0
+    assert torch.isfinite(indexer_loss)
+    return indexer_loss.detach().float().clone()
 
 
 def _causal_mask(seq_q: int, seq_k: int, *, ratio: int, device: torch.device) -> torch.Tensor:
     q_idx = torch.arange(seq_q, device=device)
     k_idx = torch.arange(seq_k, device=device)
-    valid_per_q = ((q_idx + 1) // ratio).clamp(max=seq_k)
+    q_global_start = seq_k * ratio - seq_q
+    valid_per_q = torch.div(
+        q_global_start + q_idx + 1,
+        ratio,
+        rounding_mode="floor",
+    ).clamp(min=0, max=seq_k)
     return k_idx.unsqueeze(0) < valid_per_q.unsqueeze(1)
 
 
@@ -161,12 +180,40 @@ def _torch_indexer_scores(
 ) -> torch.Tensor:
     q_bshd = q_indexer.permute(1, 0, 2, 3).float()
     k_bsd = k_indexer.permute(1, 0, 2).float()
+    # Production moves the positive softmax scale onto W, then quantizes the
+    # scaled weights back to BF16 before the indexer GEMM. Reproduce that
+    # boundary so exact top-k checks do not fail on an FP32/BF16 rank flip.
+    w_bsh = (
+        weights.permute(1, 0, 2).float() * float(indexer_softmax_scale)
+    ).to(weights.dtype).float()
+    scores = torch.einsum("bqhd,bkd->bqhk", q_bshd, k_bsd)
+    scores = torch.relu(scores).mul(w_bsh.unsqueeze(-1)).sum(dim=2)
+    causal = _causal_mask(scores.shape[1], scores.shape[2], ratio=ratio, device=scores.device)
+    return torch.where(causal.unsqueeze(0), scores, torch.full_like(scores, -torch.inf))
+
+
+def _torch_dense_indexer_scores(
+    q_indexer: torch.Tensor,
+    k_indexer: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    ratio: int,
+    indexer_softmax_scale: float,
+) -> torch.Tensor:
+    """Canonical full-KV score used by cuDNN dense score/backward."""
+
+    q_bshd = q_indexer.permute(1, 0, 2, 3).float()
+    k_bsd = k_indexer.permute(1, 0, 2).float()
     w_bsh = weights.permute(1, 0, 2).float()
     scores = torch.einsum("bqhd,bkd->bqhk", q_bshd, k_bsd)
     scores = torch.relu(scores).mul(w_bsh.unsqueeze(-1)).sum(dim=2)
     scores = scores * float(indexer_softmax_scale)
-    causal = _causal_mask(scores.shape[1], scores.shape[2], ratio=ratio, device=scores.device)
-    return torch.where(causal.unsqueeze(0), scores, torch.full_like(scores, -torch.inf))
+    causal = _causal_mask(
+        scores.shape[1], scores.shape[2], ratio=ratio, device=scores.device
+    )
+    return torch.where(
+        causal.unsqueeze(0), scores, torch.full_like(scores, -torch.inf)
+    )
 
 
 def _torch_topk_from_scores(scores: torch.Tensor, topk: int) -> torch.Tensor:
@@ -225,7 +272,6 @@ def _torch_sparse_indexer_loss(
     indexer_scores: torch.Tensor,
     query_states: torch.Tensor,
     kv_full: torch.Tensor,
-    attn_sink: torch.Tensor,
     topk_indices: torch.Tensor,
     *,
     softmax_scale: float,
@@ -242,15 +288,23 @@ def _torch_sparse_indexer_loss(
     attn_scores = torch.where(
         valid.unsqueeze(2), attn_scores, torch.full_like(attn_scores, -torch.inf)
     )
-    sink = attn_sink.detach().float().view(1, 1, -1, 1)
-    sink = sink.expand(attn_scores.shape[0], attn_scores.shape[1], -1, -1)
-    attn_probs = torch.softmax(torch.cat([attn_scores, sink], dim=-1), dim=-1)[..., :-1]
+    row_valid = valid.any(dim=-1)
+    safe_attn_scores = torch.where(
+        row_valid.view(*row_valid.shape, 1, 1),
+        attn_scores,
+        torch.zeros_like(attn_scores),
+    )
+    attn_probs = torch.softmax(safe_attn_scores, dim=-1)
+    attn_probs = torch.where(
+        row_valid.view(*row_valid.shape, 1, 1),
+        attn_probs,
+        torch.zeros_like(attn_probs),
+    )
     target_mass = attn_probs.sum(dim=2)
     target_mass = torch.where(valid, target_mass, torch.zeros_like(target_mass))
 
-    row_valid = valid.any(dim=-1)
     target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(
-        torch.finfo(torch.float32).tiny
+        1.0e-10
     )
     target = target_mass / target_denom
 
@@ -263,11 +317,9 @@ def _torch_sparse_indexer_loss(
     )
     predict = torch.softmax(selected_indexer_scores, dim=-1)
 
-    eps = torch.finfo(torch.float32).tiny
-    target_clamped = target.clamp_min(eps)
-    predict_clamped = predict.clamp_min(eps)
+    eps = 1.0e-10
     kl_per_row = (
-        target_clamped * (torch.log(target_clamped) - torch.log(predict_clamped))
+        target * (torch.log(target + eps) - torch.log(predict + eps))
     ).sum(dim=-1)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
     return float(loss_coeff) * kl_per_row.mean()
@@ -277,8 +329,6 @@ def _torch_dense_indexer_loss(
     indexer_scores: torch.Tensor,
     query_states: torch.Tensor,
     kv_full: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_indices: torch.Tensor,
     *,
     softmax_scale: float,
     loss_coeff: float,
@@ -297,36 +347,34 @@ def _torch_dense_indexer_loss(
         attn_scores,
         torch.full_like(attn_scores, -torch.inf),
     )
-    # FlashMLA reports the per-head LSE over the selected sparse keys plus
-    # sink.  Dense DSA then recomputes all-key scores against that same LSE
-    # before L1-normalising the head-summed target over the full KV axis.
-    selected_keys = _gather_sequence(kv_bsd, topk_indices)
-    selected_scores = torch.einsum("bqhd,bqtd->bqht", query_bshd, selected_keys)
-    selected_scores = selected_scores * float(softmax_scale)
-    selected_scores = torch.where(
-        topk_indices.unsqueeze(2) >= 0,
-        selected_scores,
-        torch.full_like(selected_scores, -torch.inf),
+    # Canonical dense DSA: every attention head independently softmaxes over
+    # the complete causal KV axis, then the head probabilities are summed and
+    # L1-normalized. No top-k tensor or attention sink participates.
+    row_valid = causal.any(dim=-1).unsqueeze(0)
+    safe_attn_scores = torch.where(
+        row_valid.view(*row_valid.shape, 1, 1),
+        attn_scores,
+        torch.zeros_like(attn_scores),
     )
-    sink = attn_sink.detach().float().view(1, 1, -1, 1)
-    sink = sink.expand(selected_scores.shape[0], selected_scores.shape[1], -1, -1)
-    selected_lse = torch.logsumexp(torch.cat([selected_scores, sink], dim=-1), dim=-1)
-    target_mass = torch.exp(attn_scores - selected_lse.unsqueeze(-1)).sum(dim=2)
+    attn_probs = torch.softmax(safe_attn_scores, dim=-1)
+    attn_probs = torch.where(
+        row_valid.view(*row_valid.shape, 1, 1),
+        attn_probs,
+        torch.zeros_like(attn_probs),
+    )
+    target_mass = attn_probs.sum(dim=2)
     target_mass = torch.where(causal.unsqueeze(0), target_mass, torch.zeros_like(target_mass))
     target_denom = target_mass.sum(dim=-1, keepdim=True).clamp_min(
-        torch.finfo(torch.float32).tiny
+        1.0e-10
     )
     target = target_mass / target_denom
 
-    row_valid = causal.any(dim=-1).unsqueeze(0)
     safe_indexer_scores = torch.where(
         row_valid.unsqueeze(-1), indexer_scores, torch.zeros_like(indexer_scores)
     )
     predict = torch.softmax(safe_indexer_scores, dim=-1)
-    eps = torch.finfo(torch.float32).tiny
-    terms = target.clamp_min(eps) * (
-        torch.log(target.clamp_min(eps)) - torch.log(predict.clamp_min(eps))
-    )
+    eps = 1.0e-10
+    terms = target * (torch.log(target + eps) - torch.log(predict + eps))
     terms = torch.where(causal.unsqueeze(0), terms, torch.zeros_like(terms))
     kl_per_row = terms.sum(dim=-1)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
@@ -374,8 +422,8 @@ def _torch_unfused_dsa_forward(
     kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
     indexer_loss = x.new_zeros((), dtype=torch.float32)
+    indexer_scores = None
     if module.indexer is not None:
-        assert topk_indices is None
         q_indexer, k_indexer, weights_indexer = module.indexer.forward_before_topk(
             x.detach(), q_resid.detach(), cos, sin, position_ids
         )
@@ -386,26 +434,37 @@ def _torch_unfused_dsa_forward(
             ratio=1,
             indexer_softmax_scale=module.indexer_softmax_scale,
         )
-        topk_indices = _torch_topk_from_scores(
-            indexer_scores, min(module.index_topk, indexer_scores.shape[-1])
-        )
+        if topk_indices is None:
+            topk_indices = _torch_topk_from_scores(
+                indexer_scores, min(module.index_topk, indexer_scores.shape[-1])
+            )
+        else:
+            # Selection correctness is proved independently from the quantized
+            # indexer scores.  Reusing the vendor-selected indices here makes
+            # the attention/loss/gradient comparison well-defined when several
+            # keys tie at the top-k cutoff but have different attention values.
+            topk_indices = topk_indices.detach()
         if module.indexer_use_sparse_loss:
             indexer_loss = _torch_sparse_indexer_loss(
                 indexer_scores,
                 query_states,
                 kv_full,
-                module.attn_sink,
                 topk_indices,
                 softmax_scale=module.softmax_scale,
                 loss_coeff=module.indexer_loss_coeff,
             )
         else:
+            dense_indexer_scores = _torch_dense_indexer_scores(
+                q_indexer,
+                k_indexer,
+                weights_indexer,
+                ratio=1,
+                indexer_softmax_scale=module.indexer_softmax_scale,
+            )
             indexer_loss = _torch_dense_indexer_loss(
-                indexer_scores,
+                dense_indexer_scores,
                 query_states,
                 kv_full,
-                module.attn_sink,
-                topk_indices,
                 softmax_scale=module.softmax_scale,
                 loss_coeff=module.indexer_loss_coeff,
             )
@@ -424,25 +483,44 @@ def _torch_unfused_dsa_forward(
     out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
     out = out.reshape(batch, seq_len, module.num_heads * module.v_head_dim)
     out = module.o_proj(out)
-    return out, topk_indices, indexer_loss
+    return out, topk_indices, indexer_loss, indexer_scores
 
 
-def _run_once_torch_unfused(modules, x, cos, sin, position_ids):
+def _run_once_torch_unfused(
+    modules,
+    x,
+    cos,
+    sin,
+    position_ids,
+    *,
+    forced_source_topk: torch.Tensor | None = None,
+):
     modules.zero_grad(set_to_none=True)
     modules.train(True)
     local_x = x.detach().clone().requires_grad_(True)
-    source_out, topk_indices, indexer_loss = _torch_unfused_dsa_forward(
-        modules["source"], local_x, cos, sin, position_ids
+    source_out, topk_indices, indexer_loss, indexer_scores = (
+        _torch_unfused_dsa_forward(
+            modules["source"],
+            local_x,
+            cos,
+            sin,
+            position_ids,
+            topk_indices=forced_source_topk,
+        )
     )
+    assert indexer_scores is not None
     hidden = local_x + source_out
-    shared_out, reused_topk_indices, shared_indexer_loss = _torch_unfused_dsa_forward(
-        modules["shared"],
-        hidden,
-        cos,
-        sin,
-        position_ids,
-        topk_indices=topk_indices,
+    shared_out, reused_topk_indices, shared_indexer_loss, shared_indexer_scores = (
+        _torch_unfused_dsa_forward(
+            modules["shared"],
+            hidden,
+            cos,
+            sin,
+            position_ids,
+            topk_indices=topk_indices,
+        )
     )
+    assert shared_indexer_scores is None
     assert torch.equal(reused_topk_indices, topk_indices)
     assert float(shared_indexer_loss.item()) == 0.0
     out = hidden + shared_out
@@ -460,6 +538,7 @@ def _run_once_torch_unfused(modules, x, cos, sin, position_ids):
         "x_grad": local_x.grad.detach().float().clone(),
         "param_grads": param_grads,
         "topk_indices": topk_indices.detach().clone(),
+        "indexer_scores": indexer_scores.detach().float().clone(),
     }
 
 
@@ -471,6 +550,105 @@ def _canonical_topk_set(topk_indices: torch.Tensor) -> torch.Tensor:
     """Canonicalize the vendor top-k's intentionally unspecified ordering."""
 
     return torch.sort(topk_indices, dim=-1).values
+
+
+def _assert_topk_matches_quantized_scores(
+    actual_indices: torch.Tensor,
+    scores: torch.Tensor,
+) -> dict[str, float | int]:
+    """Validate top-k exactly away from ties and by cutoff at numeric ties."""
+
+    assert actual_indices.shape[:2] == scores.shape[:2]
+    topk = actual_indices.shape[-1]
+    seq_k = scores.shape[-1]
+    assert topk <= seq_k
+    actual_valid = actual_indices >= 0
+    valid_count = torch.isfinite(scores).sum(dim=-1)
+    expected_count = valid_count.clamp(max=topk)
+    torch.testing.assert_close(
+        actual_valid.sum(dim=-1), expected_count, atol=0, rtol=0
+    )
+    assert torch.all((actual_indices < seq_k) | ~actual_valid)
+
+    canonical_actual = _canonical_topk_set(actual_indices)
+    duplicate = (
+        (canonical_actual[..., 1:] == canonical_actual[..., :-1])
+        & (canonical_actual[..., 1:] >= 0)
+    )
+    assert not torch.any(duplicate), "vendor top-k returned duplicate valid indices"
+
+    expected_indices = _torch_topk_from_scores(scores, topk)
+    exact_rows = torch.all(
+        canonical_actual == _canonical_topk_set(expected_indices), dim=-1
+    )
+
+    probe_k = min(topk + 1, seq_k)
+    probe_values = torch.topk(scores, k=probe_k, dim=-1).values
+    kth_slot = (expected_count - 1).clamp(min=0).unsqueeze(-1)
+    cutoff = torch.gather(probe_values[..., :topk], -1, kth_slot).squeeze(-1)
+    tolerance = _TOPK_SCORE_ATOL + _TOPK_SCORE_RTOL * cutoff.abs()
+
+    safe_indices = actual_indices.clamp(min=0).long()
+    selected_scores = torch.gather(scores, dim=-1, index=safe_indices)
+    selected_scores = torch.where(
+        actual_valid, selected_scores, torch.full_like(selected_scores, torch.inf)
+    )
+    minimum_selected = selected_scores.amin(dim=-1)
+    nonempty = expected_count > 0
+    selected_counts = torch.zeros_like(scores, dtype=torch.int32)
+    selected_counts.scatter_add_(-1, safe_indices, actual_valid.to(torch.int32))
+    selected_mask = selected_counts > 0
+    unselected_scores = torch.where(
+        torch.isfinite(scores) & ~selected_mask,
+        scores,
+        torch.full_like(scores, -torch.inf),
+    )
+    maximum_unselected = unselected_scores.amax(dim=-1)
+    has_unselected = valid_count > expected_count
+    pairwise_tolerance = _TOPK_SCORE_ATOL + _TOPK_SCORE_RTOL * torch.maximum(
+        minimum_selected.abs(), maximum_unselected.abs()
+    )
+    shortfall = torch.where(
+        nonempty & has_unselected,
+        (maximum_unselected - minimum_selected).clamp_min(0),
+        torch.zeros_like(cutoff),
+    )
+    assert torch.all(
+        ~(nonempty & has_unselected)
+        | (minimum_selected >= maximum_unselected - pairwise_tolerance)
+    ), (
+        "top-k omitted a score above the selected boundary: "
+        f"max_shortfall={float(shortfall.max().item())}"
+    )
+
+    strict_rows = valid_count <= topk
+    if probe_k > topk:
+        next_score = probe_values[..., topk]
+        margin = cutoff - next_score
+        strict_rows = strict_rows | (margin > tolerance)
+    assert torch.all(~strict_rows | exact_rows), (
+        "top-k index multiset differs despite a numerically separated cutoff"
+    )
+    ambiguous_rows = (~strict_rows & nonempty).sum()
+    return {
+        "exact_rows": int(exact_rows.sum().item()),
+        "ambiguous_rows": int(ambiguous_rows.item()),
+        "max_score_shortfall": float(shortfall.max().item()),
+    }
+
+
+def test_topk_score_proof_rejects_missing_strict_winner_but_allows_boundary_ties():
+    scores = torch.tensor([[[100.0, 1.0, 1.0]]])
+    with pytest.raises(AssertionError, match="omitted a score"):
+        _assert_topk_matches_quantized_scores(
+            torch.tensor([[[1, 2]]], dtype=torch.int32), scores
+        )
+
+    proof = _assert_topk_matches_quantized_scores(
+        torch.tensor([[[0, 2]]], dtype=torch.int32), scores
+    )
+    assert proof["ambiguous_rows"] == 1
+    assert proof["max_score_shortfall"] == 0.0
 
 
 def _max_param_grad_abs(a: dict, b: dict) -> float:
@@ -510,7 +688,9 @@ def _assert_meaningful_indexer_grads(result: dict) -> float:
     return max(grad_max_abs.values())
 
 
-def _indexer_grad_similarity(actual: dict, expected: dict) -> dict[str, tuple[float, float]]:
+def _indexer_grad_similarity(
+    actual: dict, expected: dict
+) -> dict[str, tuple[float, float, float]]:
     names = sorted(
         name for name in expected["param_grads"] if name.startswith("source.indexer.")
     )
@@ -518,7 +698,7 @@ def _indexer_grad_similarity(actual: dict, expected: dict) -> dict[str, tuple[fl
     assert set(names) == {
         name for name in actual["param_grads"] if name.startswith("source.indexer.")
     }
-    similarities: dict[str, tuple[float, float]] = {}
+    similarities: dict[str, tuple[float, float, float]] = {}
     for name in names:
         actual_grad = actual["param_grads"][name].float().reshape(-1)
         expected_grad = expected["param_grads"][name].float().reshape(-1)
@@ -528,18 +708,33 @@ def _indexer_grad_similarity(actual: dict, expected: dict) -> dict[str, tuple[fl
         rms_diff = torch.sqrt(torch.mean((actual_grad - expected_grad).square()))
         rms_expected = torch.sqrt(torch.mean(expected_grad.square()))
         rms_relative = rms_diff / rms_expected
-        similarities[name] = (float(cosine.item()), float(rms_relative.item()))
+        norm_ratio = actual_norm / expected_norm
+        similarities[name] = (
+            float(cosine.item()),
+            float(rms_relative.item()),
+            float(norm_ratio.item()),
+        )
     return similarities
 
 
 @pytest.mark.parametrize("sparse_loss", [True, False], ids=["sparse-loss", "dense-loss"])
-def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
+def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool, monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for GLM5 DSA accept-with-proof smoke.")
 
-    from megatron.lite.primitive.modules.attention import build_rope_cache
+    from megatron.lite.primitive.modules.attention import (
+        DSAIndexerLossAutoScaler,
+        build_rope_cache,
+    )
 
     device = torch.device("cuda", int(torch.cuda.current_device()))
+    # The runtime loss scaler is process-global.  Pin this standalone oracle to
+    # unit scale and let monkeypatch restore any suite-level prior value.
+    monkeypatch.setattr(
+        DSAIndexerLossAutoScaler,
+        "main_loss_backward_scale",
+        torch.ones((), device=device),
+    )
     torch.manual_seed(20260626)
     fused = _make_dsa_pair(sparse_loss=sparse_loss).to(device=device, dtype=torch.bfloat16)
     unfused = copy.deepcopy(fused).to(device=device, dtype=torch.bfloat16)
@@ -558,6 +753,14 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
     fused_b = _run_once(fused, x, cos, sin, position_ids, fused_training=True)
     unfused_a = _run_once_torch_unfused(unfused, x, cos, sin, position_ids)
     unfused_b = _run_once_torch_unfused(unfused, x, cos, sin, position_ids)
+    matched_unfused_a = _run_once_torch_unfused(
+        unfused,
+        x,
+        cos,
+        sin,
+        position_ids,
+        forced_source_topk=fused_a["topk_indices"],
+    )
 
     fused_r2r_out = _max_abs(fused_a["out"], fused_b["out"])
     fused_r2r_loss = abs(float(fused_a["loss"].item()) - float(fused_b["loss"].item()))
@@ -569,29 +772,41 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
     )
     unfused_r2r_x_grad = _max_abs(unfused_a["x_grad"], unfused_b["x_grad"])
     unfused_r2r_param_grad = _max_param_grad_abs(unfused_a, unfused_b)
-    fused_vs_unfused_out = _max_abs(fused_a["out"], unfused_a["out"])
-    fused_vs_unfused_x_grad = _max_abs(fused_a["x_grad"], unfused_a["x_grad"])
-    fused_vs_unfused_param_grad = _max_param_grad_abs(fused_a, unfused_a)
-    loss_diff = abs(float(fused_a["loss"].item()) - float(unfused_a["loss"].item()))
+    fused_vs_unfused_out = _max_abs(fused_a["out"], matched_unfused_a["out"])
+    fused_vs_unfused_x_grad = _max_abs(
+        fused_a["x_grad"], matched_unfused_a["x_grad"]
+    )
+    fused_vs_unfused_param_grad = _max_param_grad_abs(fused_a, matched_unfused_a)
+    loss_diff = abs(
+        float(fused_a["loss"].item()) - float(matched_unfused_a["loss"].item())
+    )
     unfused_indexer_loss_diff = abs(
         float(unfused_a["indexer_loss"].item())
         - float(unfused_b["indexer_loss"].item())
     )
     fused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(fused_a)
     _assert_meaningful_indexer_grads(fused_b)
-    unfused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(unfused_a)
+    unfused_indexer_grad_max_abs = _assert_meaningful_indexer_grads(
+        matched_unfused_a
+    )
     _assert_meaningful_indexer_grads(unfused_b)
-    indexer_grad_similarity = _indexer_grad_similarity(fused_a, unfused_a)
+    indexer_grad_similarity = _indexer_grad_similarity(fused_a, matched_unfused_a)
     min_indexer_grad_cosine = min(value[0] for value in indexer_grad_similarity.values())
     max_indexer_grad_rms_relative = max(
         value[1] for value in indexer_grad_similarity.values()
+    )
+    min_indexer_grad_norm_ratio = min(
+        value[2] for value in indexer_grad_similarity.values()
+    )
+    max_indexer_grad_norm_ratio = max(
+        value[2] for value in indexer_grad_similarity.values()
     )
     fused_indexer_loss_r2r = abs(
         float(fused_a["indexer_loss"].item()) - float(fused_b["indexer_loss"].item())
     )
     fused_vs_unfused_indexer_loss = abs(
         float(fused_a["indexer_loss"].item())
-        - float(unfused_a["indexer_loss"].item())
+        - float(matched_unfused_a["indexer_loss"].item())
     )
 
     assert torch.isfinite(fused_a["loss"])
@@ -607,6 +822,70 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
     fused_topk_set_r2r = torch.equal(fused_a_topk_set, fused_b_topk_set)
     unfused_topk_set_r2r = torch.equal(unfused_a_topk_set, unfused_b_topk_set)
     fused_vs_unfused_topk_set = torch.equal(fused_a_topk_set, unfused_a_topk_set)
+    topk_score_proof = _assert_topk_matches_quantized_scores(
+        fused_a["topk_indices"], unfused_a["indexer_scores"]
+    )
+
+    dense_topk_loss_diff = 0.0
+    dense_topk_indexer_grad_diff = 0.0
+    dense_topk_changed = False
+    if not sparse_loss:
+        from megatron.lite.primitive.kernels import dsa_kernels
+
+        original_topk = dsa_kernels._indexer_topk_bshd
+
+        def lowest_valid_topk(q_bshd, k_bsd, w_bsh, topk, ratio=4):
+            _indices, _length, scores = original_topk(
+                q_bshd, k_bsd, w_bsh, topk, ratio
+            )
+            del _indices, _length
+            low_rank_scores = torch.where(
+                torch.isfinite(scores), scores, torch.full_like(scores, torch.inf)
+            )
+            values, indices = torch.topk(
+                low_rank_scores, k=topk, dim=-1, largest=False
+            )
+            indices = torch.where(
+                torch.isfinite(values), indices, torch.full_like(indices, -1)
+            ).int()
+            lengths = (indices >= 0).sum(dim=-1).int()
+            return indices, lengths, scores
+
+        with monkeypatch.context() as dense_topk_patch:
+            dense_topk_patch.setattr(
+                dsa_kernels, "_indexer_topk_bshd", lowest_valid_topk
+            )
+            alternate_topk = _run_once(
+                fused, x, cos, sin, position_ids, fused_training=True
+            )
+
+        dense_topk_changed = not torch.equal(
+            _canonical_topk_set(alternate_topk["topk_indices"]), fused_a_topk_set
+        )
+        assert dense_topk_changed
+        dense_topk_loss_diff = abs(
+            float(alternate_topk["indexer_loss"].item())
+            - float(fused_a["indexer_loss"].item())
+        )
+        torch.testing.assert_close(
+            alternate_topk["indexer_loss"],
+            fused_a["indexer_loss"],
+            atol=_FUSED_VS_REFERENCE_LOSS_ATOL,
+            rtol=_FUSED_VS_REFERENCE_LOSS_RTOL,
+        )
+        indexer_names = [
+            name
+            for name in fused_a["param_grads"]
+            if name.startswith("source.indexer.")
+        ]
+        dense_topk_indexer_grad_diff = max(
+            _max_abs(
+                alternate_topk["param_grads"][name],
+                fused_a["param_grads"][name],
+            )
+            for name in indexer_names
+        )
+        assert dense_topk_indexer_grad_diff <= 1.0e-6
     print(
         "GLM5_DSA_ACCEPTANCE_DIAGNOSTICS "
         f"sparse_loss={sparse_loss} "
@@ -624,14 +903,32 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
         f" fused_vs_unfused_indexer_loss={fused_vs_unfused_indexer_loss:.6e}"
         f" min_indexer_grad_cosine={min_indexer_grad_cosine:.6e}"
         f" max_indexer_grad_rms_relative={max_indexer_grad_rms_relative:.6e}"
+        f" min_indexer_grad_norm_ratio={min_indexer_grad_norm_ratio:.6e}"
+        f" max_indexer_grad_norm_ratio={max_indexer_grad_norm_ratio:.6e}"
+        f" topk_exact_rows={topk_score_proof['exact_rows']}"
+        f" topk_ambiguous_rows={topk_score_proof['ambiguous_rows']}"
+        f" topk_max_score_shortfall={topk_score_proof['max_score_shortfall']:.6e}"
+        f" dense_topk_changed={dense_topk_changed}"
+        f" dense_topk_loss_diff={dense_topk_loss_diff:.6e}"
+        f" dense_topk_indexer_grad_diff={dense_topk_indexer_grad_diff:.6e}"
     )
     assert fused_topk_set_r2r
     assert unfused_topk_set_r2r
-    assert fused_vs_unfused_topk_set
     assert fused_indexer_loss_r2r <= _FUSED_VS_REFERENCE_LOSS_ATOL
-    assert fused_vs_unfused_indexer_loss <= _FUSED_VS_REFERENCE_LOSS_ATOL
+    torch.testing.assert_close(
+        fused_a["indexer_loss"],
+        matched_unfused_a["indexer_loss"],
+        atol=_FUSED_VS_REFERENCE_LOSS_ATOL,
+        rtol=_FUSED_VS_REFERENCE_LOSS_RTOL,
+    )
     assert min_indexer_grad_cosine >= _MIN_INDEXER_GRAD_COSINE, indexer_grad_similarity
     assert max_indexer_grad_rms_relative <= _MAX_INDEXER_GRAD_RMS_REL, (
+        indexer_grad_similarity
+    )
+    assert min_indexer_grad_norm_ratio >= _MIN_INDEXER_GRAD_NORM_RATIO, (
+        indexer_grad_similarity
+    )
+    assert max_indexer_grad_norm_ratio <= _MAX_INDEXER_GRAD_NORM_RATIO, (
         indexer_grad_similarity
     )
     valid_topk = (fused_a["topk_indices"] >= 0).sum(dim=-1)
@@ -660,7 +957,11 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
         f"unfused_indexer_loss={float(unfused_a['indexer_loss'].item()):.6e} "
         f"fused_indexer_loss={float(fused_a['indexer_loss'].item()):.6e} "
         f"index_heads=32 sparse_loss={sparse_loss} "
-        "topk_set_exact=True "
+        f"topk_set_exact={fused_vs_unfused_topk_set} "
+        "topk_score_proof_pass=True "
+        f"topk_ambiguous_rows={topk_score_proof['ambiguous_rows']} "
+        "matched_topk_reference=True "
+        f"dense_topk_independent={not sparse_loss and dense_topk_changed} "
         f"indexer_topk={_INDEXER_TOPK} seq={seq} "
         f"loss_diff={loss_diff:.6e} "
         f"fused_r2r_loss_diff={fused_r2r_loss:.6e} "
@@ -678,11 +979,15 @@ def test_glm5_dsa_run_to_run_accept_with_proof(sparse_loss: bool):
         f"unfused_indexer_grad_max_abs={unfused_indexer_grad_max_abs:.6e}"
         f" min_indexer_grad_cosine={min_indexer_grad_cosine:.6e}"
         f" max_indexer_grad_rms_relative={max_indexer_grad_rms_relative:.6e}"
+        f" min_indexer_grad_norm_ratio={min_indexer_grad_norm_ratio:.6e}"
+        f" max_indexer_grad_norm_ratio={max_indexer_grad_norm_ratio:.6e}"
+        f" dense_topk_loss_diff={dense_topk_loss_diff:.6e}"
+        f" dense_topk_indexer_grad_diff={dense_topk_indexer_grad_diff:.6e}"
     )
 
 
 def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
-    """Run the legacy DSv4-facing two-output autograd contract on real kernels."""
+    """Prove the legacy DSv4 training API against its decomposed inference path."""
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the fused DSA API regression smoke.")
@@ -691,8 +996,19 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
 
     device = torch.device("cuda", int(torch.cuda.current_device()))
     seq, batch, heads = 512, 1, 64
+    ratio = 4
+    n_comp = seq // ratio
+    kv_offset = seq
+    window_topk = 64
     query_dim, value_dim = 576, 512
-    index_heads, index_dim, topk = 32, 128, 512
+    index_heads, index_dim = 32, 128
+    requested_topk = n_comp + 64
+
+    query_positions = torch.arange(seq, device=device).view(seq, 1)
+    window_offsets = torch.arange(window_topk, device=device).view(1, window_topk)
+    window = query_positions - (window_topk - 1 - window_offsets)
+    window = torch.where(window >= 0, window, torch.full_like(window, -1))
+    window = window.unsqueeze(0).expand(batch, -1, -1).to(torch.int32)
 
     def make_args():
         torch.manual_seed(20260627)
@@ -702,24 +1018,24 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
 
         return (
             leaf(seq, batch, heads, query_dim),
-            leaf(seq, batch, query_dim),
+            leaf(seq + n_comp, batch, query_dim),
             leaf(heads, dtype=torch.float32),
-            torch.empty(batch, seq, 0, device=device, dtype=torch.int32),
+            window.clone(),
             leaf(seq, batch, index_heads, index_dim),
-            leaf(seq, batch, index_dim),
+            leaf(n_comp, batch, index_dim),
             leaf(seq, batch, index_heads),
-            topk,
-            1,
+            requested_topk,
+            ratio,
             query_dim**-0.5,
             index_dim**-0.5,
             0.0,
             False,
-            0,
+            kv_offset,
             False,
             value_dim,
         )
 
-    results = []
+    fused_results = []
     for name, call in (
         ("direct", dsa_kernels.FusedIndexerSparseAttnFunc.apply),
         ("public", dsa_kernels.fused_indexer_sparse_attn),
@@ -730,18 +1046,111 @@ def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
         output, indexer_loss = result
         assert output.shape == (seq, batch, heads * value_dim)
         assert indexer_loss.ndim == 0
+        assert float(indexer_loss.item()) == 0.0
         objective = output.float().square().mean() + indexer_loss
         objective.backward()
-        differentiable_inputs = (args[0], args[1], args[2], args[4], args[5], args[6])
-        assert all(tensor.grad is not None for tensor in differentiable_inputs)
-        assert all(torch.isfinite(tensor.grad).all() for tensor in differentiable_inputs)
-        results.append(output.detach().float())
+        main_inputs = {"query": args[0], "kv_full": args[1], "attn_sink": args[2]}
+        indexer_inputs = {"q_indexer": args[4], "k_indexer": args[5], "weights": args[6]}
+        assert all(tensor.grad is not None for tensor in (*main_inputs.values(), *indexer_inputs.values()))
+        assert all(
+            torch.isfinite(tensor.grad).all()
+            for tensor in (*main_inputs.values(), *indexer_inputs.values())
+        )
+        assert all(torch.count_nonzero(tensor.grad).item() == 0 for tensor in indexer_inputs.values())
+        fused_results.append(
+            {
+                "output": output.detach().float(),
+                "objective": objective.detach().float(),
+                "main_grads": {
+                    key: tensor.grad.detach().float() for key, tensor in main_inputs.items()
+                },
+            }
+        )
         print(
             "DSV4_FUSED_DSA_LEGACY_API "
             f"path={name} loss={float(objective.detach().item()):.8e}"
         )
 
-    torch.testing.assert_close(results[0], results[1], rtol=0.0, atol=0.0)
+    # Reproduce the exact DSv4/CSA inference decomposition: indexer_topk ->
+    # global/compact indices -> dsa_sparse_attn.  This is independent of the
+    # legacy fused autograd wrapper and covers the real compressed-KV layout.
+    args = make_args()
+    topk_indices, topk_length = dsa_kernels.indexer_topk(
+        args[4],
+        args[5],
+        args[6],
+        requested_topk,
+        ratio,
+        indexer_softmax_scale=args[10],
+    )
+    assert topk_indices.shape == (batch, seq, requested_topk)
+    assert topk_length.shape == (batch, seq)
+    assert torch.all(topk_indices[..., n_comp:] == -1)
+    compressed_global = torch.where(
+        topk_indices >= 0, topk_indices + kv_offset, topk_indices
+    ).to(torch.int32)
+    assert torch.all(
+        (compressed_global < 0) | (compressed_global >= kv_offset)
+    )
+    flat_indices, flat_length = dsa_kernels.build_flat_topk_idxs(
+        args[3],
+        compressed_global,
+        batch_size=batch,
+        seqlen_kv=args[1].shape[0],
+        compact=True,
+    )
+    assert flat_length is not None
+    decomposed_output = dsa_kernels.dsa_sparse_attn(
+        args[0],
+        args[1],
+        args[2],
+        flat_indices,
+        args[9],
+        topk_length=flat_length,
+        value_dim=value_dim,
+    )
+    decomposed_objective = decomposed_output.float().square().mean()
+    decomposed_objective.backward()
+    decomposed_main_grads = {
+        "query": args[0].grad.detach().float(),
+        "kv_full": args[1].grad.detach().float(),
+        "attn_sink": args[2].grad.detach().float(),
+    }
+    assert all(torch.isfinite(grad).all() for grad in decomposed_main_grads.values())
+    assert all(args[index].grad is None for index in (4, 5, 6))
+
+    torch.testing.assert_close(
+        fused_results[0]["output"], fused_results[1]["output"], rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(
+        fused_results[0]["objective"], fused_results[1]["objective"], rtol=0.0, atol=0.0
+    )
+    for name in decomposed_main_grads:
+        torch.testing.assert_close(
+            fused_results[0]["main_grads"][name],
+            fused_results[1]["main_grads"][name],
+            rtol=0.0,
+            atol=0.0,
+        )
+    torch.testing.assert_close(
+        fused_results[1]["output"],
+        decomposed_output.detach().float(),
+        rtol=2.0e-3,
+        atol=2.0e-3,
+    )
+    for name, decomposed_grad in decomposed_main_grads.items():
+        torch.testing.assert_close(
+            fused_results[1]["main_grads"][name],
+            decomposed_grad,
+            rtol=5.0e-2,
+            atol=5.0e-2,
+        )
+    print(
+        "NON_SKIP_DSV4_FUSED_DSA_DECOMPOSED_PARITY_PASSED "
+        f"ratio={ratio} n_comp={n_comp} requested_topk={requested_topk} "
+        f"window_topk={window_topk} kv_offset={kv_offset} "
+        "topk_padding=True main_grad_parity=True zero_indexer_grads=True"
+    )
 
 
 def test_glm52_model_preserves_multisegment_positions_through_indexshare_and_mtp():
@@ -861,17 +1270,10 @@ def test_glm52_model_preserves_multisegment_positions_through_indexshare_and_mtp
     assert "mtp_logits" in output and len(output["mtp_logits"]) == 1
     assert torch.equal(captured[1], reset_positions)
     assert torch.equal(captured[2], reset_positions)
-
-    rolled_segment_positions = torch.cat(
-        (segment_positions[1:], torch.zeros(1, device=device, dtype=torch.long))
-    )
-    expected_mtp_positions = torch.cat(
-        (rolled_segment_positions, rolled_segment_positions)
-    ).unsqueeze(0)
-    assert torch.equal(captured[3], expected_mtp_positions)
+    assert torch.equal(captured[3], reset_positions)
     print(
         "NON_SKIP_GLM52_PACKED_POSITION_IDS_PASSED "
         f"segments=2 segment_length={segment_length} "
         f"trunk_reset={torch.equal(captured[2], reset_positions)} "
-        f"mtp_segment_roll={torch.equal(captured[3], expected_mtp_positions)}"
+        f"mtp_rotary_reused={torch.equal(captured[3], reset_positions)}"
     )

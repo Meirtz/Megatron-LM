@@ -340,6 +340,7 @@ def test_glm5_dsa_attention_preserves_explicit_packed_position_resets(
 ):
     from types import SimpleNamespace
 
+    import pytest
     import torch
     import torch.nn as nn
 
@@ -393,7 +394,10 @@ def test_glm5_dsa_attention_preserves_explicit_packed_position_resets(
         capture.calls[0]["sin"], torch.cat((segment_sin, segment_sin), dim=1)
     )
 
-    # Direct legacy callers still get the historical monotonic fallback.
+    with pytest.raises(ValueError, match="packed sequences require explicit position_ids"):
+        attention(x, packed_seq_params=object())
+
+    # Direct non-packed legacy callers still get the historical monotonic fallback.
     attention(x)
     assert torch.equal(
         capture.calls[1]["position_ids"], torch.arange(6).unsqueeze(0)
@@ -505,8 +509,9 @@ def test_glm5_threads_positions_through_trunk_and_mtp(
         def forward(self, value):
             return value[..., :4]
 
-    # Exercise the MTP layer's packed, per-sequence left roll and verify that
-    # the rolled positions reach its transformer layer.
+    # MTP rolls token/label positions per packed sequence, while attention
+    # deliberately retains the original rotary coordinates (the same contract
+    # used by MCore's MTP block).
     mtp = Glm5MTPLayer.__new__(Glm5MTPLayer)
     nn.Module.__init__(mtp)
     mtp.ps = ParallelState()
@@ -517,16 +522,21 @@ def test_glm5_threads_positions_through_trunk_and_mtp(
     mtp.eh_proj = KeepHiddenWidth()
     mtp.transformer_layer = RecordingLayer()
     mtp.final_layernorm = nn.Identity()
-    mtp(
+    _mtp_hidden, rolled_input_ids, rolled_position_ids = mtp(
         input_ids=torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long),
         position_ids=positions,
         hidden_states=hidden,
         packed_seq_params=packed,
     )
     assert torch.equal(
-        mtp.transformer_layer.position_ids,
+        rolled_input_ids,
+        torch.tensor([[4, 5, 0, 7, 8, 0]], dtype=torch.long),
+    )
+    assert torch.equal(
+        rolled_position_ids,
         torch.tensor([[1, 2, 0, 1, 2, 0]], dtype=torch.long),
     )
+    assert torch.equal(mtp.transformer_layer.position_ids, positions)
 
 
 def test_glm52_serving_mtp_share_metadata_is_ignored_and_mtp_is_always_full():

@@ -323,6 +323,290 @@ def test_glm32_indexer_backward_padding_is_zero_and_reversible():
     assert unchanged_weights is padded_weights
 
 
+def test_glm5_cp_per_token_indexer_loss_fails_until_global_divisor_is_wired(
+    monkeypatch,
+):
+    from megatron.lite.primitive.modules.attention import dsa
+
+    monkeypatch.setattr(dsa, "RMSNorm", torch.nn.LayerNorm)
+    with pytest.raises(NotImplementedError, match="global-token divisor"):
+        dsa.DynamicSparseAttention(
+            hidden_size=16,
+            num_attention_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=2,
+            rms_norm_eps=1.0e-5,
+            indexer_loss_coeff=1.0e-2,
+            calculate_per_token_loss=True,
+            cp_size=2,
+            cp_rank=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("calculate_per_token_loss", "expected_weights"),
+    [
+        (False, [0.2, 0.3, 0.5]),
+        (True, [1.0, 1.0, 1.0]),
+    ],
+    ids=["mean-kl-token-weighted", "per-token-kl-sum"],
+)
+def test_glm5_packed_dsa_weights_segment_indexer_losses(
+    calculate_per_token_loss, expected_weights
+):
+    from types import MethodType
+
+    from megatron.lite.primitive.modules.attention import dsa
+
+    attention = dsa.DynamicSparseAttention.__new__(dsa.DynamicSparseAttention)
+    torch.nn.Module.__init__(attention)
+    attention.calculate_per_token_loss = calculate_per_token_loss
+    attention.skip_topk = False
+    attention.indexer_loss_coeff = 0.0
+
+    calls = []
+
+    def fake_forward_dense_full(
+        self,
+        x,
+        cos,
+        sin,
+        position_ids,
+        *,
+        index_share_state=None,
+        index_share_cache_key=None,
+        indexer_loss_weight=1.0,
+    ):
+        del self, cos, sin, position_ids, index_share_state
+        calls.append((x.shape[1], index_share_cache_key, indexer_loss_weight))
+        return x
+
+    attention._forward_dense_full = MethodType(fake_forward_dense_full, attention)
+    x = torch.arange(40, dtype=torch.float32).view(1, 10, 4)
+    positions = torch.tensor([[0, 1, 0, 1, 2, 0, 1, 2, 3, 4]])
+    cos = torch.zeros(1, 10, 2)
+    sin = torch.zeros_like(cos)
+    packed_seq_params = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, 2, 5, 10], dtype=torch.int32)
+    )
+
+    actual = attention._forward_packed_full(
+        x,
+        cos,
+        sin,
+        positions,
+        packed_seq_params,
+        index_share_state=None,
+    )
+
+    torch.testing.assert_close(actual, x)
+    assert [length for length, _key, _weight in calls] == [2, 3, 5]
+    assert [key for _length, key, _weight in calls] == [0, 1, 2]
+    assert [weight for _length, _key, weight in calls] == pytest.approx(
+        expected_weights
+    )
+    segment_losses = [1.0, 3.0, 5.0]
+    aggregated = sum(
+        loss * weight
+        for loss, (_length, _key, weight) in zip(segment_losses, calls, strict=True)
+    )
+    expected_aggregate = (
+        sum(segment_losses)
+        if calculate_per_token_loss
+        else (1.0 * 2 + 3.0 * 3 + 5.0 * 5) / 10
+    )
+    assert aggregated == pytest.approx(expected_aggregate)
+
+
+def test_glm5_packed_dsa_rejects_padded_indexer_aux_until_query_mask_exists():
+    from types import MethodType
+
+    from megatron.lite.primitive.modules.attention import dsa
+
+    attention = dsa.DynamicSparseAttention.__new__(dsa.DynamicSparseAttention)
+    torch.nn.Module.__init__(attention)
+    attention.calculate_per_token_loss = False
+    attention.skip_topk = False
+    attention.indexer_loss_coeff = 1.0e-2
+
+    def must_not_run(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("padded indexer auxiliary path must fail before DSA")
+
+    attention._forward_dense_full = MethodType(must_not_run, attention)
+    x = torch.zeros(1, 8, 4)
+    positions = torch.tensor([[0, 1, 0, 0, 0, 1, 2, 0]])
+    cos = torch.zeros(1, 8, 2)
+    sin = torch.zeros_like(cos)
+    packed_seq_params = SimpleNamespace(
+        cu_seqlens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+
+    with pytest.raises(NotImplementedError, match="query-valid mask"):
+        attention._forward_packed_full(
+            x,
+            cos,
+            sin,
+            positions,
+            packed_seq_params,
+            index_share_state=None,
+        )
+
+
+def test_dense_dsa_full_causal_lse_is_chunked_and_topk_independent():
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    torch.manual_seed(123)
+    batch, seq_q, seq_k, q_heads, kv_heads, head_dim = 2, 10, 5, 4, 2, 3
+    ratio = 2
+    scale = 0.37
+    q = torch.randn(batch, seq_q, q_heads, head_dim, dtype=torch.bfloat16)
+    k = torch.randn(batch, seq_k, kv_heads, head_dim, dtype=torch.bfloat16)
+
+    # Limit the temporary to two query rows so this exercises the bounded
+    # block loop rather than accidentally validating one monolithic einsum.
+    max_score_bytes = 2 * batch * q_heads * seq_k * 4
+    actual = dsa_kernels._compute_full_causal_attn_lse(
+        q,
+        k,
+        scale,
+        ratio,
+        max_score_bytes=max_score_bytes,
+    )
+    key_chunked = dsa_kernels._compute_full_causal_attn_lse(
+        q,
+        k,
+        scale,
+        ratio,
+        max_score_bytes=2 * batch * q_heads * 4,
+    )
+
+    expanded_k = k.float().repeat_interleave(q_heads // kv_heads, dim=2)
+    scores = torch.einsum("bqhd,bkhd->bqhk", q.float(), expanded_k) * scale
+    q_global_start = seq_k * ratio - seq_q
+    q_pos = torch.arange(seq_q)
+    k_pos = torch.arange(seq_k)
+    valid_kv = torch.div(
+        q_global_start + q_pos + 1,
+        ratio,
+        rounding_mode="floor",
+    ).clamp(min=0, max=seq_k)
+    causal = k_pos.view(1, seq_k) < valid_kv.view(seq_q, 1)
+    expected = torch.logsumexp(
+        scores.masked_fill(~causal.view(1, seq_q, 1, seq_k), -torch.inf),
+        dim=-1,
+    )
+    expected = torch.where(
+        valid_kv.view(1, seq_q, 1) > 0,
+        expected,
+        torch.full_like(expected, torch.inf),
+    )
+
+    torch.testing.assert_close(actual, expected, atol=1.0e-6, rtol=1.0e-6)
+    torch.testing.assert_close(key_chunked, expected, atol=1.0e-6, rtol=1.0e-6)
+    assert actual.shape == (batch, seq_q, q_heads)
+    assert torch.isposinf(actual[:, :1]).all()
+    assert torch.isfinite(actual[:, 1:]).all()
+
+
+def test_dsa_score_memory_estimate_exposes_202k_training_boundary():
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    seq = 202_752
+    sparse_bytes = dsa_kernels._estimate_dsa_score_peak_bytes(
+        1, seq, seq, dense_loss=False
+    )
+    dense_bytes = dsa_kernels._estimate_dsa_score_peak_bytes(
+        1, seq, seq, dense_loss=True
+    )
+    gib = 1024**3
+    assert sparse_bytes / gib > 150.0
+    assert dense_bytes / gib > 300.0
+    assert dense_bytes > 2 * sparse_bytes
+
+
+def test_dsa_bottom_right_topk_lengths_cover_non_square_valid_keys():
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    ratio1 = dsa_kernels._bottom_right_valid_kv_counts(
+        seq_q=2, seq_k=4, ratio=1, device=torch.device("cpu")
+    )
+    assert ratio1.tolist() == [3, 4]
+
+    ratio4 = dsa_kernels._bottom_right_valid_kv_counts(
+        seq_q=5, seq_k=2, ratio=4, device=torch.device("cpu")
+    )
+    assert ratio4.tolist() == [1, 1, 1, 1, 2]
+
+    with pytest.raises(ValueError, match="seq_q <= seq_k"):
+        dsa_kernels._bottom_right_valid_kv_counts(
+            seq_q=9, seq_k=2, ratio=4, device=torch.device("cpu")
+        )
+
+
+def test_dense_dsa_kl_matches_canonical_epsilon_placement():
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    attn_score = torch.tensor(
+        [[[0.7, 0.3, 0.0], [0.0, 0.0, 0.0]]], dtype=torch.float32
+    )
+    attn_l1norm = attn_score.sum(dim=-1)
+    index_logits = torch.tensor(
+        [[[1.2, -0.4, -torch.inf], [-torch.inf, -torch.inf, -torch.inf]]],
+        dtype=torch.float32,
+    )
+    index_lse = torch.logsumexp(index_logits, dim=-1)
+    coeff = 0.25
+
+    actual = dsa_kernels._kl_loss_from_dense_scores(
+        attn_score,
+        attn_l1norm,
+        index_logits,
+        index_lse,
+        coeff,
+    )
+
+    target = attn_score[0, 0] / attn_l1norm[0, 0]
+    predict = torch.softmax(index_logits[0, 0, :2], dim=-1)
+    expected_row = (
+        target[:2]
+        * (
+            torch.log(target[:2] + 1.0e-10)
+            - torch.log(predict + 1.0e-10)
+        )
+    ).sum()
+    expected = coeff * expected_row / 2
+    torch.testing.assert_close(actual, expected, atol=1.0e-7, rtol=1.0e-7)
+
+
+def test_dsa_vendor_score_grad_is_adjusted_for_canonical_log_epsilon():
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    logits = torch.tensor([2.0, -30.0, -50.0], dtype=torch.float64, requires_grad=True)
+    target = torch.tensor([0.2, 0.3, 0.5], dtype=torch.float64)
+    predict = torch.softmax(logits, dim=-1)
+    loss = -(target * torch.log(predict + 1.0e-10)).sum()
+    (autograd_grad,) = torch.autograd.grad(loss, logits)
+
+    adjusted_target = dsa_kernels._scale_target_for_canonical_log_eps_backward_(
+        target.clone(), predict.detach()
+    )
+    vendor_equivalent = -adjusted_target + predict.detach() * adjusted_target.sum()
+    torch.testing.assert_close(
+        vendor_equivalent, autograd_grad, atol=1.0e-12, rtol=1.0e-12
+    )
+    # The tiny-probability entries must be attenuated; plain -target would be
+    # the wrong gradient for log(P + 1e-10).
+    assert adjusted_target[-1] < target[-1] * 1.0e-8
+
+
 def test_glm5_nonpacked_cp_reconstructs_rank3_rotary_in_zigzag_order(monkeypatch):
     from megatron.lite.primitive.modules.attention import dsa
     from megatron.lite.primitive.parallel.cp import zigzag_slice_for_cp
@@ -364,6 +648,148 @@ def test_glm5_nonpacked_cp_reconstructs_rank3_rotary_in_zigzag_order(monkeypatch
     )
     assert same_cos is cache_cos
     assert same_sin is cache_sin
+
+
+def test_glm5_packed_cp_rejects_inconsistent_padded_extent():
+    from megatron.lite.primitive.modules.attention import dsa
+
+    attention = dsa.DynamicSparseAttention.__new__(dsa.DynamicSparseAttention)
+    torch.nn.Module.__init__(attention)
+    attention.cp_size = 2
+    attention.cp_group = "cp-group"
+    packed = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, 8], dtype=torch.int32)
+    )
+
+    with pytest.raises(ValueError, match="padded packed sequence exactly"):
+        attention._gather_packed_cp_inputs(
+            torch.zeros(1, 3, 8),
+            torch.arange(3).unsqueeze(0),
+            packed,
+        )
+
+
+@pytest.mark.parametrize(
+    ("cos", "sin", "match"),
+    [
+        (torch.zeros(1, 4, 4), torch.zeros(8, 2), "ranks must match"),
+        (torch.zeros(1, 4, 4), torch.zeros(1, 4, 2), "shapes must match"),
+        (
+            torch.zeros(1, 5, 4),
+            torch.zeros(1, 5, 4),
+            "local or padded full packed sequence",
+        ),
+    ],
+    ids=["rank", "shape", "coverage"],
+)
+def test_glm5_packed_cp_rejects_invalid_rotary_representations(cos, sin, match):
+    from megatron.lite.primitive.modules.attention import dsa
+
+    attention = dsa.DynamicSparseAttention.__new__(dsa.DynamicSparseAttention)
+    torch.nn.Module.__init__(attention)
+    attention.cp_size = 2
+    attention.cp_group = "cp-group"
+    packed = SimpleNamespace(
+        cu_seqlens_q_padded=torch.tensor([0, 8], dtype=torch.int32)
+    )
+
+    with pytest.raises(ValueError, match=match):
+        attention._gather_packed_cp_rotary(
+            cos,
+            sin,
+            packed,
+            torch.device("cpu"),
+            local_seq=4,
+        )
+
+
+def test_glm5_packed_cp_reconstructs_rank3_rotary(monkeypatch):
+    from megatron.lite.primitive.modules.attention import dsa
+    from megatron.lite.primitive.parallel.thd import split_packed_to_cp_local
+
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+    full_cos = torch.arange(1 * 8 * 4, dtype=torch.float32).view(1, 8, 4)
+    full_sin = full_cos + 100.0
+    cos_parts = [
+        split_packed_to_cp_local(
+            full_cos,
+            cu_seqlens_padded=cu_seqlens,
+            cp_size=2,
+            cp_rank=rank,
+            dim=1,
+        )
+        for rank in range(2)
+    ]
+    sin_parts = [
+        split_packed_to_cp_local(
+            full_sin,
+            cu_seqlens_padded=cu_seqlens,
+            cp_size=2,
+            cp_rank=rank,
+            dim=1,
+        )
+        for rank in range(2)
+    ]
+
+    def fake_all_gather(tensor, *, cp_size, cp_group):
+        assert cp_size == 2
+        assert cp_group == "cp-group"
+        return cos_parts if torch.equal(tensor, cos_parts[0]) else sin_parts
+
+    monkeypatch.setattr(dsa, "_all_gather_cp", fake_all_gather)
+    attention = dsa.DynamicSparseAttention.__new__(dsa.DynamicSparseAttention)
+    torch.nn.Module.__init__(attention)
+    attention.cp_size = 2
+    attention.cp_group = "cp-group"
+    packed = SimpleNamespace(cu_seqlens_q_padded=cu_seqlens)
+
+    gathered_cos, gathered_sin = attention._gather_packed_cp_rotary(
+        cos_parts[0],
+        sin_parts[0],
+        packed,
+        torch.device("cpu"),
+        local_seq=4,
+    )
+    torch.testing.assert_close(gathered_cos, full_cos)
+    torch.testing.assert_close(gathered_sin, full_sin)
+
+
+@pytest.mark.parametrize(
+    "metadata_index",
+    [12, 18],
+    ids=["position-local-vs-full", "rotary-local-vs-full"],
+)
+def test_glm5_cp_rejects_mixed_collective_input_representations(
+    monkeypatch, metadata_index
+):
+    from megatron.lite.primitive.modules.attention import dsa
+
+    attention = dsa.DynamicSparseAttention.__new__(dsa.DynamicSparseAttention)
+    torch.nn.Module.__init__(attention)
+    attention.cp_size = 2
+    attention.cp_group = "cp-group"
+
+    def fake_all_gather(metadata, *, cp_size, cp_group):
+        assert cp_size == 2
+        assert cp_group == "cp-group"
+        peer_metadata = metadata.clone()
+        # Metadata layout is header(3), followed by fixed-size shape/dtype
+        # records for x, position, cos, and sin. Change one rank's selected
+        # sequence axis from local length 4 to full length 8.
+        peer_metadata[metadata_index] = 8
+        return [metadata, peer_metadata]
+
+    monkeypatch.setattr(dsa, "_all_gather_cp", fake_all_gather)
+    with pytest.raises(ValueError, match="same local/full position and rotary representation"):
+        attention._validate_cp_collective_input_metadata(
+            torch.zeros(1, 4, 8),
+            torch.arange(4).unsqueeze(0),
+            torch.zeros(1, 4, 4),
+            torch.zeros(1, 4, 4),
+            local_seq=4,
+            full_seq=8,
+            packed=False,
+        )
 
 
 def test_dsa_index_share_pipeline_guard_rejects_cross_stage_sources():

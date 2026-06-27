@@ -156,7 +156,7 @@ class Glm5DSAAttention(nn.Module):
     where ``x_sbhd`` is ``[S, B, H]``.  DSA is hard-wired ``[B, S, H]`` and needs
     explicit ``cos`` / ``sin`` / ``position_ids``.  This wrapper:
       1. transposes ``[S, B, H] -> [B, S, H]``,
-      2. builds ``position_ids`` (local sequence) and the rotary ``cos`` / ``sin``,
+      2. builds CP-local rows with global ``position_ids`` and rotary ``cos`` / ``sin``,
       3. runs DSA,
       4. transposes the ``[B, S, H]`` output back to ``[S, B, H]``.
     The Kimi skeleton therefore never observes the batch-first interior.
@@ -219,9 +219,13 @@ class Glm5DSAAttention(nn.Module):
         x_bsh = x.transpose(0, 1).contiguous()
         batch, seq_len, _ = x_bsh.shape
         if position_ids is None:
+            if packed_seq_params is not None:
+                raise ValueError(
+                    "GLM5 DSA packed sequences require explicit position_ids so "
+                    "positions reset at every packed-sequence boundary."
+                )
             # Compatibility fallback for direct callers that do not provide
-            # positions. Packed/runtime paths pass their per-sequence positions
-            # explicitly so resets at packed boundaries are preserved.
+            # positions. This fallback is intentionally non-packed only.
             if self.ps.cp_size > 1:
                 position_ids = zigzag_position_ids_for_cp(
                     seq_len * self.ps.cp_size,
@@ -602,7 +606,13 @@ class Glm5MTPLayer(nn.Module):
         packed_seq_params=None,
         dsa_index_share_state: DSAIndexShareState | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        del rotary_position_ids
+        # MTP shifts token/label positions for the next prediction depth, but
+        # its transformer layer keeps the original rotary coordinates.  This
+        # matches the reference MTP contract, where rotary embeddings are built once
+        # before entering the MTP block and reused at every prediction depth.
+        attention_position_ids = (
+            rotary_position_ids if rotary_position_ids is not None else position_ids
+        )
         input_ids, _ = _roll_mtp_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
         if position_ids is not None:
             position_ids, _ = _roll_mtp_left(
@@ -624,7 +634,7 @@ class Glm5MTPLayer(nn.Module):
             hidden_states,
             packed_seq_params=packed_seq_params,
             dsa_index_share_state=dsa_index_share_state,
-            position_ids=position_ids,
+            position_ids=attention_position_ids,
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids

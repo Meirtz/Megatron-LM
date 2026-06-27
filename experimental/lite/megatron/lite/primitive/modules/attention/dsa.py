@@ -630,6 +630,17 @@ class DynamicSparseAttention(nn.Module):
         self.skip_topk = indexer_type == "shared"
         if self.skip_topk and not self.index_share_enabled:
             raise ValueError("A shared DSA layer requires index_share_enabled=True")
+        if (
+            not self.skip_topk
+            and self.cp_size > 1
+            and self.calculate_per_token_loss
+            and self.indexer_loss_coeff > 0
+        ):
+            raise NotImplementedError(
+                "GLM5 DSA indexer auxiliary loss with context parallelism and "
+                "calculate_per_token_loss=True is not supported until the global-token "
+                "divisor is wired through the replicated-gradient reduction."
+            )
         if self.skip_topk:
             if index_share_source_layer is None:
                 index_share_source_layer = source_dsa_compute_layer(
@@ -697,8 +708,34 @@ class DynamicSparseAttention(nn.Module):
             )
         if packed_seq_params is not None:
             if self.cp_size > 1:
+                local_seq = x.shape[1]
+                full_seq = int(
+                    self._packed_cu_seqlens(packed_seq_params, x.device)[-1].item()
+                )
+                self._validate_cp_collective_input_metadata(
+                    x,
+                    position_ids,
+                    cos,
+                    sin,
+                    local_seq=local_seq,
+                    full_seq=full_seq,
+                    packed=True,
+                )
+                if local_seq * self.cp_size != full_seq:
+                    raise ValueError(
+                        "GLM5 packed DynamicSparseAttention CP shards must cover "
+                        "the padded packed sequence exactly: "
+                        f"local_seq={local_seq}, cp_size={self.cp_size}, "
+                        f"padded_full_seq={full_seq}."
+                    )
                 x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
-                cos, sin = self._gather_packed_cp_rotary(cos, sin, packed_seq_params, x.device)
+                cos, sin = self._gather_packed_cp_rotary(
+                    cos,
+                    sin,
+                    packed_seq_params,
+                    x.device,
+                    local_seq=local_seq,
+                )
             out = self._forward_packed_full(
                 x,
                 cos,
@@ -720,6 +757,15 @@ class DynamicSparseAttention(nn.Module):
         cp_restore = self.cp_size > 1
         if cp_restore:
             local_seq = x.shape[1]
+            self._validate_cp_collective_input_metadata(
+                x,
+                position_ids,
+                cos,
+                sin,
+                local_seq=local_seq,
+                full_seq=local_seq * self.cp_size,
+                packed=False,
+            )
             x, position_ids, attention_mask = self._gather_cp_inputs(
                 x, position_ids, attention_mask
             )
@@ -749,6 +795,9 @@ class DynamicSparseAttention(nn.Module):
         index_share_state: DSAIndexShareState | None,
     ) -> torch.Tensor:
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
+        true_cu_seqlens = self._packed_true_cu_seqlens(
+            packed_seq_params, cu_seqlens, x.device
+        )
         if position_ids.dim() == 1:
             position_ids = position_ids.unsqueeze(0)
         if position_ids.shape[-1] != x.shape[1]:
@@ -756,12 +805,55 @@ class DynamicSparseAttention(nn.Module):
                 "GLM5 packed DynamicSparseAttention position_ids must cover the reconstructed packed tokens, "
                 f"got {tuple(position_ids.shape)} for packed length {x.shape[1]}."
             )
+        total_tokens = x.shape[1]
+        packed_tokens = int(cu_seqlens[-1].item())
+        if packed_tokens != total_tokens:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention cu_seqlens must cover the reconstructed "
+                f"packed tokens, got cu_seqlens[-1]={packed_tokens} for length {total_tokens}."
+            )
+        padded_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        true_lengths = true_cu_seqlens[1:] - true_cu_seqlens[:-1]
+        if (
+            int(cu_seqlens[0].item()) != 0
+            or int(true_cu_seqlens[0].item()) != 0
+            or torch.any(padded_lengths < 0)
+            or torch.any(true_lengths < 0)
+            or torch.any(true_lengths > padded_lengths)
+        ):
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention cumulative lengths must start at "
+                "zero, be monotonic, and keep every true length no larger than its "
+                "padded length."
+            )
+        has_alignment_padding = bool(torch.any(true_lengths != padded_lengths).item())
+        if (
+            has_alignment_padding
+            and not self.skip_topk
+            and self.indexer_loss_coeff > 0
+        ):
+            raise NotImplementedError(
+                "GLM5 packed DSA indexer auxiliary loss does not yet support THD "
+                "alignment padding: a query-valid mask must be wired into the fused "
+                "KL forward/backward before padded rows can be excluded safely."
+            )
+        total_true_tokens = int(true_cu_seqlens[-1].item())
         pieces = []
         for idx in range(int(cu_seqlens.numel()) - 1):
             start = int(cu_seqlens[idx].item())
             end = int(cu_seqlens[idx + 1].item())
             if end <= start:
                 continue
+            true_segment_len = int(true_lengths[idx].item())
+            indexer_loss_weight = (
+                1.0
+                if self.calculate_per_token_loss
+                else (
+                    float(true_segment_len) / float(total_true_tokens)
+                    if total_true_tokens > 0
+                    else 0.0
+                )
+            )
             seg_cos, seg_sin = self._slice_rotary_cache(cos, sin, start, end)
             pieces.append(
                 self._forward_dense_full(
@@ -771,6 +863,7 @@ class DynamicSparseAttention(nn.Module):
                     position_ids[:, start:end],
                     index_share_state=index_share_state,
                     index_share_cache_key=idx,
+                    indexer_loss_weight=indexer_loss_weight,
                 )
             )
         if pieces:
@@ -786,7 +879,13 @@ class DynamicSparseAttention(nn.Module):
         *,
         index_share_state: DSAIndexShareState | None = None,
         index_share_cache_key: Hashable | None = None,
+        indexer_loss_weight: float = 1.0,
     ) -> torch.Tensor:
+
+        if indexer_loss_weight < 0.0:
+            raise ValueError(
+                f"indexer_loss_weight must be non-negative, got {indexer_loss_weight}."
+            )
 
         batch, seq_len, _ = x.shape
         q_resid = self.q_a_layernorm(self.q_a_proj(x))
@@ -891,6 +990,8 @@ class DynamicSparseAttention(nn.Module):
                     value_dim=self.kv_lora_rank,
                 )
             if self.indexer_loss_coeff > 0:
+                if indexer_loss_weight != 1.0:
+                    indexer_loss = indexer_loss * indexer_loss_weight
                 out = DSAIndexerLossAutoScaler.apply(out, indexer_loss)
         else:
             if topk_indices is None:
@@ -957,6 +1058,66 @@ class DynamicSparseAttention(nn.Module):
                 )
         return full_x, full_position_ids, attention_mask
 
+    def _validate_cp_collective_input_metadata(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        local_seq: int,
+        full_seq: int,
+        packed: bool,
+    ) -> None:
+        """Keep rank-local representation choices from splitting CP collectives.
+
+        Position and rank-3 rotary tensors may be supplied in either CP-local or
+        reconstructed full-sequence form.  The later gather helpers necessarily
+        branch on that choice, so every CP rank must make the same choice.  A
+        fixed-size metadata exchange happens before any conditional gather and
+        turns mixed local/full inputs into a deterministic error on every rank
+        instead of leaving only a subset blocked in NCCL.
+        """
+
+        def shape_metadata(tensor: torch.Tensor) -> list[int]:
+            shape = list(tensor.shape)
+            if len(shape) > 4:
+                shape = shape[:4]
+            dtype_code = sum(
+                (index + 1) * ord(character)
+                for index, character in enumerate(str(tensor.dtype))
+            )
+            return [tensor.dim(), dtype_code, *shape, *([-1] * (4 - len(shape)))]
+
+        metadata = torch.tensor(
+            [
+                int(packed),
+                local_seq,
+                full_seq,
+                *shape_metadata(x),
+                *shape_metadata(position_ids),
+                *shape_metadata(cos),
+                *shape_metadata(sin),
+            ],
+            device=x.device,
+            dtype=torch.int64,
+        )
+        metadata_parts = _all_gather_cp(
+            metadata, cp_size=self.cp_size, cp_group=self.cp_group
+        )
+        if len(metadata_parts) != self.cp_size:
+            raise RuntimeError(
+                "GLM5 DynamicSparseAttention CP group size does not match cp_size: "
+                f"group returned {len(metadata_parts)} ranks, configured cp_size={self.cp_size}."
+            )
+        per_rank = [tuple(part.detach().cpu().tolist()) for part in metadata_parts]
+        if any(item != per_rank[0] for item in per_rank[1:]):
+            raise ValueError(
+                "GLM5 DynamicSparseAttention requires every CP rank to use the same "
+                "local/full position and rotary representation and matching tensor "
+                f"shapes; got per-rank metadata {per_rank}."
+            )
+
     def _full_cp_position_ids(
         self,
         position_ids: torch.Tensor,
@@ -991,6 +1152,13 @@ class DynamicSparseAttention(nn.Module):
         local_seq = x.shape[1]
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
         full_seq = int(cu_seqlens[-1].item())
+        if local_seq * self.cp_size != full_seq:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP shards must cover the "
+                "padded packed sequence exactly: "
+                f"local_seq={local_seq}, cp_size={self.cp_size}, "
+                f"padded_full_seq={full_seq}."
+            )
         x_parts = _all_gather_cp(x, cp_size=self.cp_size, cp_group=self.cp_group)
         full_x = reconstruct_packed_from_cp_parts(
             x_parts, cu_seqlens_padded=cu_seqlens, cp_size=self.cp_size, dim=1
@@ -1056,14 +1224,37 @@ class DynamicSparseAttention(nn.Module):
         )
 
     def _gather_packed_cp_rotary(
-        self, cos: torch.Tensor, sin: torch.Tensor, packed_seq_params, device: torch.device
+        self,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        packed_seq_params,
+        device: torch.device,
+        *,
+        local_seq: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if cos.dim() != 3 or sin.dim() != 3:
+        if cos.dim() != sin.dim():
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP cos/sin ranks must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.shape != sin.shape:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP cos/sin shapes must match, "
+                f"got cos={tuple(cos.shape)}, sin={tuple(sin.shape)}."
+            )
+        if cos.dim() != 3:
             return cos, sin
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, device)
         full_seq = int(cu_seqlens[-1].item())
-        if cos.shape[1] == full_seq and sin.shape[1] == full_seq:
+        if cos.shape[1] == full_seq:
             return cos, sin
+        if cos.shape[1] != local_seq:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention CP rank-3 rotary tensors "
+                "must cover either the local or padded full packed sequence, "
+                f"got {tuple(cos.shape)} for local_seq={local_seq}, "
+                f"padded_full_seq={full_seq}."
+            )
         cos_parts = _all_gather_cp(cos, cp_size=self.cp_size, cp_group=self.cp_group)
         sin_parts = _all_gather_cp(sin, cp_size=self.cp_size, cp_group=self.cp_group)
         full_cos = reconstruct_packed_from_cp_parts(
@@ -1082,6 +1273,22 @@ class DynamicSparseAttention(nn.Module):
         if cu_seqlens is None:
             raise ValueError("GLM5 packed DynamicSparseAttention requires packed cu_seqlens.")
         return cu_seqlens.to(device=device, dtype=torch.int32)
+
+    @staticmethod
+    def _packed_true_cu_seqlens(
+        packed_seq_params, padded_cu_seqlens: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        true_cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+        if true_cu_seqlens is None:
+            return padded_cu_seqlens
+        true_cu_seqlens = true_cu_seqlens.to(device=device, dtype=torch.int32)
+        if true_cu_seqlens.shape != padded_cu_seqlens.shape:
+            raise ValueError(
+                "GLM5 packed DynamicSparseAttention true/padded cu_seqlens must "
+                f"have the same shape, got {tuple(true_cu_seqlens.shape)} and "
+                f"{tuple(padded_cu_seqlens.shape)}."
+            )
+        return true_cu_seqlens
 
     @staticmethod
     def _slice_rotary_cache(

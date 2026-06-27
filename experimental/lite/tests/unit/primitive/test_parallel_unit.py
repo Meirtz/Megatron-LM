@@ -415,6 +415,14 @@ def test_plain_thd_batch_is_split_by_protocol_context_parallel_helper():
     assert packed.input_ids.shape == (1, 16)
     assert packed.cp_size == 2
     assert packed.packed_seq_params.local_cp_size is None
+    assert torch.equal(
+        packed.packed_seq_params.cu_seqlens_q,
+        torch.tensor([0, 5, 12], dtype=torch.int32),
+    )
+    assert torch.equal(
+        packed.packed_seq_params.cu_seqlens_q_padded,
+        torch.tensor([0, 8, 16], dtype=torch.int32),
+    )
 
     local_params, local_tensors = prepare_packed_thd_for_context_parallel(
         packed.packed_seq_params,
