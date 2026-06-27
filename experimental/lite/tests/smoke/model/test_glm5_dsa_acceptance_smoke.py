@@ -15,11 +15,11 @@ _FUSED_VS_REFERENCE_GRAD_ATOL = 5.0e-2
 _FUSED_VS_REFERENCE_LOSS_ATOL = 1.0e-5
 
 
-def _make_dsa():
+def _make_dsa_pair():
     pytest.importorskip("cudnn", reason="GLM5 DSA accept-with-proof needs cudnn DSA.")
     from megatron.lite.primitive.modules.attention import DynamicSparseAttention
 
-    return DynamicSparseAttention(
+    common = dict(
         hidden_size=128,
         num_attention_heads=64,
         q_lora_rank=16,
@@ -31,34 +31,81 @@ def _make_dsa():
         index_head_dim=128,
         index_topk=512,
         rms_norm_eps=1e-5,
-        layer_number=1,
+        rope_interleaved=True,
+        indexer_rope_interleaved=True,
         index_topk_freq=2,
+        index_skip_topk_offset=1,
+        index_share_enabled=True,
     )
+    source = DynamicSparseAttention(
+        **common,
+        layer_number=1,
+        indexer_type="full",
+        index_share_source_layer=1,
+    )
+    shared = DynamicSparseAttention(
+        **common,
+        layer_number=2,
+        indexer_type="shared",
+        index_share_source_layer=1,
+    )
+    assert source.indexer is not None
+    assert shared.indexer is None
+    return torch.nn.ModuleDict({"source": source, "shared": shared})
 
 
-def _run_once(module, x, cos, sin, position_ids, *, fused_training: bool):
+def _run_once(modules, x, cos, sin, position_ids, *, fused_training: bool):
     from megatron.lite.primitive.modules.attention import DSAIndexShareState
 
-    module.zero_grad(set_to_none=True)
-    module.train(fused_training)
+    class RecordingState(DSAIndexShareState):
+        def __init__(self):
+            super().__init__({1: 1})
+            self.saved: list[torch.Tensor] = []
+            self.consumed: list[torch.Tensor] = []
+
+        def save_topk(self, layer_number, topk_indices, *, sequence_key=None):
+            self.saved.append(topk_indices.detach().clone())
+            return super().save_topk(
+                layer_number, topk_indices, sequence_key=sequence_key
+            )
+
+        def get_topk(self, layer_number, source_layer, *, sequence_key=None):
+            topk_indices = super().get_topk(
+                layer_number, source_layer, sequence_key=sequence_key
+            )
+            self.consumed.append(topk_indices.detach().clone())
+            return topk_indices
+
+    modules.zero_grad(set_to_none=True)
+    modules.train(fused_training)
     local_x = x.detach().clone().requires_grad_(True)
-    index_share_state = DSAIndexShareState({module.layer_number: 1})
-    out = module(
+    index_share_state = RecordingState()
+    source_out = modules["source"](
         local_x,
         cos=cos,
         sin=sin,
         position_ids=position_ids,
         index_share_state=index_share_state,
     )
-    topk_indices = index_share_state.get_topk(
-        module.layer_number + 1, module.layer_number
-    ).detach().clone()
+    assert index_share_state.cached_tensor_count == 1
+    hidden = local_x + source_out
+    shared_out = modules["shared"](
+        hidden,
+        cos=cos,
+        sin=sin,
+        position_ids=position_ids,
+        index_share_state=index_share_state,
+    )
+    out = hidden + shared_out
+    assert len(index_share_state.saved) == 1
+    assert len(index_share_state.consumed) == 1
+    assert torch.equal(index_share_state.saved[0], index_share_state.consumed[0])
     assert index_share_state.cached_tensor_count == 0
     loss = out.float().square().mean()
     loss.backward()
     param_grads = {
         name: param.grad.detach().float().clone()
-        for name, param in module.named_parameters()
+        for name, param in modules.named_parameters()
         if param.grad is not None
     }
     return {
@@ -66,7 +113,7 @@ def _run_once(module, x, cos, sin, position_ids, *, fused_training: bool):
         "out": out.detach().float().clone(),
         "x_grad": local_x.grad.detach().float().clone(),
         "param_grads": param_grads,
-        "topk_indices": topk_indices,
+        "topk_indices": index_share_state.consumed[0],
     }
 
 
@@ -147,7 +194,9 @@ def _torch_sparse_attention(
     )
 
 
-def _torch_unfused_dsa_forward(module, x, cos, sin, position_ids):
+def _torch_unfused_dsa_forward(
+    module, x, cos, sin, position_ids, *, topk_indices: torch.Tensor | None = None
+):
     from megatron.lite.primitive.modules.attention.dsa import (
         _rotary_embeddings_from_cache,
         apply_rotary_pos_emb,
@@ -185,20 +234,31 @@ def _torch_unfused_dsa_forward(module, x, cos, sin, position_ids):
     ).squeeze(2)
     kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
-    assert module.indexer is not None
-    q_indexer, k_indexer, weights_indexer = module.indexer.forward_before_topk(
-        x, q_resid, cos, sin, position_ids
-    )
-    indexer_scores = _torch_indexer_scores(
-        q_indexer,
-        k_indexer,
-        weights_indexer,
-        ratio=1,
-        indexer_softmax_scale=module.indexer_softmax_scale,
-    )
-    topk_indices = _torch_topk_from_scores(
-        indexer_scores, min(module.index_topk, indexer_scores.shape[-1])
-    )
+    zero_indexer_dependency = None
+    if module.indexer is not None:
+        assert topk_indices is None
+        q_indexer, k_indexer, weights_indexer = module.indexer.forward_before_topk(
+            x, q_resid, cos, sin, position_ids
+        )
+        indexer_scores = _torch_indexer_scores(
+            q_indexer,
+            k_indexer,
+            weights_indexer,
+            ratio=1,
+            indexer_softmax_scale=module.indexer_softmax_scale,
+        )
+        topk_indices = _torch_topk_from_scores(
+            indexer_scores, min(module.index_topk, indexer_scores.shape[-1])
+        )
+        # Fused loss_coeff=0 returns explicit zero indexer gradients. Keep the
+        # same parameters in the independent reference graph so keys are checked.
+        zero_indexer_dependency = (
+            q_indexer.float().sum()
+            + k_indexer.float().sum()
+            + weights_indexer.float().sum()
+        ) * 0.0
+    else:
+        assert topk_indices is not None
     out = _torch_sparse_attention(
         query_states,
         kv_full,
@@ -212,25 +272,34 @@ def _torch_unfused_dsa_forward(module, x, cos, sin, position_ids):
     out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
     out = out.reshape(batch, seq_len, module.num_heads * module.v_head_dim)
     out = module.o_proj(out)
-    # Fused loss_coeff=0 returns explicit zero indexer gradients. Keep the
-    # same parameters in the independent reference graph so keys are checked.
-    zero_indexer_dependency = (
-        q_indexer.float().sum() + k_indexer.float().sum() + weights_indexer.float().sum()
-    ) * 0.0
-    out = out + zero_indexer_dependency.to(out.dtype)
+    if zero_indexer_dependency is not None:
+        out = out + zero_indexer_dependency.to(out.dtype)
     return out, topk_indices
 
 
-def _run_once_torch_unfused(module, x, cos, sin, position_ids):
-    module.zero_grad(set_to_none=True)
-    module.train(True)
+def _run_once_torch_unfused(modules, x, cos, sin, position_ids):
+    modules.zero_grad(set_to_none=True)
+    modules.train(True)
     local_x = x.detach().clone().requires_grad_(True)
-    out, topk_indices = _torch_unfused_dsa_forward(module, local_x, cos, sin, position_ids)
+    source_out, topk_indices = _torch_unfused_dsa_forward(
+        modules["source"], local_x, cos, sin, position_ids
+    )
+    hidden = local_x + source_out
+    shared_out, reused_topk_indices = _torch_unfused_dsa_forward(
+        modules["shared"],
+        hidden,
+        cos,
+        sin,
+        position_ids,
+        topk_indices=topk_indices,
+    )
+    assert torch.equal(reused_topk_indices, topk_indices)
+    out = hidden + shared_out
     loss = out.float().square().mean()
     loss.backward()
     param_grads = {
         name: param.grad.detach().float().clone()
-        for name, param in module.named_parameters()
+        for name, param in modules.named_parameters()
         if param.grad is not None
     }
     return {
@@ -266,7 +335,7 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
 
     device = torch.device("cuda", int(torch.cuda.current_device()))
     torch.manual_seed(20260626)
-    fused = _make_dsa().to(device=device, dtype=torch.bfloat16)
+    fused = _make_dsa_pair().to(device=device, dtype=torch.bfloat16)
     unfused = copy.deepcopy(fused).to(device=device, dtype=torch.bfloat16)
 
     batch, seq, hidden = 1, 512, 128
@@ -334,3 +403,66 @@ def test_glm5_dsa_run_to_run_accept_with_proof():
         f"fused_vs_unfused_x_grad_max_abs={fused_vs_unfused_x_grad:.6e} "
         f"fused_vs_unfused_param_grad_max_abs={fused_vs_unfused_param_grad:.6e}"
     )
+
+
+def test_dsv4_fused_dsa_legacy_two_output_api_real_gpu():
+    """Run the legacy DSv4-facing two-output autograd contract on real kernels."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the fused DSA API regression smoke.")
+    pytest.importorskip("cudnn", reason="Fused DSA API smoke needs the cuDNN DSA stack.")
+    from megatron.lite.primitive.kernels import dsa_kernels
+
+    device = torch.device("cuda", int(torch.cuda.current_device()))
+    seq, batch, heads = 512, 1, 64
+    query_dim, value_dim = 576, 512
+    index_heads, index_dim, topk = 32, 128, 512
+
+    def make_args():
+        torch.manual_seed(20260627)
+
+        def leaf(*shape, dtype=torch.bfloat16):
+            return torch.randn(*shape, device=device, dtype=dtype).requires_grad_(True)
+
+        return (
+            leaf(seq, batch, heads, query_dim),
+            leaf(seq, batch, query_dim),
+            leaf(heads, dtype=torch.float32),
+            torch.empty(batch, seq, 0, device=device, dtype=torch.int32),
+            leaf(seq, batch, index_heads, index_dim),
+            leaf(seq, batch, index_dim),
+            leaf(seq, batch, index_heads),
+            topk,
+            1,
+            query_dim**-0.5,
+            index_dim**-0.5,
+            0.0,
+            False,
+            0,
+            False,
+            value_dim,
+        )
+
+    results = []
+    for name, call in (
+        ("direct", dsa_kernels.FusedIndexerSparseAttnFunc.apply),
+        ("public", dsa_kernels.fused_indexer_sparse_attn),
+    ):
+        args = make_args()
+        result = call(*args)
+        assert isinstance(result, tuple) and len(result) == 2
+        output, indexer_loss = result
+        assert output.shape == (seq, batch, heads * value_dim)
+        assert indexer_loss.ndim == 0
+        objective = output.float().square().mean() + indexer_loss
+        objective.backward()
+        differentiable_inputs = (args[0], args[1], args[2], args[4], args[5], args[6])
+        assert all(tensor.grad is not None for tensor in differentiable_inputs)
+        assert all(torch.isfinite(tensor.grad).all() for tensor in differentiable_inputs)
+        results.append(output.detach().float())
+        print(
+            "DSV4_FUSED_DSA_LEGACY_API "
+            f"path={name} loss={float(objective.detach().item()):.8e}"
+        )
+
+    torch.testing.assert_close(results[0], results[1], rtol=0.0, atol=0.0)

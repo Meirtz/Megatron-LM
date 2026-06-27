@@ -161,11 +161,16 @@ class Glm5DSAAttention(nn.Module):
     The Kimi skeleton therefore never observes the batch-first interior.
     """
 
-    def __init__(self, config: Glm5Config, ps: ParallelState, layer_idx: int):
+    def __init__(self, config: Glm5Config, ps: ParallelState, layer_idx: int = 0):
         super().__init__()
         self.ps = ps
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.rope_theta = config.rope_theta
+        # PR #66 promises gate-off compatibility with the existing GLM-5/5.1
+        # path. Those models historically ran half-split RoPE in MLite even
+        # though their HF metadata contains interleave flags. Only the
+        # GLM-5.2 IndexShare architecture opts into the configured layouts.
+        use_configured_rope_layout = config.uses_configured_dsa_rope_layout
         self.self_attention = DynamicSparseAttention(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -178,10 +183,12 @@ class Glm5DSAAttention(nn.Module):
             index_head_dim=config.index_head_dim,
             index_topk=config.index_topk,
             rms_norm_eps=config.rms_norm_eps,
-            rope_interleaved=config.rope_interleave,
+            rope_interleaved=(config.rope_interleave if use_configured_rope_layout else False),
             latent_rms_norm_eps=config.latent_rms_norm_eps,
             indexer_layer_norm_eps=config.indexer_layer_norm_eps,
-            indexer_rope_interleaved=config.indexer_rope_interleave,
+            indexer_rope_interleaved=(
+                config.indexer_rope_interleave if use_configured_rope_layout else False
+            ),
             indexer_rope_first=config.indexer_rope_first,
             indexer_use_hadamard=config.indexer_use_hadamard,
             layer_number=layer_idx + 1,
@@ -722,15 +729,36 @@ def _local_dsa_index_share_consumer_counts(
     return consumer_counts
 
 
-def _validate_dsa_index_share_recompute(
-    consumer_counts: dict[int, int], recompute_modules: list[str]
+def _validate_dsa_index_share_activation_replay(
+    index_share_enabled: bool,
+    *,
+    recompute_modules: list[str],
+    offload_modules: list[str] | None = None,
 ) -> None:
-    unsafe = {"full", "self_attn", "dsa"} & set(recompute_modules)
-    if consumer_counts and unsafe:
+    """Reject wrappers that replay a shared layer after its top-k was released.
+
+    The check is intentionally based on the global architecture schedule, not
+    the layers local to one PP rank.  Model construction must fail consistently
+    on every rank instead of letting only the rank that owns a shared layer
+    abort while its peers enter collectives.
+    """
+
+    if not index_share_enabled:
+        return
+    attention_replay_modules = {"full", "core_attn", "self_attn", "dsa"}
+    unsafe_recompute = attention_replay_modules & set(recompute_modules)
+    unsafe_offload = attention_replay_modules & set(offload_modules or ())
+    if unsafe_recompute or unsafe_offload:
+        details = []
+        if unsafe_recompute:
+            details.append(f"recompute={sorted(unsafe_recompute)}")
+        if unsafe_offload:
+            details.append(f"offload={sorted(unsafe_offload)}")
         raise ValueError(
-            "DSA IndexShare is incompatible with per-layer attention recompute "
-            f"{sorted(unsafe)}: backward recomputes shared layers before their "
-            "source layer. A source+shared group-aware checkpoint is required."
+            "DSA IndexShare is incompatible with per-layer attention activation replay "
+            f"({', '.join(details)}): backward replays shared layers after their "
+            "bounded top-k cache entry has been released. A source+shared group-aware "
+            "checkpoint/offload implementation is required."
         )
 
 
@@ -760,6 +788,12 @@ class Glm5Model(nn.Module):
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
 
+        recompute_modules = list(getattr(train_config, "recompute_modules", []) or [])
+        _validate_dsa_index_share_activation_replay(
+            config.uses_dsa_index_share,
+            recompute_modules=recompute_modules,
+        )
+
         layout = build_pipeline_chunk_layout(
             config.num_hidden_layers,
             ps,
@@ -788,7 +822,6 @@ class Glm5Model(nn.Module):
         if layout.has_embed:
             self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
-        recompute_modules = getattr(train_config, "recompute_modules", [])
         moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [
@@ -834,9 +867,6 @@ class Glm5Model(nn.Module):
 
         self._dsa_index_share_consumer_counts = _local_dsa_index_share_consumer_counts(
             self.layers, self.mtp
-        )
-        _validate_dsa_index_share_recompute(
-            self._dsa_index_share_consumer_counts, recompute_modules
         )
 
         self.sp_params: list[nn.Parameter] = []

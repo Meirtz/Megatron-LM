@@ -200,10 +200,10 @@ def test_dsa_index_share_state_rejects_unconsumed_source_save():
         state.save_topk(3, torch.zeros(1, 1, 1, dtype=torch.int32))
 
 
-def test_glm5_counts_local_index_share_consumers_including_repeated_mtp():
+def test_glm5_counts_local_index_share_consumers_and_rejects_activation_replay():
     from megatron.lite.model.glm5.lite.model import (
         _local_dsa_index_share_consumer_counts,
-        _validate_dsa_index_share_recompute,
+        _validate_dsa_index_share_activation_replay,
     )
 
     def layer(*, shared: bool, source_layer: int):
@@ -216,18 +216,29 @@ def test_glm5_counts_local_index_share_consumers_including_repeated_mtp():
         layer(shared=True, source_layer=3),
     ]
     mtp = SimpleNamespace(
-        layers=[SimpleNamespace(transformer_layer=layer(shared=True, source_layer=7))],
+        layers=[SimpleNamespace(transformer_layer=layer(shared=False, source_layer=7))],
         repeated_layer=True,
         num_layers=3,
     )
 
     consumer_counts = _local_dsa_index_share_consumer_counts(trunk_layers, mtp)
-    assert consumer_counts == {3: 2, 7: 3}
-    _validate_dsa_index_share_recompute(consumer_counts, ["moe", "attn_proj"])
-    _validate_dsa_index_share_recompute({}, ["full", "self_attn", "dsa"])
-    for unsafe_mode in ("full", "self_attn", "dsa"):
-        with pytest.raises(ValueError, match="group-aware checkpoint"):
-            _validate_dsa_index_share_recompute(consumer_counts, [unsafe_mode])
+    assert consumer_counts == {3: 2}
+    _validate_dsa_index_share_activation_replay(
+        True,
+        recompute_modules=["moe", "attn_proj"],
+        offload_modules=["mlp", "attn_proj"],
+    )
+    _validate_dsa_index_share_activation_replay(
+        False,
+        recompute_modules=["full", "core_attn", "self_attn", "dsa"],
+        offload_modules=["full", "core_attn", "self_attn", "dsa"],
+    )
+    for replay_kind in ("recompute", "offload"):
+        for unsafe_mode in ("full", "core_attn", "self_attn", "dsa"):
+            kwargs = {"recompute_modules": [], "offload_modules": []}
+            kwargs[f"{replay_kind}_modules"] = [unsafe_mode]
+            with pytest.raises(ValueError, match="group-aware"):
+                _validate_dsa_index_share_activation_replay(True, **kwargs)
 
 
 def test_dsv4_fused_dsa_legacy_two_output_api_cpu_mock(monkeypatch):

@@ -823,7 +823,6 @@ class _FusedIndexerSparseAttnWithTopKFunc(torch.autograd.Function):
         sq, b, np_, d = query.shape
         skv = kv_full.shape[0]
         n_comp = k_indexer.shape[0]
-        idx_nh, idx_hd = q_indexer.shape[2], q_indexer.shape[3]
 
         requested_topk = indexer_topk
         effective_topk = min(requested_topk, n_comp)

@@ -130,6 +130,22 @@ def test_glm5_config_ignores_null_hf_optional_fields():
     assert cfg.mlp_layer_types is None
 
 
+def test_glm52_config_fields_append_without_shifting_legacy_positional_slots():
+    from dataclasses import fields
+
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    names = [field.name for field in fields(Glm5Config)]
+    legacy_tail = names.index("mlp_layer_types")
+    assert names[legacy_tail + 1 :] == [
+        "index_topk_freq",
+        "index_skip_topk_offset",
+        "index_topk_pattern",
+        "indexer_types",
+        "dsa_rope_layout_revision",
+    ]
+
+
 def test_glm52_config_uses_explicit_indexer_types_as_canonical_schedule():
     import pytest
 
@@ -222,7 +238,101 @@ def test_glm52_config_pattern_precedence_groups_and_all_full_override():
         indexer_types=["full"] * 6,
     )
     assert all_full_cfg.uses_dsa_index_share is False
+    assert all_full_cfg.has_dsa_index_share_schedule is True
+    assert all_full_cfg.uses_configured_dsa_rope_layout is True
     assert all_full_cfg.dsa_index_share_decoder_layer_groups() is None
+
+    # The rotary revision is a load-time compatibility decision, not a live
+    # alias of the sharing schedule. Disabling sharing later must not change it.
+    all_full_cfg.indexer_types = None
+    all_full_cfg.index_topk_pattern = None
+    all_full_cfg.index_topk_freq = 1
+    all_full_cfg.index_skip_topk_offset = 0
+    assert all_full_cfg.has_dsa_index_share_schedule is False
+    assert all_full_cfg.uses_configured_dsa_rope_layout is True
+    roundtripped = Glm5Config._from_hf_dict(all_full_cfg.to_dict())
+    assert roundtripped.has_dsa_index_share_schedule is False
+    assert roundtripped.uses_configured_dsa_rope_layout is True
+
+
+def test_glm5_rope_revision_is_inferred_before_schedule_overrides():
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    glm52_source = {
+        **_tiny_config_kwargs(),
+        "index_topk_freq": 2,
+        "index_skip_topk_offset": 1,
+        "indexer_types": ["full", "shared"],
+    }
+    glm52_all_full = Glm5Config._from_hf_dict(
+        glm52_source,
+        index_topk_freq=1,
+        index_skip_topk_offset=0,
+        indexer_types=["full", "full"],
+    )
+    assert glm52_all_full.uses_dsa_index_share is False
+    assert glm52_all_full.uses_configured_dsa_rope_layout is True
+
+    glm51_with_local_all_full = Glm5Config._from_hf_dict(
+        _tiny_config_kwargs(),
+        indexer_types=["full", "full"],
+    )
+    assert glm51_with_local_all_full.uses_dsa_index_share is False
+    assert glm51_with_local_all_full.uses_configured_dsa_rope_layout is False
+
+
+def test_glm51_gate_off_preserves_legacy_rope_layout(
+    transformer_engine_import_stub, monkeypatch
+):
+    import torch.nn as nn
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.model import Glm5DSAAttention
+    from megatron.lite.primitive.modules.attention import dsa
+    from megatron.lite.primitive.parallel import ParallelState
+
+    monkeypatch.setattr(dsa, "RMSNorm", nn.RMSNorm)
+
+    published_rope_fields = {
+        "rope_interleave": True,
+        "indexer_rope_interleave": True,
+    }
+    legacy_cfg = Glm5Config(**_tiny_config_kwargs(), **published_rope_fields)
+    glm52_cfg = Glm5Config(
+        **_tiny_config_kwargs(),
+        **published_rope_fields,
+        indexer_types=["full", "shared"],
+    )
+    glm52_all_full_cfg = Glm5Config(
+        **_tiny_config_kwargs(),
+        **published_rope_fields,
+        indexer_types=["full", "full"],
+    )
+
+    assert legacy_cfg.has_dsa_index_share_schedule is False
+    assert legacy_cfg.dsa_rope_layout_revision == "legacy"
+    # The exported wrapper keeps its pre-PR two-argument constructor contract.
+    legacy_dsa = Glm5DSAAttention(legacy_cfg, ParallelState()).self_attention
+    assert legacy_dsa.layer_number == 1
+    assert legacy_dsa.rope_interleaved is False
+    assert legacy_dsa.indexer is not None
+    assert legacy_dsa.indexer.rope_interleaved is False
+
+    assert glm52_cfg.dsa_rope_layout_revision == "configured"
+    glm52_dsa = Glm5DSAAttention(glm52_cfg, ParallelState(), 0).self_attention
+    assert glm52_dsa.rope_interleaved is True
+    assert glm52_dsa.indexer is not None
+    assert glm52_dsa.indexer.rope_interleaved is True
+
+    assert glm52_all_full_cfg.uses_dsa_index_share is False
+    assert glm52_all_full_cfg.uses_configured_dsa_rope_layout is True
+    all_full_dsa = Glm5DSAAttention(
+        glm52_all_full_cfg, ParallelState(), 0
+    ).self_attention
+    assert all_full_dsa.rope_interleaved is True
+    assert all_full_dsa.indexer is not None
+    assert all_full_dsa.indexer.rope_interleaved is True
 
 
 def test_glm52_serving_mtp_share_metadata_is_ignored_and_mtp_is_always_full():
@@ -819,6 +929,32 @@ def test_glm5_protocol_allows_cp_only_parallel_scope():
         _validate_parallel_scope(ParallelConfig(tp=2, ep=1, etp=1, cp=1, pp=1, vpp=1))
     with pytest.raises(NotImplementedError):
         _validate_parallel_scope(ParallelConfig(tp=1, ep=1, etp=2, cp=1, pp=1, vpp=1))
+
+
+def test_glm52_protocol_rejects_attention_replay_before_parallel_init(
+    transformer_engine_import_stub, monkeypatch
+):
+    import pytest
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite import protocol
+
+    cfg = Glm5Config(
+        **_tiny_config_kwargs(),
+        indexer_types=["full", "shared"],
+    )
+
+    def unexpected_parallel_init(*args, **kwargs):
+        raise AssertionError("IndexShare activation replay must fail before init_parallel")
+
+    monkeypatch.setattr(protocol, "init_parallel", unexpected_parallel_init)
+    for impl_cfg in (
+        protocol.ImplConfig(optimizer=None, recompute=["core_attn"]),
+        protocol.ImplConfig(optimizer=None, offload=["dsa"]),
+    ):
+        with pytest.raises(ValueError, match="group-aware"):
+            protocol.build_model(cfg, impl_cfg=impl_cfg)
 
 
 def test_glm5_impl_config_accepts_runtime_mtp_fields():

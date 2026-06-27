@@ -195,10 +195,18 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     elif hasattr(model_cfg, "num_nextn_predict_layers"):
         model_cfg.num_nextn_predict_layers = 0
 
-    from megatron.lite.model.glm5.lite.model import Glm5Model
+    from megatron.lite.model.glm5.lite.model import (
+        Glm5Model,
+        _validate_dsa_index_share_activation_replay,
+    )
 
-    ps = init_parallel(p)
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)
+    _validate_dsa_index_share_activation_replay(
+        model_cfg.uses_dsa_index_share,
+        recompute_modules=recompute_spec,
+        offload_modules=impl_cfg.offload,
+    )
+    ps = init_parallel(p)
     vpp = None if p.vpp == 1 else p.vpp
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,

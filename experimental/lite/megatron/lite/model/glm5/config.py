@@ -59,6 +59,7 @@ _HF_FIELDS = frozenset(
         "vocab_size",
     }
 )
+_SERIALIZED_INTERNAL_FIELDS = frozenset({"dsa_rope_layout_revision"})
 
 # ``index_share_for_mtp_iteration`` is intentionally absent.  It is a serving
 # proposer control (draft step 0 computes; later draft steps reuse), not a
@@ -121,10 +122,6 @@ class Glm5Config:
     index_head_dim: int = 128
     index_n_heads: int = 32
     index_topk: int = 2048
-    index_topk_freq: int = 1
-    index_skip_topk_offset: int = 0
-    index_topk_pattern: str | list[str] | None = None
-    indexer_types: list[str] | None = None
     indexer_layer_norm_eps: float = 1e-6
     indexer_rope_interleave: bool = False
     indexer_rope_first: bool = True
@@ -151,7 +148,23 @@ class Glm5Config:
     mtp_use_repeated_layer: bool = False
     mlp_layer_types: list[str] | None = None
 
+    # GLM-5.2 extension fields stay at the end so positional construction of
+    # every pre-existing Glm5Config field keeps its historical slot.
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int = 0
+    index_topk_pattern: str | list[str] | None = None
+    indexer_types: list[str] | None = None
+    # Internal compatibility revision. ``None`` infers configured RoPE only
+    # for configs carrying GLM-5.2 IndexShare schedule metadata. Persisting the
+    # resolved value prevents a later all-full override from silently changing
+    # the checkpoint's rotary convention.
+    dsa_rope_layout_revision: str | None = None
+
     def __post_init__(self):
+        if self.dsa_rope_layout_revision is None:
+            self.dsa_rope_layout_revision = (
+                "configured" if self.has_dsa_index_share_schedule else "legacy"
+            )
         self._validate()
 
     @property
@@ -166,6 +179,27 @@ class Glm5Config:
     @property
     def uses_dsa_index_share(self) -> bool:
         return "shared" in self.resolved_dsa_indexer_types
+
+    @property
+    def has_dsa_index_share_schedule(self) -> bool:
+        """Whether the current config carries GLM-5.2-style schedule metadata.
+
+        GLM-5/5.1 checkpoints expose RoPE interleave metadata too, but MLite's
+        pre-5.2 implementation historically used half-split RoPE. This metadata
+        infers the initial layout revision, even for an explicit all-full
+        schedule; the resolved revision itself remains stable after mutation.
+        """
+
+        return (
+            self.indexer_types is not None
+            or self.index_topk_pattern is not None
+            or self.index_topk_freq > 1
+            or self.index_skip_topk_offset > 0
+        )
+
+    @property
+    def uses_configured_dsa_rope_layout(self) -> bool:
+        return self.dsa_rope_layout_revision == "configured"
 
     @property
     def resolved_dsa_indexer_types(self) -> tuple[str, ...]:
@@ -260,6 +294,10 @@ class Glm5Config:
         check(
             self.index_skip_topk_offset >= 0,
             "index_skip_topk_offset must be >= 0",
+        )
+        check(
+            self.dsa_rope_layout_revision in {"legacy", "configured"},
+            "dsa_rope_layout_revision must be 'legacy' or 'configured'",
         )
         check(self.dsa_indexer_loss_coeff >= 0.0, "dsa_indexer_loss_coeff must be >= 0")
         check(
@@ -364,8 +402,24 @@ class Glm5Config:
     @classmethod
     def _from_hf_dict(cls, hf: dict[str, Any], **overrides) -> Glm5Config:
         kwargs = {
-            key: value for key, value in hf.items() if key in _HF_FIELDS and value is not None
+            key: value
+            for key, value in hf.items()
+            if key in (_HF_FIELDS | _SERIALIZED_INTERNAL_FIELDS) and value is not None
         }
+        # Resolve the architecture revision from the source checkpoint before
+        # applying local schedule overrides. Turning a real 5.2 config into an
+        # all-full schedule must not also reinterpret its rotary layout, while
+        # adding an all-full schedule to a 5.1 config must not silently opt in.
+        if "dsa_rope_layout_revision" not in kwargs:
+            source_has_index_share_schedule = (
+                hf.get("indexer_types") is not None
+                or hf.get("index_topk_pattern") is not None
+                or int(hf.get("index_topk_freq") or 1) > 1
+                or int(hf.get("index_skip_topk_offset") or 0) > 0
+            )
+            kwargs["dsa_rope_layout_revision"] = (
+                "configured" if source_has_index_share_schedule else "legacy"
+            )
         if "num_nextn_predict_layers" not in kwargs and hf.get("num_nextn_predict") is not None:
             kwargs["num_nextn_predict_layers"] = int(hf["num_nextn_predict"])
         rope_parameters = hf.get("rope_parameters")

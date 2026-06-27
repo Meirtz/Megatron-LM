@@ -81,6 +81,32 @@ def test_non_interleaved_rope_keeps_the_glm51_formula_bitwise(
     assert torch.equal(actual, expected)
 
 
+def test_public_dsa_primitive_defaults_preserve_legacy_half_split(
+    transformer_engine_import_stub, monkeypatch
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.attention import dsa
+
+    monkeypatch.setattr(dsa, "RMSNorm", nn.RMSNorm)
+    attention = dsa.DynamicSparseAttention(
+        hidden_size=16,
+        num_attention_heads=2,
+        q_lora_rank=8,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=8,
+        v_head_dim=4,
+        index_n_heads=2,
+        index_head_dim=12,
+        index_topk=2,
+        rms_norm_eps=1e-6,
+    )
+
+    assert attention.rope_interleaved is False
+    assert attention.indexer is not None
+    assert attention.indexer.rope_interleaved is False
+
+
 @pytest.mark.parametrize("mla_interleaved", [False, True])
 def test_dynamic_sparse_attention_main_rope_matches_independent_reference(
     transformer_engine_import_stub, monkeypatch, mla_interleaved
