@@ -2,11 +2,20 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine, _build_lr_scheduler
+
+_GRPO_LAUNCHER = (
+    Path(__file__).resolve().parents[3]
+    / "examples"
+    / "verl"
+    / "scripts"
+    / "run_qwen3moe_gsm8k_grpo.sh"
+)
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -60,13 +69,19 @@ def test_canonical_config_target_import_registers_default_mlite_backend() -> Non
 import importlib
 import sys
 
-from verl.workers.engine.base import EngineRegistry
+import verl.workers.engine.base as engine_base
+
+EngineRegistry = engine_base.EngineRegistry
 
 assert "verl_mlite.engine.mlite_engine" not in sys.modules
 config_module = importlib.import_module("verl_mlite.engine.config")
 config = config_module.MegatronLiteEngineConfig(impl_cfg={"use_thd": True})
 assert config.custom_backend_module == "verl_mlite.engine.mlite_engine"
 assert config.strategy == "mlite"
+assert config.weight_sync_target == "hf"
+# Legacy/local VERL revisions may query the physical host directly. Isolate this
+# registration-only assertion from host device detection; no device work occurs.
+engine_base.get_device_name = lambda: "cuda"
 engine_cls = EngineRegistry.get_engine_cls(
     model_type="language_model", backend="mlite"
 )
@@ -159,8 +174,9 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.impl_cfg["deterministic"] is False
 
 
-def test_auto_qwen35_weight_sync_uses_resolved_vllm_export_target() -> None:
-    engine = _engine(engine_config=_engine_config())
+@pytest.mark.parametrize("target", ["hf", "vllm"])
+def test_auto_qwen35_weight_sync_uses_configured_consumer_target(target) -> None:
+    engine = _engine(engine_config=_engine_config(weight_sync_target=target))
     assert engine.engine_config.model_name == "auto"
     engine._mlite_config = engine._build_mlite_config()
     assert engine._mlite_config.model_name == "qwen3_5"
@@ -183,9 +199,123 @@ def test_auto_qwen35_weight_sync_uses_resolved_vllm_export_target() -> None:
     assert captured["handle"] is handle
     assert captured["kwargs"] == {
         "limit": 3,
-        "target": "vllm",
+        "target": target,
         "export_dtype": "bfloat16",
     }
+
+
+def test_weight_sync_target_rejects_unknown_consumer() -> None:
+    with pytest.raises(ValueError, match="weight_sync_target"):
+        _engine_config(weight_sync_target="sglang")
+
+
+def test_vllm_weight_sync_target_rejects_non_qwen35_model() -> None:
+    engine = _engine(engine_config=_engine_config(weight_sync_target="vllm"))
+    engine._mlite_config = SimpleNamespace(model_name="deepseek_v4")
+    engine.runtime = SimpleNamespace(export_weights=lambda *_args, **_kwargs: [])
+    engine.handle = object()
+
+    with pytest.raises(ValueError, match="implemented only for Qwen3.5"):
+        engine.get_per_tensor_param()
+
+
+@pytest.mark.parametrize(
+    ("rollout_backend", "expected_target"), [("vllm", "vllm"), ("sglang", "hf")]
+)
+def test_grpo_launcher_selects_consumer_compatible_weight_keyspace(
+    tmp_path, rollout_backend, expected_target
+) -> None:
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "INFER_BACKEND": rollout_backend,
+        "OUTPUT_ROOT": str(tmp_path / rollout_backend),
+    }
+
+    completed = subprocess.run(
+        [str(_GRPO_LAUNCHER)], env=env, text=True, capture_output=True, check=True
+    )
+
+    assert (
+        "actor_rollout_ref.actor.engine.weight_sync_target=" + expected_target
+        in completed.stdout
+    )
+
+
+def test_grpo_launcher_rejects_qwen35_trtllm_without_live_reload_evidence(
+    tmp_path,
+) -> None:
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "INFER_BACKEND": "trtllm",
+        "MLITE_MODEL_NAME": "qwen3_5",
+        "OUTPUT_ROOT": str(tmp_path / "qwen3_5"),
+    }
+
+    completed = subprocess.run(
+        [str(_GRPO_LAUNCHER)], env=env, text=True, capture_output=True, check=False
+    )
+
+    assert completed.returncode != 0
+    assert (
+        "Qwen3.5 TRT-LLM rollout is blocked for pinned VERL "
+        "1ff76cc625e9820d2434dad1b6d9b8e5dd26a359 + TensorRT-LLM "
+        "v1.3.0rc19" in completed.stderr
+    )
+    assert "live dynamic weight reload has not been validated end to end" in (
+        completed.stderr
+    )
+    assert "static mapper/key-normalization analysis is insufficient" in (
+        completed.stderr
+    )
+    assert "deterministically asserts" not in completed.stderr
+    assert "actor_rollout_ref.actor.engine.weight_sync_target=" not in completed.stdout
+
+
+@pytest.mark.parametrize("rollout_backend", ["vllm", "sglang", "trtllm"])
+def test_grpo_launcher_rejects_auto_without_guessing_from_non_qwen_model_path(
+    tmp_path, rollout_backend
+) -> None:
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "INFER_BACKEND": rollout_backend,
+        "MODEL_PATH": "/models/DeepSeek-V4-not-a-qwen-model",
+        "MLITE_MODEL_NAME": "auto",
+        "OUTPUT_ROOT": str(tmp_path / rollout_backend),
+    }
+
+    completed = subprocess.run(
+        [str(_GRPO_LAUNCHER)], env=env, text=True, capture_output=True, check=False
+    )
+
+    assert completed.returncode != 0
+    assert "MLITE_MODEL_NAME=auto is not safe in this launcher" in completed.stderr
+    assert "MODEL_PATH text is not authoritative" in completed.stderr
+    assert "Set MLITE_MODEL_NAME explicitly" in completed.stderr
+    assert "actor_rollout_ref.actor.engine.weight_sync_target=" not in completed.stdout
+
+
+@pytest.mark.parametrize("rollout_backend", ["vllm", "trtllm"])
+def test_grpo_launcher_keeps_hf_target_for_explicit_non_qwen35_model(
+    tmp_path, rollout_backend
+) -> None:
+    env = {
+        **os.environ,
+        "DRY_RUN": "1",
+        "INFER_BACKEND": rollout_backend,
+        "MLITE_MODEL_NAME": "deepseek_v4",
+        "OUTPUT_ROOT": str(tmp_path / rollout_backend),
+    }
+
+    completed = subprocess.run(
+        [str(_GRPO_LAUNCHER)], env=env, text=True, capture_output=True, check=True
+    )
+
+    assert "actor_rollout_ref.actor.engine.model_name=deepseek_v4" in completed.stdout
+    assert "actor_rollout_ref.actor.engine.weight_sync_target=hf" in completed.stdout
+    assert f"actor_rollout_ref.rollout.name={rollout_backend}" in completed.stdout
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:

@@ -7,23 +7,926 @@ import datetime
 import importlib
 import json
 import multiprocessing as mp
+import os
+import pickle
 import random
+import stat
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from megatron.lite.primitive.ckpt import CheckpointLoadFatalError
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 pytestmark = pytest.mark.mlite
 
 
-def _gloo_extra_state_target_commit_failure_worker(rank: int, init_path: str) -> None:
+@pytest.mark.parametrize(
+    "copy_operation",
+    [copy.copy, copy.deepcopy, pickle.dumps],
+    ids=["copy", "deepcopy", "pickle"],
+)
+def test_model_handle_is_an_uncopyable_opaque_runtime_capability(copy_operation):
+    handle = ModelHandle(model=nn.Linear(2, 2))
+
+    with pytest.raises(TypeError, match="opaque runtime capability"):
+        copy_operation(handle)
+
+
+def _gloo_dcp_model_metadata_mismatch_worker(
+    init_path: str, checkpoint_path: str, mismatch: str
+) -> None:
     import torch.distributed as dist
     from megatron.lite.primitive.ckpt import dcp
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import Replicate
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=0,
+        world_size=1,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    original_build_meshes = dcp._build_meshes
+    original_dcp_load = dcp.dcp.load
+    try:
+        mesh = DeviceMesh("cpu", [0])
+        dcp._build_meshes = lambda _config: (mesh, mesh)
+        config = types.SimpleNamespace(tp=1, ep=1, etp=1, cp=1, pp=1)
+
+        def placements(_name):
+            return [Replicate()]
+
+        parallel_state = types.SimpleNamespace(pp_size=1, pp_rank=0)
+
+        source = nn.Linear(1, 1, bias=False, dtype=torch.float32)
+        with torch.no_grad():
+            source.weight.fill_(1.234567)
+        dcp.save_training_checkpoint(
+            source,
+            None,
+            23,
+            checkpoint_path,
+            config=config,
+            ps=parallel_state,
+            get_placements=placements,
+            use_dcp=True,
+            save_optimizer=False,
+            save_rng=False,
+        )
+
+        if mismatch == "dtype":
+            target = nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+            expected_fragment = "dtype"
+        elif mismatch == "shape":
+            target = nn.Linear(2, 1, bias=False, dtype=torch.float32)
+            expected_fragment = "global_shape"
+        else:
+            raise AssertionError(f"unsupported mismatch: {mismatch}")
+        with torch.no_grad():
+            target.weight.fill_(-7.0)
+        before = target.weight.detach().clone()
+
+        def forbidden_dcp_load(*_args, **_kwargs):
+            raise AssertionError("DCP load must not run after metadata mismatch")
+
+        dcp.dcp.load = forbidden_dcp_load
+        with pytest.raises(
+            RuntimeError,
+            match=rf"DCP model metadata validation failed.*{expected_fragment}",
+        ):
+            dcp.load_training_checkpoint(
+                target,
+                None,
+                checkpoint_path,
+                config=config,
+                ps=parallel_state,
+                get_placements=placements,
+                use_dcp=True,
+                load_optimizer=False,
+                load_rng=False,
+            )
+        torch.testing.assert_close(target.weight, before, atol=0.0, rtol=0.0)
+        dist.barrier()
+    finally:
+        dcp._build_meshes = original_build_meshes
+        dcp.dcp.load = original_dcp_load
+        dist.destroy_process_group()
+
+
+def _gloo_dcp_asymmetric_preflight_failure_worker(
+    rank: int, init_path: str, checkpoint_path: str, failure_mode: str
+) -> None:
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt import dcp
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    try:
+        dcp._resolve_step_checkpoint_path = lambda path, **_kwargs: path
+        dcp._validate_checkpoint_manifest = lambda *_args, **_kwargs: None
+        dcp._preload_checkpoint_sidecars = lambda *_args, **_kwargs: (None, None, {})
+        dcp._supports_dist_opt_distckpt = lambda *_args, **_kwargs: False
+
+        def build_meshes(_config):
+            if failure_mode == "build_meshes" and rank == 1:
+                raise RuntimeError("rank-1 injected mesh construction failure")
+            return object(), object()
+
+        def placements(_name):
+            if failure_mode == "placements" and rank == 1:
+                raise RuntimeError("rank-1 injected placement failure")
+            return []
+
+        class Reader:
+            @staticmethod
+            def read_metadata():
+                return types.SimpleNamespace(state_dict_metadata={})
+
+        dcp._build_meshes = build_meshes
+        dcp._empty_dcp_tensor_like_param = (
+            lambda tensor, _mesh, _placements: torch.empty_like(tensor)
+        )
+        dcp.dcp.FileSystemReader = lambda _path: Reader()
+        dcp._validate_dcp_model_metadata = lambda *_args, **_kwargs: (False, False)
+        dcp.dcp.load = lambda *_args, **_kwargs: pytest.fail(
+            "DCP load must not run after asymmetric preflight failure"
+        )
+
+        model = nn.Linear(2, 2, bias=False)
+        before = model.weight.detach().clone()
+        config = types.SimpleNamespace(tp=1, ep=1, etp=1, cp=1, pp=1)
+        parallel_state = types.SimpleNamespace(pp_size=1, pp_rank=0)
+        message = None
+        try:
+            dcp.load_training_checkpoint(
+                model,
+                None,
+                checkpoint_path,
+                config=config,
+                ps=parallel_state,
+                get_placements=placements,
+                use_dcp=True,
+                load_optimizer=False,
+                load_rng=False,
+                allow_legacy_checkpoint=True,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("asymmetric DCP preflight failure was ignored")
+        assert "DCP model metadata validation failed" in message
+        assert "rank-1 injected" in message
+        torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+        messages: list[str | None] = [None, None]
+        dist.all_gather_object(messages, message)
+        assert messages[0] == messages[1]
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _local_checkpoint_payload(
+    model: nn.Module,
+    *,
+    step: int,
+    generation: str = "a" * 32,
+    topology=None,
+    rank_coordinate=None,
+) -> dict[str, object]:
+    from megatron.lite.primitive.ckpt import dcp
+
+    return {
+        "format": "megatron_lite.local_training.v3",
+        "step": step,
+        "generation": generation,
+        "topology": topology,
+        "rank_coordinate": rank_coordinate,
+        "model": [dcp._chunk_tensor_state(model)],
+        "optimizer": None,
+        "optimizer_parameter_state": None,
+        "rng_state": None,
+    }
+
+
+def _gloo_local_checkpoint_consensus_worker(
+    rank: int, init_path: str, checkpoint_path: str, failure_mode: str
+) -> None:
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt import dcp
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    checkpoint_root = Path(checkpoint_path)
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    transaction_roots = {checkpoint_root}
+    parallel_config = types.SimpleNamespace(
+        tp=1, etp=1, ep=1, pp=1, vpp=1, cp=1, pp_layout=None
+    )
+    parallel_state = types.SimpleNamespace(
+        tp_size=1,
+        etp_size=1,
+        ep_size=1,
+        pp_size=1,
+        cp_size=1,
+        dp_size=2,
+        expert_dp_size=2,
+        tp_rank=0,
+        etp_rank=0,
+        ep_rank=0,
+        pp_rank=0,
+        cp_rank=0,
+        dp_rank=rank,
+        expert_dp_rank=rank,
+    )
+    topology, rank_coordinate = dcp._local_checkpoint_parallel_identity(
+        parallel_config, parallel_state
+    )
+
+    def local_payload(payload_model, *, step: int, generation: str = "a" * 32):
+        return _local_checkpoint_payload(
+            payload_model,
+            step=step,
+            generation=generation,
+            topology=topology,
+            rank_coordinate=rank_coordinate,
+        )
+
+    def save_local(payload_model, payload_optimizer, step, save_path=None, **kwargs):
+        return dcp.save_training_checkpoint(
+            payload_model,
+            payload_optimizer,
+            step,
+            save_path or checkpoint_path,
+            config=parallel_config,
+            ps=parallel_state,
+            use_dcp=False,
+            **kwargs,
+        )
+
+    def load_local(payload_model, payload_optimizer, load_path=None, **kwargs):
+        return dcp.load_training_checkpoint(
+            payload_model,
+            payload_optimizer,
+            load_path or checkpoint_path,
+            config=parallel_config,
+            ps=parallel_state,
+            use_dcp=False,
+            **kwargs,
+        )
+
+    model = nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(rank + 1.0)
+    checkpoint_file = dcp._local_checkpoint_file(checkpoint_path)
+    message: str | None = None
+    original_atomic_save = dcp._atomic_torch_save
+    original_backup = dcp._backup_local_checkpoint_file
+    original_read_completion = dcp._read_local_checkpoint_completion_with_consensus
+    original_replace = dcp.os.replace
+    original_fsync_file = dcp._fsync_file
+    original_fsync_directory = dcp._fsync_directory
+
+    def publish_completion(*, step: int, generation: str = "a" * 32) -> None:
+        if rank == 0:
+            dcp._atomic_write_json(
+                dcp._local_checkpoint_completion_path(checkpoint_path),
+                dcp._local_checkpoint_completion_payload(
+                    step=step, generation=generation, topology=topology
+                ),
+            )
+        dist.barrier()
+
+    try:
+        if failure_mode == "load_missing_rank_file":
+            if rank == 0:
+                torch.save(local_payload(model, step=31), checkpoint_file)
+            publish_completion(step=31)
+            with torch.no_grad():
+                model.weight.fill_(100.0 + rank)
+            before = model.weight.detach().clone()
+            try:
+                load_local(model, None, load_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("rank-local missing checkpoint did not fail")
+            assert "local checkpoint load preflight failed" in message
+            assert "FileNotFoundError" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode in {"load_legacy_v2_default", "load_legacy_v2_opt_in"}:
+            legacy_payload = local_payload(model, step=30)
+            legacy_payload["format"] = "megatron_lite.local_training.v2"
+            legacy_payload.pop("generation")
+            legacy_payload.pop("topology")
+            legacy_payload.pop("rank_coordinate")
+            torch.save(legacy_payload, checkpoint_file)
+            dist.barrier()
+            source_weight = model.weight.detach().clone()
+            with torch.no_grad():
+                model.weight.fill_(190.0 + rank)
+            before = model.weight.detach().clone()
+            if failure_mode == "load_legacy_v2_default":
+                try:
+                    load_local(model, None, load_rng=False)
+                except RuntimeError as exc:
+                    message = str(exc)
+                else:
+                    raise AssertionError("distributed legacy V2 loaded by default")
+                assert "completion validation failed" in message
+                torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+            else:
+                assert (
+                    load_local(
+                        model, None, load_rng=False, allow_legacy_checkpoint=True
+                    )
+                    == 30
+                )
+                torch.testing.assert_close(
+                    model.weight, source_weight, atol=0.0, rtol=0.0
+                )
+
+        elif failure_mode == "load_v3_missing_marker_allow":
+            torch.save(local_payload(model, step=36), checkpoint_file)
+            dist.barrier()
+            with torch.no_grad():
+                model.weight.fill_(195.0 + rank)
+            before = model.weight.detach().clone()
+            try:
+                load_local(model, None, load_rng=False, allow_legacy_checkpoint=True)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("torn V3 checkpoint bypassed completion marker")
+            assert "allow_legacy_checkpoint cannot bypass" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode == "load_identity_step":
+            torch.save(local_payload(model, step=100 + rank), checkpoint_file)
+            publish_completion(step=100)
+            with torch.no_grad():
+                model.weight.fill_(200.0 + rank)
+            before = model.weight.detach().clone()
+            try:
+                load_local(model, None, load_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("mixed local checkpoint steps were accepted")
+            assert "loaded identity differs across ranks" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode == "load_identity_generation":
+            generation = "a" * 32 if rank == 0 else "b" * 32
+            torch.save(
+                local_payload(model, step=101, generation=generation), checkpoint_file
+            )
+            publish_completion(step=101, generation="a" * 32)
+            with torch.no_grad():
+                model.weight.fill_(210.0 + rank)
+            before = model.weight.detach().clone()
+            try:
+                load_local(model, None, load_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("mixed local checkpoint generations were accepted")
+            assert "loaded identity differs across ranks" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode == "load_completion_generation":
+            torch.save(
+                local_payload(model, step=104, generation="b" * 32), checkpoint_file
+            )
+            publish_completion(step=104, generation="a" * 32)
+            with torch.no_grad():
+                model.weight.fill_(220.0 + rank)
+            before = model.weight.detach().clone()
+            try:
+                load_local(model, None, load_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("stale completion generation was accepted")
+            assert "does not match the completed generation" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode == "load_identity_path":
+            rank_checkpoint_path = f"{checkpoint_path}-rank{rank}"
+            rank_checkpoint_root = Path(rank_checkpoint_path)
+            rank_checkpoint_root.mkdir(parents=True, exist_ok=True)
+            transaction_roots.add(rank_checkpoint_root)
+            rank_checkpoint_file = dcp._local_checkpoint_file(rank_checkpoint_path)
+            torch.save(local_payload(model, step=102), rank_checkpoint_file)
+            dist.barrier()
+            before = model.weight.detach().clone()
+            try:
+                load_local(model, None, load_path=rank_checkpoint_path, load_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("rank-divergent checkpoint paths were accepted")
+            assert "load path differs across ranks" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode == "load_commit":
+            source_model = nn.Linear(2, 2, bias=False)
+            source_optimizer = torch.optim.AdamW(
+                source_model.parameters(), lr=1.0e-3, weight_decay=0.0
+            )
+            source_model(torch.ones(2, 2)).sum().backward()
+            source_optimizer.step()
+            source_optimizer.zero_grad(set_to_none=True)
+            source_model_state = copy.deepcopy(source_model.state_dict())
+            source_optimizer_state = copy.deepcopy(source_optimizer.state_dict())
+            save_local(source_model, source_optimizer, 33, save_rng=False)
+
+            class FailOnceAdamW(torch.optim.AdamW):
+                def __init__(self, params, *, fail_once: bool):
+                    super().__init__(params, lr=1.0e-3, weight_decay=0.0)
+                    self.fail_once = fail_once
+
+                def load_state_dict(self, state_dict):
+                    super().load_state_dict(state_dict)
+                    if self.fail_once:
+                        self.fail_once = False
+                        raise RuntimeError("rank-1 injected optimizer commit failure")
+
+            target_model = nn.Linear(2, 2, bias=False)
+            target_optimizer = FailOnceAdamW(target_model.parameters(), fail_once=False)
+            target_model(torch.full((2, 2), 3.0)).sum().backward()
+            target_optimizer.step()
+            target_optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                target_model.weight.add_(17.0 + rank)
+            target_optimizer.fail_once = rank == 1
+            model_before = copy.deepcopy(target_model.state_dict())
+            try:
+                load_local(target_model, target_optimizer, load_rng=False)
+            except RuntimeError as exc:
+                assert isinstance(exc, CheckpointLoadFatalError)
+                message = str(exc)
+            else:
+                raise AssertionError("rank-local load commit failure was ignored")
+            assert "runtime must be poisoned" in message
+            assert "discard and reinitialize" in message
+            assert "rank-1 injected optimizer commit failure" in message
+            assert any(
+                not torch.equal(target_model.state_dict()[name], tensor)
+                for name, tensor in model_before.items()
+            )
+            _assert_nested_state_equal(target_model.state_dict(), source_model_state)
+            _assert_nested_state_equal(
+                target_optimizer.state_dict(), source_optimizer_state
+            )
+
+        elif failure_mode == "parameter_state_owner":
+
+            class OwnerOnlyOptimizer:
+                def __init__(self, parameters, *, parameter_value: int):
+                    self.optimizer = torch.optim.AdamW(
+                        parameters, lr=1.0e-3, weight_decay=0.0
+                    )
+                    self.data_parallel_group = dist.group.WORLD
+                    self.parameter_value = parameter_value
+                    self.parameter_load_calls = 0
+
+                def state_dict(self):
+                    return self.optimizer.state_dict()
+
+                def validate_state_dict(self, state):
+                    dcp._validate_torch_optimizer_checkpoint_state(
+                        self.optimizer, state
+                    )
+
+                def load_state_dict(self, state):
+                    self.optimizer.load_state_dict(state)
+
+                def save_parameter_state(self, filename):
+                    dist.barrier(group=self.data_parallel_group)
+                    if self.data_parallel_group.rank() == 0:
+                        torch.save({"value": self.parameter_value}, filename)
+
+                @staticmethod
+                def validate_parameter_state(filename, *, update_legacy_format=False):
+                    assert update_legacy_format is False
+                    state = torch.load(filename, map_location="cpu", weights_only=False)
+                    assert set(state) == {"value"}
+                    assert type(state["value"]) is int
+
+                def load_parameter_state(self, filename, *, update_legacy_format=False):
+                    assert update_legacy_format is False
+                    values = [
+                        (
+                            torch.load(filename, map_location="cpu", weights_only=False)
+                            if self.data_parallel_group.rank() == 0
+                            else None
+                        )
+                    ]
+                    dist.broadcast_object_list(
+                        values, src=0, group=self.data_parallel_group
+                    )
+                    self.parameter_value = values[0]["value"]
+                    self.parameter_load_calls += 1
+
+            source_model = nn.Linear(2, 2, bias=False)
+            source_optimizer = OwnerOnlyOptimizer(
+                source_model.parameters(), parameter_value=700
+            )
+            save_local(source_model, source_optimizer, 34, save_rng=False)
+            payload = torch.load(
+                dcp._local_checkpoint_file(checkpoint_path),
+                map_location="cpu",
+                weights_only=False,
+            )
+            parameter_state_path = (
+                checkpoint_root / payload["optimizer_parameter_state"]
+            )
+            assert parameter_state_path.exists() is (rank == 0)
+            dist.barrier()
+            sidecars = list(
+                checkpoint_root.glob(
+                    "training_state_rank_*.optimizer_parameter_state.*.pt"
+                )
+            )
+            assert len(sidecars) == 1
+            assert "rank_00000" in sidecars[0].name
+
+            previous_parameter_state_path = parameter_state_path
+            source_optimizer.parameter_value = 701
+            save_local(source_model, source_optimizer, 35, save_rng=False)
+            payload = torch.load(
+                dcp._local_checkpoint_file(checkpoint_path),
+                map_location="cpu",
+                weights_only=False,
+            )
+            parameter_state_path = (
+                checkpoint_root / payload["optimizer_parameter_state"]
+            )
+            assert parameter_state_path != previous_parameter_state_path
+            assert parameter_state_path.exists() is (rank == 0)
+            assert not previous_parameter_state_path.exists()
+            dist.barrier()
+            sidecars = list(
+                checkpoint_root.glob(
+                    "training_state_rank_*.optimizer_parameter_state.*.pt"
+                )
+            )
+            assert len(sidecars) == 1
+            assert "rank_00000" in sidecars[0].name
+            if rank == 0:
+                assert sidecars[0] == parameter_state_path
+
+            target_model = nn.Linear(2, 2, bias=False)
+            target_optimizer = OwnerOnlyOptimizer(
+                target_model.parameters(), parameter_value=-1
+            )
+            assert load_local(target_model, target_optimizer, load_rng=False) == 35
+            assert target_optimizer.parameter_value == 701
+            assert target_optimizer.parameter_load_calls == 1
+            _assert_nested_state_equal(
+                target_model.state_dict(), source_model.state_dict()
+            )
+
+        elif failure_mode == "load_relocated":
+            source_model = nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                source_model.weight.fill_(50.0 + rank)
+            save_local(source_model, None, 35, save_rng=False)
+            relocated_path = f"{checkpoint_path}-relocated"
+            relocated_root = Path(relocated_path)
+            if rank == 0:
+                checkpoint_root.rename(relocated_root)
+            dist.barrier()
+            transaction_roots.add(relocated_root)
+            target_model = nn.Linear(2, 2, bias=False)
+            assert (
+                load_local(target_model, None, load_path=relocated_path, load_rng=False)
+                == 35
+            )
+            _assert_nested_state_equal(
+                target_model.state_dict(), source_model.state_dict()
+            )
+
+        elif failure_mode == "load_topology_preflight":
+            save_local(model, None, 37, save_rng=False)
+            with torch.no_grad():
+                model.weight.fill_(230.0 + rank)
+            before = model.weight.detach().clone()
+            if rank == 1:
+                parallel_state.dp_rank = parallel_state.dp_size
+            try:
+                load_local(model, None, load_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError(
+                    "rank-local invalid load topology coordinate was ignored"
+                )
+            assert "local checkpoint load topology preflight failed" in message
+            assert "invalid local checkpoint rank coordinate" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode == "load_topology_mismatch":
+            save_local(model, None, 38, save_rng=False)
+            with torch.no_grad():
+                model.weight.fill_(240.0 + rank)
+            before = model.weight.detach().clone()
+            parallel_config.tp = 2
+            parallel_state.tp_size = 2
+            parallel_state.dp_size = 1
+            parallel_state.tp_rank = rank
+            parallel_state.dp_rank = 0
+            try:
+                load_local(model, None, load_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("changed local checkpoint topology was accepted")
+            assert "topology/rank coordinate does not match runtime" in message
+            torch.testing.assert_close(model.weight, before, atol=0.0, rtol=0.0)
+
+        elif failure_mode == "save_identity_step":
+            try:
+                save_local(model, None, 100 + rank, save_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("rank-divergent save steps were accepted")
+            assert "save identity differs across ranks" in message
+            assert not checkpoint_file.exists()
+
+        elif failure_mode == "save_identity_path":
+            rank_checkpoint_path = f"{checkpoint_path}-rank{rank}"
+            rank_checkpoint_root = Path(rank_checkpoint_path)
+            transaction_roots.add(rank_checkpoint_root)
+            rank_checkpoint_file = dcp._local_checkpoint_file(rank_checkpoint_path)
+            try:
+                save_local(
+                    model, None, 103, save_path=rank_checkpoint_path, save_rng=False
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("rank-divergent save paths were accepted")
+            assert "save identity differs across ranks" in message
+            assert not rank_checkpoint_file.exists()
+
+        elif failure_mode == "save_explicit_file_path":
+            explicit_path = f"{checkpoint_path}.pt"
+            try:
+                save_local(model, None, 104, save_path=explicit_path, save_rng=False)
+            except (RuntimeError, ValueError) as exc:
+                message = str(exc)
+            else:
+                raise AssertionError(
+                    "distributed explicit checkpoint file was accepted"
+                )
+            assert "explicit file path is unsafe" in message
+            assert not Path(explicit_path).exists()
+
+        elif failure_mode == "save_topology_preflight":
+            if rank == 1:
+                parallel_state.dp_rank = parallel_state.dp_size
+            try:
+                save_local(model, None, 105, save_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError(
+                    "rank-local invalid save topology coordinate was ignored"
+                )
+            assert "local checkpoint save topology preflight failed" in message
+            assert "invalid local checkpoint rank coordinate" in message
+            assert not checkpoint_file.exists()
+
+        elif failure_mode == "save_prepare":
+            if rank == 1:
+
+                def fail_atomic_save(_value, _path):
+                    raise OSError("rank-1 injected staging failure")
+
+                dcp._atomic_torch_save = fail_atomic_save
+            try:
+                save_local(model, None, 32, save_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("rank-local save preparation failure was ignored")
+            assert "local checkpoint save file materialization failed" in message
+            assert "rank-1 injected staging failure" in message
+
+        elif failure_mode == "save_commit":
+
+            class LocalStateOptimizer:
+                def __init__(self):
+                    self.value = 100 + rank
+
+                def state_dict(self):
+                    return {"value": self.value}
+
+                def save_parameter_state(self, filename):
+                    torch.save({"generation": "new", "rank": rank}, filename)
+
+            optimizer = LocalStateOptimizer()
+            parameter_state_file = dcp._local_optimizer_parameter_state_file(
+                checkpoint_file, generation="a" * 32
+            )
+            old_payload = local_payload(model, step=40)
+            old_payload["optimizer"] = optimizer.state_dict()
+            old_payload["optimizer_parameter_state"] = parameter_state_file.name
+            torch.save(old_payload, checkpoint_file)
+            torch.save({"generation": "old", "rank": rank}, parameter_state_file)
+            publish_completion(step=40)
+
+            def fail_rank1_commit(source, destination):
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if (
+                    rank == 1
+                    and destination_path == checkpoint_file
+                    and ".mlite-prepare-" in source_path.name
+                ):
+                    raise OSError("rank-1 injected commit failure")
+                return original_replace(source, destination)
+
+            dcp.os.replace = fail_rank1_commit
+            try:
+                save_local(model, optimizer, 41, save_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError("rank-local save commit failure was ignored")
+            finally:
+                dcp.os.replace = original_replace
+            assert "local checkpoint save commit failed" in message
+            assert "rank-1 injected commit failure" in message
+
+        elif failure_mode in {"save_payload_file_fsync", "save_payload_dir_fsync"}:
+            torch.save(local_payload(model, step=44), checkpoint_file)
+            publish_completion(step=44)
+            injected = False
+            directory_calls = 0
+
+            def fail_payload_file_fsync(path):
+                nonlocal injected
+                if rank == 1 and Path(path) == checkpoint_file and not injected:
+                    injected = True
+                    raise OSError("rank-1 injected payload file fsync failure")
+                return original_fsync_file(path)
+
+            def fail_payload_directory_fsync(path):
+                nonlocal directory_calls, injected
+                if rank == 1 and Path(path) == checkpoint_root:
+                    directory_calls += 1
+                    if directory_calls == 2 and not injected:
+                        injected = True
+                        raise OSError("rank-1 injected payload directory fsync failure")
+                return original_fsync_directory(path)
+
+            if failure_mode == "save_payload_file_fsync":
+                dcp._fsync_file = fail_payload_file_fsync
+            else:
+                dcp._fsync_directory = fail_payload_directory_fsync
+            try:
+                save_local(model, None, 45, save_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError(
+                    f"{failure_mode} did not abort local checkpoint save"
+                )
+            finally:
+                dcp._fsync_file = original_fsync_file
+                dcp._fsync_directory = original_fsync_directory
+            assert "local checkpoint save commit failed" in message
+            assert "rank-1 injected payload" in message
+
+        elif failure_mode in {"save_completion_backup", "save_completion_readback"}:
+            torch.save(local_payload(model, step=42), checkpoint_file)
+            publish_completion(step=42)
+
+            if failure_mode == "save_completion_backup":
+
+                def fail_marker_backup(destination):
+                    if rank == 0 and Path(
+                        destination
+                    ) == dcp._local_checkpoint_completion_path(checkpoint_path):
+                        raise OSError("rank-0 injected completion backup failure")
+                    return original_backup(destination)
+
+                dcp._backup_local_checkpoint_file = fail_marker_backup
+            else:
+
+                def fail_after_completion_readback(*args, **kwargs):
+                    result = original_read_completion(*args, **kwargs)
+                    if rank == 1:
+                        raise OSError("rank-1 injected completion readback failure")
+                    return result
+
+                dcp._read_local_checkpoint_completion_with_consensus = (
+                    fail_after_completion_readback
+                )
+
+            try:
+                save_local(model, None, 43, save_rng=False)
+            except RuntimeError as exc:
+                message = str(exc)
+            else:
+                raise AssertionError(
+                    f"{failure_mode} did not abort local checkpoint save"
+                )
+            finally:
+                dcp._backup_local_checkpoint_file = original_backup
+                dcp._read_local_checkpoint_completion_with_consensus = (
+                    original_read_completion
+                )
+            expected_context = (
+                "local checkpoint completion backup failed"
+                if failure_mode == "save_completion_backup"
+                else "local checkpoint completion readback failed"
+            )
+            assert expected_context in message
+        else:
+            raise AssertionError(f"unsupported failure mode: {failure_mode}")
+
+        messages: list[str | None] = [None, None]
+        dist.all_gather_object(messages, message)
+        assert messages[0] == messages[1]
+        dist.barrier()
+
+        if failure_mode == "save_prepare":
+            assert not checkpoint_file.exists()
+        elif failure_mode in {
+            "save_commit",
+            "save_payload_file_fsync",
+            "save_payload_dir_fsync",
+        }:
+            restored = torch.load(
+                checkpoint_file, map_location="cpu", weights_only=False
+            )
+            expected_step = 40 if failure_mode == "save_commit" else 44
+            assert restored["step"] == expected_step
+            if failure_mode == "save_commit":
+                restored_parameter_state = torch.load(
+                    parameter_state_file, map_location="cpu", weights_only=False
+                )
+                assert restored_parameter_state == {"generation": "old", "rank": rank}
+            completion = json.loads(
+                dcp._local_checkpoint_completion_path(checkpoint_path).read_text()
+            )
+            assert completion["step"] == expected_step
+            assert completion["generation"] == "a" * 32
+            if failure_mode == "save_commit":
+                sidecars = list(
+                    checkpoint_root.glob(
+                        f"{checkpoint_file.stem}.optimizer_parameter_state.*.pt"
+                    )
+                )
+                assert sidecars == [parameter_state_file]
+        elif failure_mode in {"save_completion_backup", "save_completion_readback"}:
+            restored = torch.load(
+                checkpoint_file, map_location="cpu", weights_only=False
+            )
+            assert restored["step"] == 42
+            completion = json.loads(
+                dcp._local_checkpoint_completion_path(checkpoint_path).read_text()
+            )
+            assert completion["step"] == 42
+            assert completion["generation"] == "a" * 32
+        for transaction_root in transaction_roots:
+            assert not list(transaction_root.glob(".*.mlite-*"))
+        dist.barrier()
+    finally:
+        dcp._atomic_torch_save = original_atomic_save
+        dcp._backup_local_checkpoint_file = original_backup
+        dcp._read_local_checkpoint_completion_with_consensus = original_read_completion
+        dcp.os.replace = original_replace
+        dcp._fsync_file = original_fsync_file
+        dcp._fsync_directory = original_fsync_directory
+        dist.destroy_process_group()
+
+
+def _gloo_extra_state_target_commit_failure_worker(rank: int, init_path: str) -> None:
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt import CheckpointLoadFatalError, dcp
 
     dist.init_process_group(
         "gloo",
@@ -42,10 +945,14 @@ def _gloo_extra_state_target_commit_failure_worker(rank: int, init_path: str) ->
             def snapshot(self):
                 return self.value
 
+            @staticmethod
+            def validate(state):
+                assert state["value"] == 99
+
             def apply(self, state):
                 self.apply_calls += 1
                 self.value = state["value"]
-                if self.apply_calls == 2 and rank == 1:
+                if self.apply_calls == 1 and rank == 1:
                     raise RuntimeError("rank-1 injected scheduler commit failure")
 
             def restore(self, snapshot):
@@ -60,7 +967,7 @@ def _gloo_extra_state_target_commit_failure_worker(rank: int, init_path: str) ->
         dcp._preflight_extra_state_targets(targets, values)
         assert target.value == rank + 10
 
-        with pytest.raises(RuntimeError, match="runtime must be poisoned"):
+        with pytest.raises(CheckpointLoadFatalError, match="runtime must be poisoned"):
             dcp._commit_extra_state_targets(targets, values)
         assert target.value == rank + 10
 
@@ -69,6 +976,231 @@ def _gloo_extra_state_target_commit_failure_worker(rank: int, init_path: str) ->
         assert restored == [10, 11]
         dist.barrier()
     finally:
+        dist.destroy_process_group()
+
+
+def _gloo_rng_preflight_rollback_failure_worker(rank: int, init_path: str) -> None:
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt import CheckpointLoadFatalError, dcp
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    original_state = copy.deepcopy(dcp._get_rng_state())
+    real_restore = dcp._restore_rng_state
+    try:
+        random.seed(700 + rank)
+        np.random.seed(700 + rank)
+        torch.manual_seed(700 + rank)
+        candidate = copy.deepcopy(dcp._get_rng_state())
+        real_restore(original_state)
+        restore_calls = 0
+
+        def fail_rank1_rollback(state):
+            nonlocal restore_calls
+            restore_calls += 1
+            if restore_calls == 2 and rank == 1:
+                random.seed(999)
+                raise RuntimeError("rank-1 injected RNG rollback failure")
+            real_restore(state)
+
+        dcp._restore_rng_state = fail_rank1_rollback
+        dcp._read_rng_sidecar = lambda *_args, **_kwargs: candidate
+        with pytest.raises(CheckpointLoadFatalError) as exc_info:
+            dcp._preload_checkpoint_sidecars(
+                "unused",
+                optimizer=None,
+                load_optimizer=False,
+                load_rng=True,
+                rng_required=True,
+                extra_state_files=(),
+                extra_state_validators={},
+                extra_state_targets={},
+                checkpoint_step=1,
+            )
+        message = str(exc_info.value)
+        assert "rank-1 injected RNG rollback failure" in message
+        messages: list[str | None] = [None, None]
+        dist.all_gather_object(messages, message)
+        assert messages[0] == messages[1]
+        dist.barrier()
+    finally:
+        dcp._restore_rng_state = real_restore
+        real_restore(original_state)
+        dist.destroy_process_group()
+
+
+def _gloo_extra_state_cross_target_mutation_worker(rank: int, init_path: str) -> None:
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt import CheckpointLoadFatalError, dcp
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    try:
+
+        class Target:
+            def __init__(self, value):
+                self.value = value
+
+            def validate(self, _state):
+                return None
+
+            def fingerprint(self):
+                return self.value
+
+        right = Target(2)
+        left = Target(1)
+        if rank == 1:
+            left.validate = lambda _state: setattr(right, "value", 99)
+
+        with pytest.raises(CheckpointLoadFatalError) as exc_info:
+            dcp._preflight_extra_state_targets(
+                {"a.pt": left, "b.pt": right},
+                {"a.pt": {"value": 11}, "b.pt": {"value": 22}},
+            )
+        message = str(exc_info.value)
+        assert "rank" not in message or "runtime must be poisoned" in message
+        assert "validate() mutated live target 'b.pt'" in message
+        messages: list[str | None] = [None, None]
+        dist.all_gather_object(messages, message)
+        assert messages[0] == messages[1]
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _gloo_extra_state_cross_target_apply_worker(rank: int, init_path: str) -> None:
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt import CheckpointLoadFatalError, dcp
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    try:
+
+        class Target:
+            def __init__(self, value):
+                self.value = value
+                self.other = None
+                self.cross_mutates = False
+
+            def validate(self, _state):
+                return None
+
+            def snapshot(self):
+                return self.value
+
+            def apply(self, state):
+                self.value = state["value"]
+                if self.cross_mutates:
+                    self.other.value = 999
+
+            def restore(self, snapshot):
+                self.value = snapshot
+
+            def fingerprint(self):
+                return self.value
+
+        left = Target(1)
+        right = Target(2)
+        right.other = left
+        right.cross_mutates = rank == 1
+        targets = {"a.pt": left, "b.pt": right}
+        values = {"a.pt": {"value": 11}, "b.pt": {"value": 22}}
+        dcp._preflight_extra_state_targets(targets, values)
+
+        with pytest.raises(CheckpointLoadFatalError) as exc_info:
+            dcp._commit_extra_state_targets(targets, values)
+        message = str(exc_info.value)
+        assert "apply() mutated target 'a.pt'" in message
+        assert (left.value, right.value) == (1, 2)
+        messages: list[str | None] = [None, None]
+        dist.all_gather_object(messages, message)
+        assert messages[0] == messages[1]
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _gloo_checkpoint_control_flow_worker(
+    rank: int, init_path: str, source_mutates: bool
+) -> None:
+    import megatron.lite.primitive.ckpt as ckpt
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt import CheckpointLoadFatalError
+    from megatron.lite.primitive.ckpt.errors import _raise_checkpoint_load_commit_error
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+    from megatron.lite.runtime.contracts.handle import ModelHandle
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_path}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=20),
+    )
+    original_load = ckpt.load_training_checkpoint
+    try:
+        model = nn.Linear(2, 2, bias=False)
+        handle = ModelHandle(model=model)
+        runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+        control_flow = KeyboardInterrupt("rank-1 checkpoint interruption")
+
+        def interrupted_load(target, *_args, **_kwargs):
+            local_exception = None
+            mutation_started = False
+            if rank == 1:
+                if source_mutates:
+                    with torch.no_grad():
+                        target.weight.fill_(19)
+                    mutation_started = True
+                local_exception = control_flow
+            _raise_checkpoint_load_commit_error(
+                local_exception,
+                mutation_started=mutation_started,
+                context="injected distributed checkpoint commit",
+            )
+            return 1
+
+        ckpt.load_training_checkpoint = interrupted_load
+        observed: BaseException | None = None
+        try:
+            runtime.load_checkpoint(
+                handle, "unused", use_dcp=True, load_optimizer=False, load_rng=False
+            )
+        except BaseException as exc:
+            observed = exc
+        assert observed is not None
+        if rank == 1:
+            assert observed is control_flow
+        else:
+            assert isinstance(observed, CheckpointLoadFatalError)
+            assert observed._peer_control_flow is True
+        assert handle.poisoned is True
+        with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+            runtime.zero_grad(handle)
+        results: list[tuple[str, bool] | None] = [None, None]
+        dist.all_gather_object(results, (type(observed).__name__, handle.poisoned))
+        assert results == [
+            ("CheckpointLoadFatalError", True),
+            ("KeyboardInterrupt", True),
+        ]
+        dist.barrier()
+    finally:
+        ckpt.load_training_checkpoint = original_load
         dist.destroy_process_group()
 
 
@@ -126,6 +1258,114 @@ def _gloo_checkpoint_reservation_failure_worker(
 @pytest.mark.skipif(
     not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
 )
+@pytest.mark.parametrize("mismatch", ["dtype", "shape"])
+def test_generic_dcp_rejects_model_metadata_mismatch_before_mutation(
+    tmp_path, mismatch
+):
+    init_path = str(tmp_path / f"gloo-dcp-metadata-{mismatch}-init")
+    checkpoint_path = str(tmp_path / f"checkpoint-{mismatch}")
+    ctx = mp.get_context("spawn")
+    process = ctx.Process(
+        target=_gloo_dcp_model_metadata_mismatch_worker,
+        args=(init_path, checkpoint_path, mismatch),
+    )
+    process.start()
+    process.join(timeout=30)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+        pytest.fail(f"generic DCP {mismatch} metadata preflight hung")
+    assert process.exitcode == 0
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
+@pytest.mark.parametrize("failure_mode", ["build_meshes", "placements"])
+def test_generic_dcp_asymmetric_preflight_failure_has_world_consensus(
+    tmp_path, failure_mode
+):
+    init_path = str(tmp_path / f"gloo-dcp-preflight-{failure_mode}-init")
+    checkpoint_path = str(tmp_path / f"checkpoint-{failure_mode}")
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_gloo_dcp_asymmetric_preflight_failure_worker,
+            args=(rank, init_path, checkpoint_path, failure_mode),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+    assert not alive, f"asymmetric DCP {failure_mode} preflight hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "load_missing_rank_file",
+        "load_legacy_v2_default",
+        "load_legacy_v2_opt_in",
+        "load_v3_missing_marker_allow",
+        "load_identity_step",
+        "load_identity_generation",
+        "load_completion_generation",
+        "load_identity_path",
+        "load_commit",
+        "parameter_state_owner",
+        "load_relocated",
+        "load_topology_preflight",
+        "load_topology_mismatch",
+        "save_identity_step",
+        "save_identity_path",
+        "save_explicit_file_path",
+        "save_topology_preflight",
+        "save_prepare",
+        "save_commit",
+        "save_payload_file_fsync",
+        "save_payload_dir_fsync",
+        "save_completion_backup",
+        "save_completion_readback",
+    ],
+)
+def test_local_checkpoint_rank_failure_has_world_consensus_and_no_partial_publish(
+    tmp_path, failure_mode
+):
+    init_path = str(tmp_path / f"gloo-local-{failure_mode}-init")
+    checkpoint_path = str(tmp_path / f"checkpoint-{failure_mode}")
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_gloo_local_checkpoint_consensus_worker,
+            args=(rank, init_path, checkpoint_path, failure_mode),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+    assert not alive, f"local checkpoint {failure_mode} consensus hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
 def test_extra_state_target_rank_failure_gloo_rolls_back_without_hang(tmp_path):
     init_path = str(tmp_path / "gloo-extra-state-target-init")
     ctx = mp.get_context("spawn")
@@ -146,6 +1386,154 @@ def test_extra_state_target_rank_failure_gloo_rolls_back_without_hang(tmp_path):
         process.join(timeout=5)
     assert not alive, "extra-state target commit consensus hung"
     assert [process.exitcode for process in processes] == [0, 0]
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
+def test_rng_preflight_rollback_failure_is_fatal_on_every_rank(tmp_path):
+    init_path = str(tmp_path / "gloo-rng-preflight-rollback-init")
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_gloo_rng_preflight_rollback_failure_worker, args=(rank, init_path)
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+    assert not alive, "RNG preflight fatal consensus hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
+def test_extra_state_cross_target_mutation_is_fatal_on_every_rank(tmp_path):
+    init_path = str(tmp_path / "gloo-extra-state-cross-target-mutation-init")
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_gloo_extra_state_cross_target_mutation_worker,
+            args=(rank, init_path),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+    assert not alive, "extra-state cross-target fatal consensus hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
+def test_extra_state_cross_target_apply_is_fatal_on_every_rank(tmp_path):
+    init_path = str(tmp_path / "gloo-extra-state-cross-target-apply-init")
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_gloo_extra_state_cross_target_apply_worker, args=(rank, init_path)
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+    assert not alive, "extra-state cross-target apply fatal consensus hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
+@pytest.mark.parametrize("source_mutates", [False, True], ids=["unknown", "mutated"])
+def test_checkpoint_control_flow_preserves_source_and_poisons_every_rank(
+    tmp_path, source_mutates
+):
+    init_path = str(tmp_path / "gloo-checkpoint-control-flow-init")
+    ctx = mp.get_context("spawn")
+    processes = [
+        ctx.Process(
+            target=_gloo_checkpoint_control_flow_worker,
+            args=(rank, init_path, source_mutates),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join(timeout=5)
+    assert not alive, "checkpoint control-flow fatal consensus hung"
+    assert [process.exitcode for process in processes] == [0, 0]
+
+
+def test_atomic_write_json_fsyncs_file_and_parent_directory(monkeypatch, tmp_path):
+    from megatron.lite.primitive.ckpt import dcp
+
+    fsync_targets: list[str] = []
+
+    def record_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        fsync_targets.append("directory" if stat.S_ISDIR(mode) else "file")
+
+    monkeypatch.setattr(dcp.os, "fsync", record_fsync)
+    target = tmp_path / "completion.json"
+    dcp._atomic_write_json(target, {"step": 1})
+
+    assert json.loads(target.read_text()) == {"step": 1}
+    assert fsync_targets == ["file", "directory"]
+
+
+def test_optimizer_parameter_state_save_fsyncs_payload_and_parent(
+    monkeypatch, tmp_path
+):
+    from megatron.lite.primitive.ckpt import dcp
+
+    events: list[tuple[str, str]] = []
+    real_fsync_file = dcp._fsync_file
+    real_fsync_directory = dcp._fsync_directory
+
+    def record_file(path):
+        events.append(("file", Path(path).name))
+        real_fsync_file(Path(path))
+
+    def record_directory(path):
+        events.append(("directory", str(path)))
+        real_fsync_directory(Path(path))
+
+    monkeypatch.setattr(dcp, "_fsync_file", record_file)
+    monkeypatch.setattr(dcp, "_fsync_directory", record_directory)
+    destination = tmp_path / "optimizer_parameter_state.pt"
+    dcp._atomic_save_optimizer_parameter_state(
+        lambda filename: torch.save({"state": 1}, filename), destination
+    )
+
+    assert destination.is_file()
+    assert [kind for kind, _path in events] == ["file", "file", "directory"]
+    assert events[1] == ("file", destination.name)
+    assert events[2] == ("directory", str(tmp_path))
 
 
 def test_hf_weight_mapping_import_is_independent_of_safetensors_io(monkeypatch):
@@ -564,10 +1952,13 @@ def test_dcp_model_metadata_rejects_unexpected_current_stage_tensor():
         RuntimeError, match=r"unexpected model tensors.*model_pp1\.removed_parameter"
     ):
         dcp._validate_dcp_model_metadata(
-            metadata_keys,
+            {key: object() for key in metadata_keys},
             model_prefix="model_pp1",
             parameter_items=parameters,
             buffer_items=[],
+            checkpoint_tensor_templates={
+                f"model_pp1.{name}": tensor for name, tensor in parameters
+            },
             require_schema=True,
         )
 
@@ -578,10 +1969,13 @@ def test_completed_dcp_model_metadata_requires_schema_key():
     model = nn.Linear(2, 2)
     with pytest.raises(RuntimeError, match="missing the required model schema key"):
         dcp._validate_dcp_model_metadata(
-            {"model.weight", "model.bias"},
+            {"model.weight": object(), "model.bias": object()},
             model_prefix="model",
             parameter_items=list(model.named_parameters()),
             buffer_items=[],
+            checkpoint_tensor_templates={
+                f"model.{name}": tensor for name, tensor in model.named_parameters()
+            },
             require_schema=True,
         )
 
@@ -592,10 +1986,23 @@ def test_requested_rank_local_optimizer_checkpoint_must_exist(tmp_path):
     optimizer = torch.optim.AdamW(nn.Linear(2, 2).parameters(), lr=0.01)
 
     with pytest.raises(
-        FileNotFoundError,
-        match="optimizer checkpoint requested by load_optimizer=True is missing",
+        RuntimeError,
+        match=(
+            "checkpoint sidecar preflight failed.*optimizer checkpoint requested "
+            "by load_optimizer=True is missing"
+        ),
     ):
-        dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
+        dcp._preload_checkpoint_sidecars(
+            str(tmp_path),
+            optimizer=optimizer,
+            load_optimizer=True,
+            load_rng=False,
+            rng_required=False,
+            extra_state_files=(),
+            extra_state_validators={},
+            extra_state_targets={},
+            checkpoint_step=None,
+        )
 
 
 def test_dcp_load_optimizer_request_requires_optimizer_object(tmp_path):
@@ -768,6 +2175,73 @@ def test_fp32_adamw_explicit_legacy_migration_upgrades_to_strict_v2():
     assert migrated["config"]["betas"] == optimizer.betas
     assert migrated["param_groups"][0]["options"]["weight_decay"] == 0.125
     optimizer.validate_state_dict(migrated)
+
+
+def test_local_v1_fp32_adamw_migrates_only_with_explicit_legacy_opt_in(tmp_path):
+    from megatron.lite.primitive.ckpt import (
+        load_training_checkpoint,
+        save_training_checkpoint,
+    )
+    from megatron.lite.primitive.optimizers.fsdp2.adamw import FP32AdamW
+
+    source_param, source_optimizer = _initialized_fp32_adamw()
+    source_model = nn.Module()
+    source_model.register_parameter("weight", source_param)
+    save_training_checkpoint(
+        source_model, source_optimizer, 17, str(tmp_path), use_dcp=False, save_rng=False
+    )
+
+    checkpoint_file = tmp_path / "training_state.pt"
+    payload = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+    payload["format"] = "megatron_lite.local_training.v1"
+    payload.pop("generation")
+    payload.pop("topology")
+    payload.pop("rank_coordinate")
+    payload["optimizer"] = _legacy_fp32_adamw_state(source_optimizer)
+    torch.save(payload, checkpoint_file)
+
+    target_model = nn.Module()
+    target_model.register_parameter(
+        "weight", nn.Parameter(torch.tensor([9.0, 10.0], dtype=torch.float32))
+    )
+    target_optimizer = FP32AdamW(
+        target_model.parameters(),
+        lr=source_optimizer.lr,
+        weight_decay=source_optimizer.weight_decay,
+        betas=source_optimizer.betas,
+        eps=source_optimizer.eps,
+    )
+    model_before = copy.deepcopy(target_model.state_dict())
+    optimizer_before = copy.deepcopy(target_optimizer.state_dict())
+
+    with pytest.raises(
+        RuntimeError, match="Legacy local checkpoints are rejected by default"
+    ):
+        load_training_checkpoint(
+            target_model, target_optimizer, str(tmp_path), use_dcp=False, load_rng=False
+        )
+    _assert_nested_state_equal(target_model.state_dict(), model_before)
+    _assert_nested_state_equal(target_optimizer.state_dict(), optimizer_before)
+
+    assert (
+        load_training_checkpoint(
+            target_model,
+            target_optimizer,
+            str(tmp_path),
+            use_dcp=False,
+            load_rng=False,
+            allow_legacy_checkpoint=True,
+        )
+        == 17
+    )
+    torch.testing.assert_close(
+        target_model.weight, source_model.weight, atol=0.0, rtol=0.0
+    )
+    migrated = target_optimizer.state_dict()
+    assert migrated["type"] == "fp32_adamw"
+    assert migrated["version"] == 2
+    assert migrated["step_count"] == source_optimizer.step_count
+    target_optimizer.validate_state_dict(migrated)
 
 
 @pytest.mark.parametrize("wrapper_kind", ["fsdp2", "chained"])
@@ -1364,11 +2838,14 @@ def test_partially_applied_rng_preflight_restores_every_rng(monkeypatch, tmp_pat
         lambda *_args, **_kwargs: pytest.fail("distckpt payload load must not run"),
     )
 
-    with pytest.raises(RuntimeError, match="RNG checkpoint is incompatible"):
+    with pytest.raises(
+        RuntimeError, match="RNG checkpoint is incompatible"
+    ) as exc_info:
         dcp.load_training_checkpoint(
             model, None, str(step), use_dcp=True, load_optimizer=False, load_rng=True
         )
 
+    assert not isinstance(exc_info.value, CheckpointLoadFatalError)
     restored = dcp._get_rng_state()
     assert restored["random_rng_state"] == rng_before["random_rng_state"]
     assert restored["np_rng_state"][0] == rng_before["np_rng_state"][0]
@@ -1380,6 +2857,75 @@ def test_partially_applied_rng_preflight_restores_every_rng(monkeypatch, tmp_pat
         restored["torch_rng_state"], rng_before["torch_rng_state"], atol=0, rtol=0
     )
     _assert_nested_state_equal(model.state_dict(), model_before)
+
+
+def test_fatal_consensus_prioritizes_mutating_rank_error(monkeypatch):
+    from megatron.lite.primitive.ckpt import errors
+
+    monkeypatch.setattr(errors.dist, "is_available", lambda: True)
+    monkeypatch.setattr(errors.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(errors.dist, "get_world_size", lambda: 2)
+
+    def gather_rank_records(records, _local_record):
+        records[:] = [
+            {
+                "mutation_started": False,
+                "error": "RuntimeError: rank-0 ordinary preflight failure",
+            },
+            {
+                "mutation_started": True,
+                "error": "CheckpointLoadFatalError: rank-1 RNG rollback fatal",
+            },
+        ]
+
+    monkeypatch.setattr(errors.dist, "all_gather_object", gather_rank_records)
+
+    with pytest.raises(CheckpointLoadFatalError) as exc_info:
+        errors._raise_checkpoint_load_commit_error(
+            RuntimeError("rank-0 ordinary preflight failure"),
+            mutation_started=False,
+            context="checkpoint sidecar preflight failed",
+        )
+
+    message = str(exc_info.value)
+    assert "rank-1 RNG rollback fatal" in message
+    assert "rank-0 ordinary preflight failure" not in message
+
+
+def test_fatal_consensus_prioritizes_control_flow_rank_error(monkeypatch):
+    from megatron.lite.primitive.ckpt import errors
+
+    monkeypatch.setattr(errors.dist, "is_available", lambda: True)
+    monkeypatch.setattr(errors.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(errors.dist, "get_world_size", lambda: 2)
+
+    def gather_rank_records(records, _local_record):
+        records[:] = [
+            {
+                "mutation_started": False,
+                "control_flow": False,
+                "error": "RuntimeError: rank-0 ordinary preflight failure",
+            },
+            {
+                "mutation_started": False,
+                "control_flow": True,
+                "error": "KeyboardInterrupt: rank-1 checkpoint interruption",
+            },
+        ]
+
+    monkeypatch.setattr(errors.dist, "all_gather_object", gather_rank_records)
+
+    with pytest.raises(CheckpointLoadFatalError) as exc_info:
+        errors._raise_checkpoint_load_commit_error(
+            RuntimeError("rank-0 ordinary preflight failure"),
+            mutation_started=False,
+            context="checkpoint sidecar preflight failed",
+        )
+
+    assert exc_info.value._peer_control_flow is True
+    message = str(exc_info.value)
+    assert "rank-1 checkpoint interruption" in message
+    assert "rank-0 ordinary preflight failure" not in message
 
 
 def test_rank0_extra_state_is_in_completion_manifest(monkeypatch, tmp_path):
@@ -1453,10 +2999,11 @@ def test_extra_state_validator_fails_before_distopt_payload(monkeypatch, tmp_pat
         if not isinstance(state.get("num_steps"), int):
             raise TypeError("num_steps must be int")
 
-    with pytest.raises(RuntimeError, match="num_steps must be int"):
-        dcp.load_training_checkpoint(
-            model,
-            None,
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    handle = ModelHandle(model=model)
+    with pytest.raises(RuntimeError, match="num_steps must be int") as exc_info:
+        runtime.load_checkpoint(
+            handle,
             str(step),
             use_dcp=True,
             load_optimizer=False,
@@ -1466,9 +3013,495 @@ def test_extra_state_validator_fails_before_distopt_payload(monkeypatch, tmp_pat
             extra_state_validators={"lr_scheduler.pt": validate_scheduler},
         )
 
+    assert not isinstance(exc_info.value, CheckpointLoadFatalError)
+    assert handle.poisoned is False
+    assert handle.poison_reason is None
+    runtime.zero_grad(handle)
+    assert len(list(runtime.export_weights(handle))) == 2
     _assert_nested_state_equal(model.state_dict(), model_before)
     assert loaded == {"existing": "preserve"}
     torch.testing.assert_close(torch.get_rng_state(), rng_before, atol=0, rtol=0)
+
+
+def test_extra_state_target_mutating_validate_is_fatal_and_poisoned(
+    monkeypatch, tmp_path
+):
+    from megatron.lite.primitive.ckpt import dcp
+
+    class MutatingTarget:
+        def __init__(self):
+            self.value = 3
+
+        def validate(self, _state):
+            self.value = 99
+
+        def snapshot(self):
+            return self.value
+
+        def apply(self, state):
+            self.value = state["num_steps"]
+
+        def restore(self, snapshot):
+            self.value = snapshot
+
+        def fingerprint(self):
+            return self.value
+
+    model = nn.Linear(2, 2)
+    handle = ModelHandle(model=model)
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    target = MutatingTarget()
+    step = tmp_path / "step_70"
+    _complete_manifest(
+        dcp, step, payload_format="distckpt", extra_state_files=("scheduler.pt",)
+    )
+    torch.save({"num_steps": 17}, step / "scheduler.pt")
+    monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: True)
+    monkeypatch.setattr(
+        dcp,
+        "_load_dist_opt_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail(
+            "core load must not run after mutating target validation"
+        ),
+    )
+
+    with pytest.raises(
+        CheckpointLoadFatalError, match=r"validate\(\) mutated live target"
+    ):
+        runtime.load_checkpoint(
+            handle,
+            str(step),
+            use_dcp=True,
+            load_optimizer=False,
+            load_rng=False,
+            load_extra_state_files=("scheduler.pt",),
+            loaded_extra_states={},
+            extra_state_targets={"scheduler.pt": target},
+        )
+
+    assert target.value == 99
+    assert handle.poisoned is True
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        runtime.zero_grad(handle)
+
+
+@pytest.mark.parametrize("mutation_source", ["validator", "validate_step", "validate"])
+def test_extra_state_target_cross_mutating_preflight_is_fatal_and_poisoned(
+    monkeypatch, tmp_path, mutation_source
+):
+    from megatron.lite.primitive.ckpt import dcp
+
+    class RightTarget:
+        def __init__(self):
+            self.value = 2
+
+        def validate(self, _state):
+            return None
+
+        def snapshot(self):
+            return self.value
+
+        def apply(self, state):
+            self.value = state["value"]
+
+        def restore(self, snapshot):
+            self.value = snapshot
+
+        def fingerprint(self):
+            return self.value
+
+    class LeftTarget(RightTarget):
+        def __init__(self, right):
+            super().__init__()
+            self.value = 1
+            self.right = right
+
+        def validate(self, _state):
+            if mutation_source == "validate":
+                self.right.value = 99
+
+        def validate_step(self, _state, _expected_step):
+            if mutation_source == "validate_step":
+                self.right.value = 99
+
+    right = RightTarget()
+    left = LeftTarget(right)
+    model = nn.Linear(2, 2)
+    handle = ModelHandle(model=model)
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    step = tmp_path / "step_701"
+    extra_filenames = ("a.pt", "b.pt")
+    _complete_manifest(
+        dcp, step, payload_format="distckpt", extra_state_files=extra_filenames
+    )
+    torch.save({"value": 11}, step / "a.pt")
+    torch.save({"value": 22}, step / "b.pt")
+    monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: True)
+    monkeypatch.setattr(
+        dcp,
+        "_load_dist_opt_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail(
+            "core load must not run after cross-target validation mutation"
+        ),
+    )
+
+    with pytest.raises(CheckpointLoadFatalError, match=r"mutated live target 'b.pt'"):
+        runtime.load_checkpoint(
+            handle,
+            str(step),
+            use_dcp=True,
+            load_optimizer=False,
+            load_rng=False,
+            load_extra_state_files=extra_filenames,
+            loaded_extra_states={},
+            extra_state_validators=(
+                {"a.pt": lambda _state: setattr(right, "value", 99)}
+                if mutation_source == "validator"
+                else None
+            ),
+            extra_state_targets={"a.pt": left, "b.pt": right},
+        )
+
+    assert left.value == 1
+    assert right.value == 99
+    assert handle.poisoned is True
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        runtime.zero_grad(handle)
+
+
+def test_extra_state_initial_fingerprint_failure_is_fatal_and_poisoned(
+    monkeypatch, tmp_path
+):
+    from megatron.lite.primitive.ckpt import dcp
+
+    class Target:
+        def __init__(self):
+            self.value = 3
+
+        def validate(self, _state):
+            return None
+
+        def snapshot(self):
+            return self.value
+
+        def apply(self, state):
+            self.value = state["value"]
+
+        def restore(self, snapshot):
+            self.value = snapshot
+
+        def fingerprint(self):
+            self.value = 33
+            raise RuntimeError("injected initial fingerprint failure")
+
+    target = Target()
+    model = nn.Linear(2, 2)
+    handle = ModelHandle(model=model)
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    step = tmp_path / "step_702"
+    _complete_manifest(
+        dcp, step, payload_format="distckpt", extra_state_files=("state.pt",)
+    )
+    torch.save({"value": 11}, step / "state.pt")
+    monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: True)
+    monkeypatch.setattr(
+        dcp,
+        "_load_dist_opt_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail(
+            "core load must not run after initial fingerprint failure"
+        ),
+    )
+
+    with pytest.raises(
+        CheckpointLoadFatalError, match="injected initial fingerprint failure"
+    ):
+        runtime.load_checkpoint(
+            handle,
+            str(step),
+            use_dcp=True,
+            load_optimizer=False,
+            load_rng=False,
+            load_extra_state_files=("state.pt",),
+            loaded_extra_states={},
+            extra_state_targets={"state.pt": target},
+        )
+
+    assert target.value == 33
+    assert handle.poisoned is True
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        runtime.zero_grad(handle)
+
+
+def test_extra_state_snapshot_failure_is_fatal_before_apply():
+    from megatron.lite.primitive.ckpt import dcp
+
+    class Target:
+        def __init__(self):
+            self.value = 4
+
+        def snapshot(self):
+            self.value = 44
+            raise RuntimeError("injected mutating snapshot failure")
+
+        def validate(self, _state):
+            return None
+
+        def apply(self, state):
+            self.value = state["value"]
+
+        def restore(self, snapshot):
+            self.value = snapshot
+
+        def fingerprint(self):
+            return self.value
+
+    target = Target()
+    with pytest.raises(
+        CheckpointLoadFatalError, match="injected mutating snapshot failure"
+    ):
+        dcp._commit_extra_state_targets(
+            {"state.pt": target}, {"state.pt": {"value": 11}}
+        )
+    assert target.value == 44
+
+
+def test_extra_state_cross_target_apply_is_fatal_and_rolls_back():
+    from megatron.lite.primitive.ckpt import dcp
+
+    class Target:
+        def __init__(self, value):
+            self.value = value
+            self.other = None
+            self.cross_mutates = False
+
+        def validate(self, _state):
+            return None
+
+        def snapshot(self):
+            return self.value
+
+        def apply(self, state):
+            self.value = state["value"]
+            if self.cross_mutates:
+                self.other.value = 999
+
+        def restore(self, snapshot):
+            self.value = snapshot
+
+        def fingerprint(self):
+            return self.value
+
+    left = Target(1)
+    right = Target(2)
+    right.other = left
+    right.cross_mutates = True
+    targets = {"a.pt": left, "b.pt": right}
+    values = {"a.pt": {"value": 11}, "b.pt": {"value": 22}}
+    dcp._preflight_extra_state_targets(targets, values)
+
+    with pytest.raises(
+        CheckpointLoadFatalError, match=r"apply\(\) mutated target 'a.pt'"
+    ):
+        dcp._commit_extra_state_targets(targets, values)
+
+    assert (left.value, right.value) == (1, 2)
+
+
+def test_export_iterator_rechecks_poison_before_every_yield():
+    model = nn.Linear(2, 2)
+    handle = ModelHandle(model=model)
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    exported = runtime.export_weights(handle)
+
+    assert next(exported)[0] == "weight"
+    handle._poison_after_checkpoint_load(CheckpointLoadFatalError("injected fatal"))
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        next(exported)
+
+
+def test_export_iterator_rechecks_poison_after_underlying_next():
+    model = nn.Linear(2, 2)
+    handle = ModelHandle(model=model)
+
+    class Proto:
+        @staticmethod
+        def export_hf_weights(*_args, **_kwargs):
+            handle._poison_after_checkpoint_load(
+                CheckpointLoadFatalError("fatal during exporter next")
+            )
+            yield "weight", model.weight
+
+    handle._extras["protocol"] = Proto()
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    exported = runtime.export_weights(handle)
+
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        next(exported)
+
+
+def test_generic_dcp_staging_load_failure_does_not_poison_handle(monkeypatch, tmp_path):
+    from megatron.lite.primitive.ckpt import dcp
+
+    model = nn.Linear(2, 2)
+    config = types.SimpleNamespace(tp=1, ep=1, etp=1, cp=1, pp=1)
+    parallel_state = types.SimpleNamespace(pp_size=1, pp_rank=0)
+    handle = ModelHandle(
+        model=model,
+        parallel_state=parallel_state,
+        config=types.SimpleNamespace(parallel=config),
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    monkeypatch.setattr(dcp, "_resolve_step_checkpoint_path", lambda path, **_: path)
+    monkeypatch.setattr(
+        dcp, "_validate_checkpoint_manifest", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
+    monkeypatch.setattr(
+        dcp, "_preload_checkpoint_sidecars", lambda *_args, **_kwargs: (None, None, {})
+    )
+    monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
+    monkeypatch.setattr(
+        dcp,
+        "_empty_dcp_tensor_like_param",
+        lambda tensor, _mesh, _placements: torch.empty_like(tensor),
+    )
+
+    class Reader:
+        @staticmethod
+        def read_metadata():
+            return types.SimpleNamespace(state_dict_metadata={})
+
+    monkeypatch.setattr(dcp.dcp, "FileSystemReader", lambda _path: Reader())
+    monkeypatch.setattr(
+        dcp, "_validate_dcp_model_metadata", lambda *_args, **_kwargs: (False, False)
+    )
+    monkeypatch.setattr(
+        dcp.dcp,
+        "load",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected staging-only DCP failure")
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="DCP staged checkpoint load failed.*staging-only"
+    ) as exc_info:
+        runtime.load_checkpoint(
+            handle,
+            str(tmp_path / "step_3"),
+            use_dcp=True,
+            load_optimizer=False,
+            load_rng=False,
+            allow_legacy_checkpoint=True,
+        )
+
+    assert not isinstance(exc_info.value, CheckpointLoadFatalError)
+    assert handle.poisoned is False
+    runtime.zero_grad(handle)
+
+
+@pytest.mark.parametrize("checkpoint_backend", ["local", "dcp"])
+@pytest.mark.parametrize(
+    "control_flow_type", [KeyboardInterrupt, SystemExit], ids=["interrupt", "exit"]
+)
+def test_runtime_checkpoint_control_flow_is_preserved_and_poisons_handle(
+    monkeypatch, tmp_path, checkpoint_backend, control_flow_type
+):
+    from megatron.lite.primitive.ckpt import dcp
+
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    target = nn.Linear(2, 2)
+    handle = ModelHandle(model=target)
+    control_flow = control_flow_type("injected checkpoint control flow")
+
+    if checkpoint_backend == "local":
+        source = nn.Linear(2, 2)
+        runtime.save_checkpoint(
+            ModelHandle(model=source), str(tmp_path), step=13, use_dcp=False
+        )
+
+        def interrupt_local_commit(chunk, _state, *, before_copy):
+            before_copy()
+            with torch.no_grad():
+                next(chunk.parameters()).fill_(17)
+            raise control_flow
+
+        monkeypatch.setattr(dcp, "_load_chunk_tensor_state", interrupt_local_commit)
+        load_kwargs = {"use_dcp": False}
+    else:
+        config = types.SimpleNamespace(tp=1, ep=1, etp=1, cp=1, pp=1)
+        parallel_state = types.SimpleNamespace(pp_size=1, pp_rank=0)
+        handle = ModelHandle(
+            model=target,
+            parallel_state=parallel_state,
+            config=types.SimpleNamespace(parallel=config),
+        )
+        monkeypatch.setattr(
+            dcp, "_resolve_step_checkpoint_path", lambda path, **_: path
+        )
+        monkeypatch.setattr(
+            dcp, "_validate_checkpoint_manifest", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
+        monkeypatch.setattr(
+            dcp,
+            "_preload_checkpoint_sidecars",
+            lambda *_args, **_kwargs: (None, None, {}),
+        )
+        monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
+        monkeypatch.setattr(
+            dcp,
+            "_empty_dcp_tensor_like_param",
+            lambda tensor, _mesh, _placements: torch.empty_like(tensor),
+        )
+
+        class Reader:
+            @staticmethod
+            def read_metadata():
+                return types.SimpleNamespace(state_dict_metadata={})
+
+        monkeypatch.setattr(dcp.dcp, "FileSystemReader", lambda _path: Reader())
+        monkeypatch.setattr(
+            dcp,
+            "_validate_dcp_model_metadata",
+            lambda *_args, **_kwargs: (False, False),
+        )
+
+        def load_staged_state(state_dict, *, checkpoint_id):
+            assert checkpoint_id == str(tmp_path)
+            state_dict["step"] = 13
+            for key, tensor in tuple(state_dict.items()):
+                if key.startswith("model."):
+                    state_dict[key] = torch.full_like(tensor, 17)
+
+        monkeypatch.setattr(dcp.dcp, "load", load_staged_state)
+
+        def interrupt_dcp_commit(destination, source, *, before_copy):
+            before_copy()
+            with torch.no_grad():
+                destination.copy_(source)
+            raise control_flow
+
+        monkeypatch.setattr(dcp, "_copy_tensor_", interrupt_dcp_commit)
+        load_kwargs = {
+            "use_dcp": True,
+            "load_optimizer": False,
+            "load_rng": False,
+            "allow_legacy_checkpoint": True,
+        }
+
+    with pytest.raises(control_flow_type) as exc_info:
+        runtime.load_checkpoint(handle, str(tmp_path), **load_kwargs)
+
+    assert exc_info.value is control_flow
+    assert handle.poisoned is True
+    assert control_flow_type.__name__ in (handle.poison_reason or "")
+    assert any(
+        torch.equal(parameter, torch.full_like(parameter, 17))
+        for parameter in target.parameters()
+    )
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        runtime.zero_grad(handle)
 
 
 def test_requested_extra_state_is_published_only_after_core_commit(
@@ -1484,6 +3517,10 @@ def test_requested_extra_state_is_published_only_after_core_commit(
 
         def snapshot(self):
             return self.value
+
+        @staticmethod
+        def validate(state):
+            assert isinstance(state["num_steps"], int)
 
         def apply(self, state):
             events.append("target_apply")
@@ -1537,8 +3574,6 @@ def test_requested_extra_state_is_published_only_after_core_commit(
     assert loaded == {"lr_scheduler.pt": {"num_steps": 17, "checkpoint_step": 71}}
     assert target.value == 17
     assert [event for event in events if isinstance(event, str)] == [
-        "target_apply",
-        "target_restore",
         "core",
         "target_apply",
     ]
@@ -1558,10 +3593,14 @@ def test_extra_state_target_commit_failure_rolls_back_target_and_poison_fails(
         def snapshot(self):
             return self.value
 
+        @staticmethod
+        def validate(state):
+            assert isinstance(state["num_steps"], int)
+
         def apply(self, state):
             self.apply_calls += 1
             self.value = state["num_steps"]
-            if self.apply_calls == 2:
+            if self.apply_calls == 1:
                 raise RuntimeError("injected target commit failure")
 
         def restore(self, snapshot):
@@ -1583,17 +3622,20 @@ def test_extra_state_target_commit_failure_rolls_back_target_and_poison_fails(
 
     def load_core(*_args, **_kwargs):
         core_called.append(True)
+        with torch.no_grad():
+            model.weight.fill_(72)
         return 72
 
     monkeypatch.setattr(dcp, "_load_dist_opt_checkpoint", load_core)
 
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    handle = ModelHandle(model=model)
     with pytest.raises(
-        RuntimeError,
+        CheckpointLoadFatalError,
         match=r"runtime must be poisoned: .*injected target commit failure",
     ):
-        dcp.load_training_checkpoint(
-            model,
-            None,
+        runtime.load_checkpoint(
+            handle,
             str(step),
             use_dcp=True,
             load_optimizer=False,
@@ -1604,8 +3646,152 @@ def test_extra_state_target_commit_failure_rolls_back_target_and_poison_fails(
         )
 
     assert core_called == [True]
+    assert handle.poisoned is True
+    assert "injected target commit failure" in (handle.poison_reason or "")
     assert target.value == 4
     assert loaded == {}
+    operations = {
+        "save_checkpoint": lambda: runtime.save_checkpoint(handle, str(tmp_path)),
+        "load_checkpoint": lambda: runtime.load_checkpoint(handle, str(step)),
+        "export_weights": lambda: runtime.export_weights(handle),
+        "to": lambda: runtime.to(handle, "cpu"),
+        "train_mode": lambda: runtime.train_mode(handle),
+        "eval_mode": lambda: runtime.eval_mode(handle),
+        "forward_backward": lambda: runtime.forward_backward(handle, [], None),
+        "is_mp_src_rank_with_outputs": lambda: runtime.is_mp_src_rank_with_outputs(
+            handle
+        ),
+        "zero_grad": lambda: runtime.zero_grad(handle),
+        "optimizer_step": lambda: runtime.optimizer_step(handle),
+        "lr_scheduler_step": lambda: runtime.lr_scheduler_step(handle),
+    }
+    for operation_name, operation in operations.items():
+        with pytest.raises(RuntimeError, match="ModelHandle is poisoned") as exc_info:
+            operation()
+        assert "discard it and build a fresh handle" in str(
+            exc_info.value
+        ), operation_name
+
+
+def test_generic_dcp_optimizer_failure_after_model_commit_poison_handle(
+    monkeypatch, tmp_path
+):
+    from megatron.lite.primitive.ckpt import dcp
+
+    class FailingOptimizer:
+        def __init__(self):
+            self.load_calls = 0
+
+        def load_state_dict(self, state):
+            assert state == {"optimizer": "staged"}
+            self.load_calls += 1
+            raise RuntimeError("injected generic optimizer sidecar failure")
+
+    model = nn.Linear(2, 2)
+    optimizer = FailingOptimizer()
+    config = types.SimpleNamespace(tp=1, ep=1, etp=1, cp=1, pp=1)
+    parallel_state = types.SimpleNamespace(pp_size=1, pp_rank=0)
+    handle = ModelHandle(
+        model=model,
+        optimizer=optimizer,
+        parallel_state=parallel_state,
+        config=types.SimpleNamespace(parallel=config),
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    monkeypatch.setattr(dcp, "_resolve_step_checkpoint_path", lambda path, **_: path)
+    monkeypatch.setattr(
+        dcp, "_validate_checkpoint_manifest", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: False)
+    monkeypatch.setattr(
+        dcp,
+        "_preload_checkpoint_sidecars",
+        lambda *_args, **_kwargs: ({"optimizer": "staged"}, None, {}),
+    )
+    monkeypatch.setattr(dcp, "_build_meshes", lambda _config: (object(), object()))
+    monkeypatch.setattr(
+        dcp,
+        "_empty_dcp_tensor_like_param",
+        lambda tensor, _mesh, _placements: torch.empty_like(tensor),
+    )
+
+    class Reader:
+        @staticmethod
+        def read_metadata():
+            return types.SimpleNamespace(state_dict_metadata={})
+
+    monkeypatch.setattr(dcp.dcp, "FileSystemReader", lambda _path: Reader())
+    monkeypatch.setattr(
+        dcp, "_validate_dcp_model_metadata", lambda *_args, **_kwargs: (False, False)
+    )
+
+    def load_staged_state(state_dict, *, checkpoint_id):
+        assert checkpoint_id == str(tmp_path / "step_9")
+        state_dict["step"] = 9
+        for key, tensor in tuple(state_dict.items()):
+            if key.startswith("model."):
+                state_dict[key] = torch.full_like(tensor, 9)
+
+    monkeypatch.setattr(dcp.dcp, "load", load_staged_state)
+
+    with pytest.raises(
+        CheckpointLoadFatalError,
+        match=(
+            "checkpoint optimizer sidecar commit failed after live-state mutation.*"
+            "injected generic optimizer sidecar failure"
+        ),
+    ):
+        runtime.load_checkpoint(
+            handle,
+            str(tmp_path / "step_9"),
+            use_dcp=True,
+            load_rng=False,
+            allow_legacy_checkpoint=True,
+        )
+
+    assert optimizer.load_calls == 1
+    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 9))
+    torch.testing.assert_close(model.bias, torch.full_like(model.bias, 9))
+    assert handle.poisoned is True
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        runtime.zero_grad(handle)
+
+
+def test_local_successful_commit_cleanup_failure_poison_handle(monkeypatch, tmp_path):
+    from megatron.lite.primitive.ckpt import dcp
+
+    source = nn.Linear(2, 2)
+    with torch.no_grad():
+        source.weight.fill_(21)
+        source.bias.fill_(-8)
+    dcp.save_training_checkpoint(
+        source, None, 17, str(tmp_path), use_dcp=False, save_rng=False
+    )
+
+    target = nn.Linear(2, 2)
+    handle = ModelHandle(model=target)
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    monkeypatch.setattr(
+        dcp,
+        "_cleanup_local_optimizer_parameter_state_staging",
+        lambda _path: OSError("injected post-commit staging cleanup failure"),
+    )
+
+    with pytest.raises(
+        CheckpointLoadFatalError,
+        match=(
+            "local checkpoint load staging cleanup failed after live-state mutation.*"
+            "injected post-commit staging cleanup failure"
+        ),
+    ):
+        runtime.load_checkpoint(handle, str(tmp_path), use_dcp=False, load_rng=False)
+
+    torch.testing.assert_close(target.weight, source.weight)
+    torch.testing.assert_close(target.bias, source.bias)
+    assert handle.poisoned is True
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        runtime.save_checkpoint(handle, str(tmp_path / "retry"), use_dcp=False)
 
 
 def test_extra_state_target_commit_runs_after_optimizer_and_rng():
@@ -1623,6 +3809,10 @@ def test_extra_state_target_commit_runs_after_optimizer_and_rng():
 
         def snapshot(self):
             return self.value
+
+        @staticmethod
+        def validate(state):
+            assert isinstance(state["num_steps"], int)
 
         def apply(self, state):
             events.append("target")
@@ -1910,7 +4100,8 @@ def test_runtime_checkpoint_uses_optimizer_state_dict_contract(tmp_path):
     assert runtime.load_checkpoint(loaded_handle, str(tmp_path), use_dcp=False) == 7
     assert loaded_optimizer.load_calls == 1
     assert loaded_optimizer.parameter_load_calls == 1
-    assert (tmp_path / "training_state.optimizer_parameter_state.pt").exists()
+    payload = torch.load(tmp_path / "training_state.pt", weights_only=False)
+    assert (tmp_path / payload["optimizer_parameter_state"]).exists()
     _assert_model_close(model, loaded_model)
 
 

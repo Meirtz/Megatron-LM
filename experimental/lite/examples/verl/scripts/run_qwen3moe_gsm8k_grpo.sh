@@ -81,7 +81,10 @@ ACTOR_CP="${ACTOR_CP:-1}"
 ACTOR_EP="${ACTOR_EP:-8}"
 ACTOR_ETP="${ACTOR_ETP:-1}"
 DTYPE="${DTYPE:-bfloat16}"
-MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-auto}"
+# This launcher must choose an inference-consumer keyspace before Python resolves
+# `model_name=auto` from the Hugging Face config. Keep the Qwen3.5 example
+# explicit and reject `auto` below instead of guessing from MODEL_PATH text.
+MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-qwen3_5}"
 MLITE_IMPL="${MLITE_IMPL:-lite}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # Optimizer backend:
@@ -122,6 +125,26 @@ EXTRA_ARGS=("$@")
 if [[ "${INFER_BACKEND}" != "vllm" && "${INFER_BACKEND}" != "sglang" && "${INFER_BACKEND}" != "trtllm" ]]; then
   echo "Unsupported INFER_BACKEND=${INFER_BACKEND}. Expected vllm, sglang, or trtllm." >&2
   exit 1
+fi
+
+if [[ "${MLITE_MODEL_NAME}" == "auto" ]]; then
+  echo "MLITE_MODEL_NAME=auto is not safe in this launcher: the weight-sync target must be selected before the model config is resolved, and MODEL_PATH text is not authoritative. Set MLITE_MODEL_NAME explicitly (for example, qwen3_5 or deepseek_v4)." >&2
+  exit 1
+fi
+
+if [[ "${INFER_BACKEND}" == "trtllm" && "${MLITE_MODEL_NAME}" == "qwen3_5" ]]; then
+  echo "Qwen3.5 TRT-LLM rollout is blocked for pinned VERL 1ff76cc625e9820d2434dad1b6d9b8e5dd26a359 + TensorRT-LLM v1.3.0rc19: live dynamic weight reload has not been validated end to end, and static mapper/key-normalization analysis is insufficient to claim readiness. Use INFER_BACKEND=vllm or sglang." >&2
+  exit 1
+fi
+
+# vLLM accepts either the released HF Qwen3.5 keyspace or its internal
+# language_model.model.* keyspace. SGLang consumes the released HF names. The
+# explicit non-Qwen3.5 compatibility routes retain HF names for every backend;
+# the engine's vLLM export implementation is Qwen3.5-specific.
+if [[ "${INFER_BACKEND}" == "vllm" && "${MLITE_MODEL_NAME}" == "qwen3_5" ]]; then
+  WEIGHT_SYNC_TARGET="vllm"
+else
+  WEIGHT_SYNC_TARGET="hf"
 fi
 
 case "${MLITE_OPTIMIZER_BACKEND}" in
@@ -219,6 +242,7 @@ ACTOR=(
   "actor_rollout_ref.actor.engine.optimizer_offload=${OPTIMIZER_OFFLOAD}"
   "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}"
   "actor_rollout_ref.actor.engine.attention_backend_override=${ATTENTION_BACKEND}"
+  "actor_rollout_ref.actor.engine.weight_sync_target=${WEIGHT_SYNC_TARGET}"
   "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True"
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 )
@@ -302,8 +326,10 @@ COMMAND=(
   "${ACTOR[@]}"
   "${ROLLOUT[@]}"
   "${TRAINER[@]}"
-  "${EXTRA_ARGS[@]}"
 )
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+  COMMAND+=("${EXTRA_ARGS[@]}")
+fi
 
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"
 printf '\n' >> "${CMD_FILE}"

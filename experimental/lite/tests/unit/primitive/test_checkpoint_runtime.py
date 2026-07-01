@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import random
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 from megatron.lite.primitive.ckpt import (
+    CheckpointLoadFatalError,
     load_training_checkpoint,
     save_training_checkpoint,
 )
@@ -68,6 +70,14 @@ def _assert_model_state_unchanged(model: nn.Module, before: dict[str, torch.Tens
     assert model.state_dict().keys() == before.keys()
     for name, tensor in model.state_dict().items():
         torch.testing.assert_close(tensor, before[name], atol=0.0, rtol=0.0)
+
+
+def _local_parameter_state_path(checkpoint_root: Path) -> Path:
+    checkpoint_file = checkpoint_root / "training_state.pt"
+    payload = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+    parameter_state_name = payload["optimizer_parameter_state"]
+    assert isinstance(parameter_state_name, str)
+    return checkpoint_root / parameter_state_name
 
 
 def test_runtime_local_checkpoint_load_matches_uninterrupted_training(tmp_path):
@@ -207,8 +217,30 @@ def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_pa
     assert loaded_optimizer.load_calls == 1
     assert loaded_optimizer.parameter_load_calls == 1
     assert loaded_optimizer.update_legacy_format is True
-    assert (tmp_path / "training_state.optimizer_parameter_state.pt").exists()
+    assert _local_parameter_state_path(tmp_path).exists()
     _assert_model_close(model, loaded_model)
+
+
+def test_local_checkpoint_gc_keeps_only_current_parameter_state_generation(tmp_path):
+    model = TinyMLP()
+    optimizer = DistOptLike(torch.optim.AdamW(model.parameters(), lr=1.0e-3))
+
+    save_training_checkpoint(
+        model, optimizer, 7, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    previous_path = _local_parameter_state_path(tmp_path)
+    assert previous_path.is_file()
+
+    save_training_checkpoint(
+        model, optimizer, 8, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    current_path = _local_parameter_state_path(tmp_path)
+    assert current_path != previous_path
+    assert current_path.is_file()
+    assert not previous_path.exists()
+    assert list(tmp_path.glob("training_state.optimizer_parameter_state.*.pt")) == [
+        current_path
+    ]
 
 
 def test_runtime_local_checkpoint_restores_rng_state(tmp_path):
@@ -242,31 +274,126 @@ def test_runtime_local_checkpoint_restores_rng_state(tmp_path):
     torch.testing.assert_close(torch.rand(4), expected_torch, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.parametrize("checkpoint_backend", ["local", "dcp"])
+@pytest.mark.parametrize("rollback_mode", ["raises", "silent_nonrestore"])
+def test_runtime_rng_preflight_rollback_failure_is_fatal_and_poisons_handle(
+    monkeypatch, tmp_path, checkpoint_backend, rollback_mode
+):
+    from megatron.lite.primitive.ckpt import dcp
+
+    model = TinyMLP()
+    handle = ModelHandle(model=model, optimizer=None)
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    original_rng_state = copy.deepcopy(dcp._get_rng_state())
+
+    random.seed(7101)
+    np.random.seed(7101)
+    torch.manual_seed(7101)
+    candidate_rng_state = copy.deepcopy(dcp._get_rng_state())
+
+    if checkpoint_backend == "local":
+        runtime.save_checkpoint(handle, str(tmp_path), step=12, use_dcp=False)
+        use_dcp = False
+    else:
+        use_dcp = True
+        monkeypatch.setattr(
+            dcp, "_resolve_step_checkpoint_path", lambda path, **_: path
+        )
+        monkeypatch.setattr(
+            dcp, "_validate_checkpoint_manifest", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr(dcp, "_supports_dist_opt_distckpt", lambda *_args: True)
+        monkeypatch.setattr(
+            dcp, "_read_rng_sidecar", lambda *_args, **_kwargs: candidate_rng_state
+        )
+        monkeypatch.setattr(
+            dcp,
+            "_load_dist_opt_checkpoint",
+            lambda *_args, **_kwargs: pytest.fail(
+                "DCP payload load must not run after fatal RNG preflight rollback"
+            ),
+        )
+
+    random.seed(8102)
+    np.random.seed(8102)
+    torch.manual_seed(8102)
+    real_restore_rng_state = dcp._restore_rng_state
+    restore_calls = 0
+
+    def fail_or_skip_preflight_rollback(state):
+        nonlocal restore_calls
+        restore_calls += 1
+        if restore_calls == 2:
+            random.seed(9103)
+            if rollback_mode == "raises":
+                raise RuntimeError("injected RNG preflight rollback failure")
+            return
+        real_restore_rng_state(state)
+
+    monkeypatch.setattr(dcp, "_restore_rng_state", fail_or_skip_preflight_rollback)
+    try:
+        with pytest.raises(CheckpointLoadFatalError) as exc_info:
+            runtime.load_checkpoint(
+                handle,
+                str(tmp_path),
+                use_dcp=use_dcp,
+                load_optimizer=(checkpoint_backend == "local"),
+                allow_legacy_checkpoint=(checkpoint_backend == "dcp"),
+            )
+
+        message = str(exc_info.value)
+        assert "runtime must be poisoned" in message
+        if rollback_mode == "raises":
+            assert "injected RNG preflight rollback failure" in message
+        else:
+            assert "restored state does not match the preflight snapshot" in message
+        assert restore_calls == 2
+        assert handle.poisoned is True
+        assert message in (handle.poison_reason or "")
+        with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+            runtime.zero_grad(handle)
+    finally:
+        real_restore_rng_state(original_rng_state)
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_gloo_available(), reason="Gloo is unavailable"
+)
 def test_runtime_local_checkpoint_uses_rank_specific_files_when_distributed(tmp_path):
     model = TinyMLP()
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-
-    with (
-        patch("megatron.lite.primitive.ckpt.dcp.dist.is_available", return_value=True),
-        patch(
-            "megatron.lite.primitive.ckpt.dcp.dist.is_initialized", return_value=True
-        ),
-        patch("megatron.lite.primitive.ckpt.dcp.dist.get_rank", return_value=3),
-    ):
-        runtime.save_checkpoint(
-            ModelHandle(model=model, optimizer=None),
-            str(tmp_path),
-            step=11,
-            use_dcp=False,
-        )
-        assert (tmp_path / "training_state_rank_00003.pt").exists()
+    parallel_state = SimpleNamespace(
+        tp_size=1,
+        etp_size=1,
+        ep_size=1,
+        pp_size=1,
+        cp_size=1,
+        dp_size=1,
+        expert_dp_size=1,
+        tp_rank=0,
+        etp_rank=0,
+        ep_rank=0,
+        pp_rank=0,
+        cp_rank=0,
+        dp_rank=0,
+        expert_dp_rank=0,
+    )
+    handle = ModelHandle(
+        model=model,
+        optimizer=None,
+        config=ParallelConfig(),
+        parallel_state=parallel_state,
+    )
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'gloo-init'}", rank=0, world_size=1
+    )
+    try:
+        runtime.save_checkpoint(handle, str(tmp_path), step=11, use_dcp=False)
+        assert (tmp_path / "training_state_rank_00000.pt").exists()
         assert not (tmp_path / "training_state.pt").exists()
-        assert (
-            runtime.load_checkpoint(
-                ModelHandle(model=model, optimizer=None), str(tmp_path), use_dcp=False
-            )
-            == 11
-        )
+        assert runtime.load_checkpoint(handle, str(tmp_path), use_dcp=False) == 11
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_primitive_local_checkpoint_keeps_optimizer_checkpoints_local(tmp_path):
@@ -288,8 +415,43 @@ def test_local_checkpoint_v2_excludes_nonpersistent_buffers(tmp_path):
     )
 
     state = torch.load(tmp_path / "training_state.pt", weights_only=False)
-    assert state["format"] == "megatron_lite.local_training.v2"
+    assert state["format"] == "megatron_lite.local_training.v3"
+    assert isinstance(state["generation"], str) and len(state["generation"]) == 32
     assert set(state["model"][0]) == {"param.weight", "buffer.persistent_scale"}
+
+
+def test_local_checkpoint_loads_standard_optimizer_from_read_only_directory(tmp_path):
+    source = TinyMLP()
+    source_optimizer = torch.optim.AdamW(source.parameters(), lr=1.0e-3)
+    _step(source, source_optimizer, torch.randn(2, 4), torch.randn(2, 2))
+    save_training_checkpoint(
+        source, source_optimizer, 12, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    relocated_path = tmp_path.with_name(f"{tmp_path.name}-relocated")
+    tmp_path.rename(relocated_path)
+    checkpoint_file = relocated_path / "training_state.pt"
+    directory_mode = relocated_path.stat().st_mode
+    file_mode = checkpoint_file.stat().st_mode
+    target = TinyMLP()
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1.0e-3)
+    try:
+        checkpoint_file.chmod(0o444)
+        relocated_path.chmod(0o555)
+        assert (
+            load_training_checkpoint(
+                target,
+                target_optimizer,
+                str(relocated_path),
+                use_dcp=False,
+                load_rng=False,
+            )
+            == 12
+        )
+    finally:
+        relocated_path.chmod(directory_mode)
+        checkpoint_file.chmod(file_mode)
+        relocated_path.rename(tmp_path)
+    _assert_model_close(target, source)
 
 
 def test_local_checkpoint_v2_preserves_different_nonpersistent_cache_on_load(tmp_path):
@@ -341,6 +503,49 @@ def test_local_checkpoint_v2_rejects_nonpersistent_buffer_before_mutation(tmp_pa
     torch.testing.assert_close(target.runtime_cache, cache_before, atol=0, rtol=0)
 
 
+def test_single_rank_local_v2_requires_explicit_migration_opt_in(tmp_path):
+    source = BufferedModule(cache_size=3)
+    with torch.no_grad():
+        source.weight.add_(10.0)
+        source.persistent_scale.add_(20.0)
+    save_training_checkpoint(
+        source, None, 14, str(tmp_path), use_dcp=False, save_rng=False
+    )
+    checkpoint_file = tmp_path / "training_state.pt"
+    state = torch.load(checkpoint_file, weights_only=False)
+    state["format"] = "megatron_lite.local_training.v2"
+    state.pop("generation")
+    state.pop("topology")
+    state.pop("rank_coordinate")
+    torch.save(state, checkpoint_file)
+
+    target = BufferedModule(cache_size=3)
+    before = copy.deepcopy(target.state_dict())
+    with pytest.raises(
+        RuntimeError, match="Legacy local checkpoints are rejected by default"
+    ):
+        load_training_checkpoint(
+            target, None, str(tmp_path), use_dcp=False, load_rng=False
+        )
+    _assert_model_state_unchanged(target, before)
+
+    assert (
+        load_training_checkpoint(
+            target,
+            None,
+            str(tmp_path),
+            use_dcp=False,
+            load_rng=False,
+            allow_legacy_checkpoint=True,
+        )
+        == 14
+    )
+    torch.testing.assert_close(target.weight, source.weight, atol=0, rtol=0)
+    torch.testing.assert_close(
+        target.persistent_scale, source.persistent_scale, atol=0, rtol=0
+    )
+
+
 def test_local_checkpoint_v1_ignores_matching_nonpersistent_buffer(tmp_path):
     source = BufferedModule(cache_size=3)
     with torch.no_grad():
@@ -352,6 +557,9 @@ def test_local_checkpoint_v1_ignores_matching_nonpersistent_buffer(tmp_path):
     checkpoint_file = tmp_path / "training_state.pt"
     state = torch.load(checkpoint_file, weights_only=False)
     state["format"] = "megatron_lite.local_training.v1"
+    state.pop("generation")
+    state.pop("topology")
+    state.pop("rank_coordinate")
     state["model"][0]["buffer.runtime_cache"] = torch.arange(11, dtype=torch.float64)
     torch.save(state, checkpoint_file)
 
@@ -362,7 +570,12 @@ def test_local_checkpoint_v1_ignores_matching_nonpersistent_buffer(tmp_path):
 
     assert (
         load_training_checkpoint(
-            target, None, str(tmp_path), use_dcp=False, load_rng=False
+            target,
+            None,
+            str(tmp_path),
+            use_dcp=False,
+            load_rng=False,
+            allow_legacy_checkpoint=True,
         )
         == 14
     )
@@ -383,6 +596,9 @@ def test_local_checkpoint_v1_rejects_nontensor_nonpersistent_buffer_before_mutat
     checkpoint_file = tmp_path / "training_state.pt"
     state = torch.load(checkpoint_file, weights_only=False)
     state["format"] = "megatron_lite.local_training.v1"
+    state.pop("generation")
+    state.pop("topology")
+    state.pop("rank_coordinate")
     state["model"][0]["buffer.runtime_cache"] = "not-a-tensor"
     torch.save(state, checkpoint_file)
 
@@ -391,7 +607,12 @@ def test_local_checkpoint_v1_rejects_nontensor_nonpersistent_buffer_before_mutat
     cache_before = target.runtime_cache.clone()
     with pytest.raises(TypeError, match="non-persistent buffer.*must be torch.Tensor"):
         load_training_checkpoint(
-            target, None, str(tmp_path), use_dcp=False, load_rng=False
+            target,
+            None,
+            str(tmp_path),
+            use_dcp=False,
+            load_rng=False,
+            allow_legacy_checkpoint=True,
         )
 
     _assert_model_state_unchanged(target, before)
@@ -406,6 +627,9 @@ def test_local_checkpoint_v1_rejects_unknown_buffer_before_mutation(tmp_path):
     checkpoint_file = tmp_path / "training_state.pt"
     state = torch.load(checkpoint_file, weights_only=False)
     state["format"] = "megatron_lite.local_training.v1"
+    state.pop("generation")
+    state.pop("topology")
+    state.pop("rank_coordinate")
     state["model"][0]["buffer.removed_cache"] = torch.ones(2)
     torch.save(state, checkpoint_file)
 
@@ -414,7 +638,12 @@ def test_local_checkpoint_v1_rejects_unknown_buffer_before_mutation(tmp_path):
     cache_before = target.runtime_cache.clone()
     with pytest.raises(RuntimeError, match="schema mismatch.*buffer.removed_cache"):
         load_training_checkpoint(
-            target, None, str(tmp_path), use_dcp=False, load_rng=False
+            target,
+            None,
+            str(tmp_path),
+            use_dcp=False,
+            load_rng=False,
+            allow_legacy_checkpoint=True,
         )
 
     _assert_model_state_unchanged(target, before)
@@ -606,7 +835,7 @@ def test_local_checkpoint_requires_parameter_state_file_before_model_copy(tmp_pa
     source = TinyMLP()
     source_optimizer = DistOptLike(torch.optim.AdamW(source.parameters(), lr=1.0e-3))
     save_training_checkpoint(source, source_optimizer, 19, str(tmp_path), use_dcp=False)
-    (tmp_path / "training_state.optimizer_parameter_state.pt").unlink()
+    _local_parameter_state_path(tmp_path).unlink()
 
     target = TinyMLP()
     target_optimizer = DistOptLike(torch.optim.AdamW(target.parameters(), lr=1.0e-3))
@@ -626,7 +855,7 @@ def test_local_checkpoint_rejects_corrupt_parameter_state_before_any_commit(tmp_
     source = TinyMLP()
     source_optimizer = DistOptLike(torch.optim.AdamW(source.parameters(), lr=1.0e-3))
     save_training_checkpoint(source, source_optimizer, 19, str(tmp_path), use_dcp=False)
-    parameter_state_path = tmp_path / "training_state.optimizer_parameter_state.pt"
+    parameter_state_path = _local_parameter_state_path(tmp_path)
     torch.save({"wrong": 1}, parameter_state_path)
 
     target = TinyMLP()

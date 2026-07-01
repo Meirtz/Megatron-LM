@@ -35,6 +35,24 @@ class _WrappedChunk(nn.Module):
         self.model = _BareChunk()
 
 
+class _UnitChunk(nn.Module):
+    def __init__(self, *units: nn.Module) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(units)
+        self.mtp = nn.ModuleList()
+
+
+class _MissingAttentionUnit(nn.Module):
+    def forward(self, value):
+        return value
+
+
+class _NonModuleAttentionUnit(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.self_attn = object()
+
+
 class _EmptyPipelineChunk(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -74,25 +92,20 @@ def test_activation_controls_wire_each_nonempty_chunk(monkeypatch) -> None:
 
     bare = _BareChunk()
     wrapped = _WrappedChunk()
-    recompute_calls = []
+    wrapped_modules = []
 
     monkeypatch.setattr(
-        protocol,
-        "apply_recompute",
-        lambda units, names, module_map: recompute_calls.append(
-            (list(units), list(names), module_map)
-        ),
+        protocol, "wrap_checkpoint", lambda module: wrapped_modules.append(module)
     )
 
     protocol._apply_activation_memory_controls(
         [bare, wrapped], recompute_spec=["core_attn"], offload_spec=[]
     )
 
-    assert [call[0] for call in recompute_calls] == [
-        protocol._iter_transformer_units(bare),
-        protocol._iter_transformer_units(wrapped),
+    assert wrapped_modules == [
+        *(unit.self_attn for unit in protocol._iter_transformer_units(bare)),
+        *(unit.self_attn for unit in protocol._iter_transformer_units(wrapped)),
     ]
-    assert [call[1] for call in recompute_calls] == [["core_attn"], ["core_attn"]]
 
 
 def test_activation_controls_really_wrap_bare_model_modules() -> None:
@@ -106,6 +119,111 @@ def test_activation_controls_really_wrap_bare_model_modules() -> None:
         unit.self_attn.forward.__name__
         for unit in protocol._iter_transformer_units(recomputed)
     } == {"_checkpointed_forward"}
+
+
+def test_activation_controls_same_chunk_late_malformed_is_transactional() -> None:
+    from megatron.lite.model.deepseek_v4.lite import protocol
+
+    valid = _Unit()
+    original_forward = valid.self_attn.forward
+    chunk = _UnitChunk(valid, _MissingAttentionUnit())
+
+    with pytest.raises(TypeError, match="could not resolve 'core_attn'.*unit 1"):
+        protocol._apply_activation_memory_controls(
+            [chunk], recompute_spec=["core_attn"], offload_spec=[]
+        )
+
+    assert valid.self_attn.forward == original_forward
+
+
+def test_activation_controls_cross_chunk_late_malformed_is_transactional() -> None:
+    from megatron.lite.model.deepseek_v4.lite import protocol
+
+    valid = _Unit()
+    original_forward = valid.self_attn.forward
+
+    with pytest.raises(TypeError, match="could not resolve 'core_attn'.*chunk 1"):
+        protocol._apply_activation_memory_controls(
+            [_UnitChunk(valid), _UnitChunk(_MissingAttentionUnit())],
+            recompute_spec=["core_attn"],
+            offload_spec=[],
+        )
+
+    assert valid.self_attn.forward == original_forward
+
+
+def test_activation_controls_reject_non_module_target_before_wrap() -> None:
+    from megatron.lite.model.deepseek_v4.lite import protocol
+
+    valid = _Unit()
+    original_forward = valid.self_attn.forward
+    with pytest.raises(TypeError, match="target must be an nn.Module.*object"):
+        protocol._apply_activation_memory_controls(
+            [_UnitChunk(valid, _NonModuleAttentionUnit())],
+            recompute_spec=["core_attn"],
+            offload_spec=[],
+        )
+    assert valid.self_attn.forward == original_forward
+
+
+def test_activation_controls_reject_alias_and_parent_child_overlap() -> None:
+    from megatron.lite.model.deepseek_v4.lite import protocol
+
+    aliased = _Unit()
+    aliased.input_layernorm = aliased.self_attn
+    original_alias_forward = aliased.self_attn.forward
+    with pytest.raises(ValueError, match="alias the same module"):
+        protocol._apply_activation_memory_controls(
+            [_UnitChunk(aliased)],
+            recompute_spec=["core_attn", "attn_norm"],
+            offload_spec=[],
+        )
+    assert aliased.self_attn.forward == original_alias_forward
+
+    nested = _Unit()
+    nested.self_attn = nn.Sequential(nested.input_layernorm)
+    original_parent_forward = nested.self_attn.forward
+    original_child_forward = nested.input_layernorm.forward
+    with pytest.raises(ValueError, match="overlap as parent and child"):
+        protocol._apply_activation_memory_controls(
+            [_UnitChunk(nested)],
+            recompute_spec=["core_attn", "attn_norm"],
+            offload_spec=[],
+        )
+    assert nested.self_attn.forward == original_parent_forward
+    assert nested.input_layernorm.forward == original_child_forward
+
+
+def test_activation_controls_roll_back_if_wrapper_application_fails(
+    monkeypatch,
+) -> None:
+    from megatron.lite.model.deepseek_v4.lite import protocol
+
+    first = _Unit()
+    second = _Unit()
+    original_first_forward = first.self_attn.forward
+    original_second_forward = second.self_attn.forward
+    assert "forward" not in first.self_attn.__dict__
+    assert "forward" not in second.self_attn.__dict__
+    calls = 0
+
+    def failing_wrapper(module) -> None:
+        nonlocal calls
+        calls += 1
+        module.forward = lambda value: value
+        if calls == 2:
+            raise RuntimeError("synthetic wrapper failure")
+
+    monkeypatch.setattr(protocol, "wrap_checkpoint", failing_wrapper)
+    with pytest.raises(RuntimeError, match="synthetic wrapper failure"):
+        protocol._apply_activation_memory_controls(
+            [_UnitChunk(first, second)], recompute_spec=["core_attn"], offload_spec=[]
+        )
+
+    assert first.self_attn.forward == original_first_forward
+    assert second.self_attn.forward == original_second_forward
+    assert "forward" not in first.self_attn.__dict__
+    assert "forward" not in second.self_attn.__dict__
 
 
 @pytest.mark.parametrize(
@@ -138,7 +256,7 @@ def test_activation_controls_fail_closed_for_malformed_or_invalid_empty_chunks(
     recompute_calls = []
     monkeypatch.setattr(
         protocol,
-        "apply_recompute",
+        "wrap_checkpoint",
         lambda *args, **kwargs: recompute_calls.append((args, kwargs)),
     )
     with pytest.raises(TypeError, match="expose a layers container"):
@@ -167,7 +285,7 @@ def test_activation_controls_allow_explicit_empty_pp_stage(monkeypatch) -> None:
 
     monkeypatch.setattr(
         protocol,
-        "apply_recompute",
+        "wrap_checkpoint",
         lambda *_args, **_kwargs: pytest.fail("empty PP stage must not be wrapped"),
     )
     protocol._apply_activation_memory_controls(

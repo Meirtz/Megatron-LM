@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from megatron.lite.runtime.contracts.config import RuntimeConfig
 
 if TYPE_CHECKING:
+    from megatron.lite.primitive.ckpt.errors import CheckpointLoadFatalError
     from megatron.lite.runtime.backends import Runtime
     from megatron.lite.runtime.backends.bridge.config import BridgeConfig
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -53,6 +54,7 @@ def __getattr__(name: str):
     _lazy = {
         "Batch": "megatron.lite.runtime.contracts.data",
         "BridgeConfig": "megatron.lite.runtime.backends.bridge.config",
+        "CheckpointLoadFatalError": "megatron.lite.primitive.ckpt.errors",
         "MegatronLiteConfig": "megatron.lite.runtime.backends.mlite.config",
         "ForwardResult": "megatron.lite.runtime.contracts.data",
         "ModelHandle": "megatron.lite.runtime.contracts.handle",
@@ -70,6 +72,7 @@ def __getattr__(name: str):
 __all__ = [
     "Batch",
     "BridgeConfig",
+    "CheckpointLoadFatalError",
     "ForwardResult",
     "MegatronLiteConfig",
     "ModelHandle",

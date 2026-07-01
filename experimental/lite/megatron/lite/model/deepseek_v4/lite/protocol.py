@@ -36,7 +36,7 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
-from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.recompute import parse_recompute_spec, wrap_checkpoint
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
 
@@ -431,6 +431,105 @@ def _is_valid_empty_pipeline_chunk(chunk: nn.Module) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _ActivationRecomputeTarget:
+    module: nn.Module
+    selector: str
+    chunk_index: int
+    unit_index: int
+
+    @property
+    def location(self) -> str:
+        return (
+            f"chunk {self.chunk_index}, unit {self.unit_index}, "
+            f"selector {self.selector!r}"
+        )
+
+
+def _plan_activation_recompute(
+    units_by_chunk: list[list[nn.Module]], recompute_spec: list[str]
+) -> list[_ActivationRecomputeTarget]:
+    """Resolve and validate every checkpoint target without mutating the model."""
+
+    plan: list[_ActivationRecomputeTarget] = []
+    for chunk_index, units in enumerate(units_by_chunk):
+        for unit_index, unit in enumerate(units):
+            if recompute_spec == ["full"]:
+                resolved = [("full", unit)]
+            else:
+                resolved = []
+                for selector in recompute_spec:
+                    try:
+                        target = MODULE_MAP[selector](unit)
+                    except (AttributeError, KeyError, TypeError) as exc:
+                        raise TypeError(
+                            "DeepSeek V4 activation recompute could not resolve "
+                            f"{selector!r} on chunk {chunk_index}, unit {unit_index}."
+                        ) from exc
+                    resolved.append((selector, target))
+
+            for selector, target in resolved:
+                if not isinstance(target, nn.Module):
+                    raise TypeError(
+                        "DeepSeek V4 activation recompute target must be an nn.Module; "
+                        f"chunk {chunk_index}, unit {unit_index}, selector "
+                        f"{selector!r} resolved to {type(target).__name__}."
+                    )
+                plan.append(
+                    _ActivationRecomputeTarget(
+                        module=target,
+                        selector=selector,
+                        chunk_index=chunk_index,
+                        unit_index=unit_index,
+                    )
+                )
+
+    target_by_id: dict[int, _ActivationRecomputeTarget] = {}
+    for target in plan:
+        previous = target_by_id.get(id(target.module))
+        if previous is not None:
+            raise ValueError(
+                "DeepSeek V4 activation recompute selectors alias the same module: "
+                f"{previous.location} and {target.location}."
+            )
+        target_by_id[id(target.module)] = target
+
+    for parent in plan:
+        for descendant in parent.module.modules():
+            if descendant is parent.module:
+                continue
+            child = target_by_id.get(id(descendant))
+            if child is not None:
+                raise ValueError(
+                    "DeepSeek V4 activation recompute targets overlap as parent and "
+                    f"child: {parent.location} contains {child.location}."
+                )
+    return plan
+
+
+def _apply_activation_recompute_plan(plan: list[_ActivationRecomputeTarget]) -> None:
+    """Apply a validated plan and restore prior forwards if wrapping fails."""
+
+    applied: list[tuple[nn.Module, bool, Any]] = []
+    try:
+        for target in plan:
+            had_instance_forward = "forward" in target.module.__dict__
+            original_instance_forward = target.module.__dict__.get("forward")
+            applied.append(
+                (target.module, had_instance_forward, original_instance_forward)
+            )
+            wrap_checkpoint(target.module)
+    except BaseException:
+        for module, had_instance_forward, original_instance_forward in reversed(
+            applied
+        ):
+            if had_instance_forward:
+                module.forward = original_instance_forward
+            else:
+                module.__dict__.pop("forward", None)
+        raise
+
+
 def _apply_activation_memory_controls(
     chunks: list[nn.Module], *, recompute_spec: list[str], offload_spec: list[str]
 ) -> None:
@@ -465,9 +564,8 @@ def _apply_activation_memory_controls(
             )
 
     if recompute_spec:
-        for units in units_by_chunk:
-            if units:
-                apply_recompute(units, recompute_spec, MODULE_MAP)
+        plan = _plan_activation_recompute(units_by_chunk, recompute_spec)
+        _apply_activation_recompute_plan(plan)
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:

@@ -14,14 +14,22 @@ import math
 import os
 import random
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.distributed.checkpoint as dcp  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
+from megatron.lite.primitive.ckpt.errors import (
+    CheckpointLoadFatalError,
+    _checkpoint_exception_started_mutation,
+    _is_control_flow_exception,
+    _mark_checkpoint_mutation,
+    _raise_checkpoint_load_commit_error,
+)
 from megatron.lite.primitive.ckpt.hf_weights import (
     _distributed_raise_if_error,
     named_persistent_buffers,
@@ -32,6 +40,9 @@ from megatron.lite.primitive.protocols import (
     PlacementFn,
     default_expert_classifier,
     default_placement_fn,
+)
+from torch.distributed.checkpoint.metadata import (  # pyright: ignore[reportMissingImports]
+    TensorStorageMetadata,
 )
 from torch.distributed.device_mesh import (  # pyright: ignore[reportMissingImports]
     DeviceMesh,
@@ -44,6 +55,46 @@ _CHECKPOINT_MANIFEST = "mlite_checkpoint_manifest.json"
 _CHECKPOINT_MANIFEST_FORMAT = "megatron_lite.training_checkpoint.v2"
 _LOCAL_TRAINING_FORMAT_V1 = "megatron_lite.local_training.v1"
 _LOCAL_TRAINING_FORMAT_V2 = "megatron_lite.local_training.v2"
+_LOCAL_TRAINING_FORMAT_V3 = "megatron_lite.local_training.v3"
+_LOCAL_TRAINING_COMPLETION = ".mlite_local_checkpoint_complete.json"
+
+
+class ExtraStateValidator(Protocol):
+    """Pure validation callback for a deserialized extra-state value.
+
+    Implementations must not mutate model, optimizer, RNG, another registered
+    target, or any other live runtime state, including when they raise.
+    """
+
+    def __call__(self, candidate: Any) -> None: ...
+
+
+class ExtraStateCheckpointTarget(Protocol):
+    """Transactional adapter for one live extra-state object.
+
+    ``validate()``, ``snapshot()``, and ``fingerprint()`` must be pure.
+    ``validate_step()`` is an optional pure extension with the same contract.
+    Only ``apply()`` and ``restore()`` may mutate live state. Registering an
+    adapter asserts this contract: in particular, no runtime probe can prove
+    that the *first* successful ``fingerprint()`` call did not silently mutate
+    state before establishing its baseline. Initial fingerprint exceptions are
+    therefore treated as fatal, while silent mutation by that first call is an
+    unsupported adapter contract violation.
+
+    Every callback is scoped to exactly one target and must not mutate another
+    registered target. Coupled state must be represented by one composite
+    target so snapshot/apply/restore remain atomic at this boundary.
+    """
+
+    def validate(self, candidate: Any) -> None: ...
+
+    def snapshot(self) -> Any: ...
+
+    def apply(self, candidate: Any) -> None: ...
+
+    def restore(self, snapshot: Any) -> None: ...
+
+    def fingerprint(self) -> Any: ...
 
 
 def save_training_checkpoint(
@@ -80,7 +131,9 @@ def save_training_checkpoint(
             )
         if extra_states:
             raise ValueError("extra_states are supported only for DCP checkpoints")
-        _save_local_training_checkpoint(model, optimizer, step, path, save_rng=save_rng)
+        _save_local_training_checkpoint(
+            model, optimizer, step, path, config=config, ps=ps, save_rng=save_rng
+        )
         return
     extra_states = _normalize_extra_states(extra_states)
     if save_optimizer and optimizer is None:
@@ -197,7 +250,14 @@ def load_training_checkpoint(
     extra_state_validators: Mapping[str, Callable[[Any], None]] | None = None,
     extra_state_targets: Mapping[str, Any] | None = None,
 ) -> int:
-    """Load training checkpoint with automatic resharding across different parallel configs."""
+    """Load a training checkpoint, resharding DCP payloads when required.
+
+    ``allow_legacy_checkpoint`` is a narrow, explicit migration escape hatch.
+    It admits local V1/V2 payloads and manifest-less DCP directories only so
+    they can be loaded once and immediately re-saved in the current format.
+    It never permits a torn V3 local checkpoint without its completion marker,
+    nor does it relax validation of a completed current-format checkpoint.
+    """
     if use_dcp is None:
         use_dcp = True
     if not use_dcp:
@@ -217,8 +277,11 @@ def load_training_checkpoint(
             model,
             optimizer,
             path,
+            config=config,
+            ps=ps,
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
+            allow_legacy_checkpoint=allow_legacy_checkpoint,
         )
     if load_optimizer and optimizer is None:
         raise ValueError(
@@ -329,17 +392,19 @@ def load_training_checkpoint(
             expected_step=expected_checkpoint_step,
             allow_legacy_checkpoint=(allow_legacy_checkpoint and manifest is None),
         )
-        local_error = None
+        local_exception: Exception | None = None
         if (
             expected_checkpoint_step is not None
             and int(step) != expected_checkpoint_step
         ):
-            local_error = (
+            local_exception = RuntimeError(
                 f"checkpoint payload step {step} does not match completion manifest "
                 f"step {expected_checkpoint_step}"
             )
-        _distributed_raise_if_error(
-            local_error, context="distckpt returned step validation failed"
+        core_mutation_started = _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=load_model or load_optimizer,
+            context="distckpt returned step validation failed",
         )
         _commit_preloaded_sidecars(
             optimizer=None,
@@ -348,6 +413,7 @@ def load_training_checkpoint(
             loaded_extra_states=loaded_extra_states,
             extra_state_values=extra_state_values,
             extra_state_targets=normalized_extra_state_targets,
+            prior_live_state_mutation=core_mutation_started,
         )
         log_rank0(f"Loaded dist_opt checkpoint from {path} at step {step}")
         return step
@@ -356,29 +422,65 @@ def load_training_checkpoint(
     parameter_items: list[tuple[str, torch.Tensor]] = []
     buffer_items: list[tuple[str, torch.Tensor]] = []
     checkpoint_tensor_items: list[tuple[str, torch.Tensor]] = []
+    checkpoint_tensor_templates: dict[str, torch.Tensor] = {}
 
     if load_model:
-        if config is None or ps is None:
-            raise ValueError("DCP model loading requires config and ParallelState.")
-        if not isinstance(model, nn.Module):
-            raise TypeError("DCP model loading currently expects a single nn.Module.")
-        dense_mesh, expert_mesh = _build_meshes(config)
-        # Same pp-aware keying as save (see save_training_checkpoint): per-stage
-        # disjoint keyspace so pp ranks don't read each other's colliding FQNs.
-        model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
-        parameter_items = list(model.named_parameters())
-        buffer_items = list(named_persistent_buffers(model))
-        checkpoint_tensor_items = parameter_items
-        metadata_keys: set[str] = set()
+        topology_identity: dict[str, int] | None = None
         local_error = None
         try:
+            if config is None or ps is None:
+                raise ValueError("DCP model loading requires config and ParallelState.")
+            if not isinstance(model, nn.Module):
+                raise TypeError(
+                    "DCP model loading currently expects a single nn.Module."
+                )
+            topology_identity = {
+                "tp": int(config.tp or 1),
+                "ep": int(config.ep or 1),
+                "etp": max(int(config.etp or 1), 1),
+                "cp": max(int(config.cp or 1), 1),
+                "pp": max(int(config.pp or 1), 1),
+                "ps_pp_size": int(ps.pp_size),
+            }
+        except Exception as exc:
+            local_error = f"{type(exc).__name__}: {exc}"
+        _distributed_raise_if_error(
+            local_error, context="DCP model topology preflight failed"
+        )
+        assert topology_identity is not None
+        _assert_world_consensus(
+            topology_identity, context="DCP model topology differs across ranks"
+        )
+
+        metadata_entries: Mapping[str, Any] = {}
+        local_error = None
+        try:
+            dense_mesh, expert_mesh = _build_meshes(config)
+            # Same pp-aware keying as save (see save_training_checkpoint): per-stage
+            # disjoint keyspace so pp ranks don't read each other's colliding FQNs.
+            model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
+            parameter_items = list(model.named_parameters())
+            buffer_items = list(named_persistent_buffers(model))
+            checkpoint_tensor_items = parameter_items
+            for name, tensor in [*parameter_items, *buffer_items]:
+                placements = get_placements(name)
+                mesh = expert_mesh if is_expert(name) else dense_mesh
+                checkpoint_tensor_templates[f"{model_prefix}.{name}"] = (
+                    _empty_dcp_tensor_like_param(tensor, mesh, placements)
+                )
             metadata = dcp.FileSystemReader(ckpt_path).read_metadata()
-            metadata_keys = set(metadata.state_dict_metadata)
+            metadata_entries = metadata.state_dict_metadata
+            if not isinstance(metadata_entries, Mapping):
+                raise TypeError(
+                    "DCP state_dict_metadata must be a mapping, got "
+                    f"{type(metadata_entries).__name__}"
+                )
             schema_present, include_buffers = _validate_dcp_model_metadata(
-                metadata_keys,
+                metadata_entries,
                 model_prefix=model_prefix,
                 parameter_items=parameter_items,
                 buffer_items=buffer_items,
+                checkpoint_tensor_templates=checkpoint_tensor_templates,
                 require_schema=manifest is not None,
             )
             if schema_present:
@@ -398,13 +500,17 @@ def load_training_checkpoint(
         )
 
         for name, tensor in checkpoint_tensor_items:
-            placements = get_placements(name)
-            mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
-                tensor, mesh, placements
-            )
+            key = f"{model_prefix}.{name}"
+            state_dict[key] = checkpoint_tensor_templates[key]
 
-    dcp.load(state_dict, checkpoint_id=ckpt_path)
+    local_error = None
+    try:
+        dcp.load(state_dict, checkpoint_id=ckpt_path)
+    except Exception as exc:
+        local_error = f"{type(exc).__name__}: {exc}"
+    _distributed_raise_if_error(
+        local_error, context="DCP staged checkpoint load failed"
+    )
 
     if load_model:
         local_error = None
@@ -428,18 +534,30 @@ def load_training_checkpoint(
     _distributed_raise_if_error(
         local_error, context="DCP checkpoint step validation failed"
     )
+    model_mutation_started = False
     if load_model:
-        local_error = None
+        local_exception = None
+
+        def mark_model_mutation_started() -> None:
+            nonlocal model_mutation_started
+            model_mutation_started = True
+
         try:
             for name, tensor in checkpoint_tensor_items:
                 key = f"{model_prefix}.{name}"
                 if key in state_dict:
                     with torch.no_grad():
-                        _copy_tensor_(tensor, state_dict[key])
-        except Exception as exc:
-            local_error = f"{type(exc).__name__}: {exc}"
-        _distributed_raise_if_error(
-            local_error, context="DCP staged model commit failed"
+                        _copy_tensor_(
+                            tensor,
+                            state_dict[key],
+                            before_copy=mark_model_mutation_started,
+                        )
+        except BaseException as exc:
+            local_exception = exc
+        model_mutation_started = _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=model_mutation_started,
+            context="DCP staged model commit failed",
         )
     _commit_preloaded_sidecars(
         optimizer=optimizer if load_optimizer else None,
@@ -448,6 +566,7 @@ def load_training_checkpoint(
         loaded_extra_states=loaded_extra_states,
         extra_state_values=extra_state_values,
         extra_state_targets=normalized_extra_state_targets,
+        prior_live_state_mutation=model_mutation_started,
     )
     log_rank0(f"Loaded training checkpoint from {path} at step {step}")
     return step
@@ -547,6 +666,31 @@ def _canonical_checkpoint_path(path: str | os.PathLike[str]) -> str:
     return os.path.abspath(os.path.normpath(os.fspath(path)))
 
 
+def _raise_checkpoint_phase_error(
+    local_exception: BaseException | None,
+    *,
+    context: str,
+    wrap_local_exception: bool = False,
+) -> None:
+    """Synchronize a phase, optionally adding context to local ordinary errors."""
+
+    if (
+        wrap_local_exception
+        and local_exception is not None
+        and isinstance(local_exception, Exception)
+        and not _checkpoint_exception_started_mutation(local_exception)
+        and (not dist.is_available() or not dist.is_initialized())
+    ):
+        raise RuntimeError(
+            f"{context}: {type(local_exception).__name__}: {local_exception}"
+        ) from local_exception
+    _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=_checkpoint_exception_started_mutation(local_exception),
+        context=context,
+    )
+
+
 def _gather_world_objects(value: Any) -> list[Any]:
     if not dist.is_available() or not dist.is_initialized():
         return [value]
@@ -619,13 +763,13 @@ def _normalize_extra_states(extra_states: Mapping[str, Any] | None) -> dict[str,
 
 
 def _normalize_extra_state_validators(
-    validators: Mapping[str, Callable[[Any], None]] | None, *, requested: Iterable[str]
-) -> dict[str, Callable[[Any], None]]:
+    validators: Mapping[str, ExtraStateValidator] | None, *, requested: Iterable[str]
+) -> dict[str, ExtraStateValidator]:
     if validators is None:
         return {}
     if not isinstance(validators, Mapping):
         raise TypeError("extra_state_validators must be a mapping")
-    normalized: dict[str, Callable[[Any], None]] = {}
+    normalized: dict[str, ExtraStateValidator] = {}
     for filename, validator in validators.items():
         filename = _validate_extra_state_filename(filename)
         if not callable(validator):
@@ -640,14 +784,16 @@ def _normalize_extra_state_validators(
 
 
 def _normalize_extra_state_targets(
-    targets: Mapping[str, Any] | None, *, requested: Iterable[str]
-) -> dict[str, Any]:
+    targets: Mapping[str, ExtraStateCheckpointTarget] | None,
+    *,
+    requested: Iterable[str],
+) -> dict[str, ExtraStateCheckpointTarget]:
     if targets is None:
         return {}
     if not isinstance(targets, Mapping):
         raise TypeError("extra_state_targets must be a mapping")
-    normalized: dict[str, Any] = {}
-    required_methods = ("snapshot", "apply", "restore", "fingerprint")
+    normalized: dict[str, ExtraStateCheckpointTarget] = {}
+    required_methods = ("validate", "snapshot", "apply", "restore", "fingerprint")
     for filename, target in targets.items():
         filename = _validate_extra_state_filename(filename)
         missing = [
@@ -672,6 +818,22 @@ def _checkpoint_world_size() -> int:
     return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
 
+def _fsync_file(path: Path) -> None:
+    file_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(file_fd)
+    finally:
+        os.close(file_fd)
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
@@ -682,6 +844,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)
+        _fsync_directory(path.parent)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
@@ -1148,14 +1311,22 @@ def _named_model_checkpoint_tensors(model: nn.Module):
 
 
 def _validate_dcp_model_metadata(
-    metadata_keys: set[str],
+    metadata_entries: Mapping[str, Any],
     *,
     model_prefix: str,
     parameter_items: list[tuple[str, torch.Tensor]],
     buffer_items: list[tuple[str, torch.Tensor]],
+    checkpoint_tensor_templates: Mapping[str, torch.Tensor],
     require_schema: bool,
 ) -> tuple[bool, bool]:
-    """Require an exact current-stage model schema before any DCP mutation."""
+    """Require an exact current-stage model schema before any DCP mutation.
+
+    PyTorch DCP loads into the dtype and shape of the provided tensor template.
+    Without checking the on-disk ``TensorStorageMetadata`` first, that behavior
+    silently casts checkpoint tensors (for example FP32 to BF16) instead of
+    enforcing an exact-resume contract.
+    """
+    metadata_keys = set(metadata_entries)
     parameter_keys = {f"{model_prefix}.{name}" for name, _tensor in parameter_items}
     buffer_keys = {f"{model_prefix}.{name}" for name, _tensor in buffer_items}
     expected_model_keys = parameter_keys | buffer_keys
@@ -1190,6 +1361,31 @@ def _validate_dcp_model_metadata(
         raise RuntimeError(
             "versioned checkpoint is missing persistent model buffers: "
             f"{sorted(buffer_keys - present_buffers)}"
+        )
+    metadata_errors: list[str] = []
+    for key in sorted(parameter_keys | present_buffers):
+        saved = metadata_entries[key]
+        expected = checkpoint_tensor_templates.get(key)
+        if expected is None:
+            metadata_errors.append(f"{key}: missing live tensor template")
+            continue
+        if not isinstance(saved, TensorStorageMetadata):
+            metadata_errors.append(
+                f"{key}: expected TensorStorageMetadata, got {type(saved).__name__}"
+            )
+            continue
+        saved_shape = tuple(saved.size)
+        expected_shape = tuple(expected.shape)
+        if saved_shape != expected_shape:
+            metadata_errors.append(
+                f"{key}: global_shape {saved_shape} != {expected_shape}"
+            )
+        saved_dtype = saved.properties.dtype
+        if saved_dtype != expected.dtype:
+            metadata_errors.append(f"{key}: dtype {saved_dtype} != {expected.dtype}")
+    if metadata_errors:
+        raise RuntimeError(
+            f"checkpoint model tensor metadata mismatch: {metadata_errors}"
         )
     return schema_present, not buffer_keys or present_buffers == buffer_keys
 
@@ -1249,7 +1445,10 @@ def _atomic_torch_save(value: Any, path: str | os.PathLike[str]) -> None:
     tmp_path = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
     try:
         torch.save(value, tmp_path)
+        _fsync_file(tmp_path)
         os.replace(tmp_path, destination)
+        _fsync_file(destination)
+        _fsync_directory(destination.parent)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
@@ -1782,12 +1981,6 @@ def _validate_torch_optimizer_option_value(
         )
 
 
-def _load_optimizer_checkpoint(optimizer, path: str) -> None:
-    state = _read_optimizer_checkpoint(optimizer, path)
-    _preflight_optimizer_checkpoint_state(optimizer, state)
-    _apply_optimizer_checkpoint_state(optimizer, state)
-
-
 def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
     if isinstance(model, nn.Module):
         return [model]
@@ -1847,11 +2040,18 @@ def _dtensor_from_dtensor_like_param(
     )
 
 
-def _copy_tensor_(target: torch.Tensor, src: torch.Tensor) -> None:
+def _copy_tensor_(
+    target: torch.Tensor,
+    src: torch.Tensor,
+    *,
+    before_copy: Callable[[], None] | None = None,
+) -> None:
     local_target = _to_local_tensor(target)
     local_src = _to_local_tensor(src).to(
         device=local_target.device, dtype=local_target.dtype
     )
+    if before_copy is not None:
+        before_copy()
     if isinstance(local_target, torch.Tensor) and local_target is not target:
         local_target.copy_(local_src)
     else:
@@ -1938,7 +2138,12 @@ def _preflight_chunk_tensor_state(
     return tuple(sorted(ignored_legacy_keys))
 
 
-def _load_chunk_tensor_state(module: nn.Module, state: dict[str, torch.Tensor]) -> None:
+def _load_chunk_tensor_state(
+    module: nn.Module,
+    state: dict[str, torch.Tensor],
+    *,
+    before_copy: Callable[[], None] | None = None,
+) -> None:
     targets = {
         **{f"param.{name}": tensor for name, tensor in module.named_parameters()},
         **{
@@ -1948,11 +2153,20 @@ def _load_chunk_tensor_state(module: nn.Module, state: dict[str, torch.Tensor]) 
     }
     for key, target in targets.items():
         with torch.no_grad():
-            _copy_tensor_(target, state[key])
+            _copy_tensor_(target, state[key], before_copy=before_copy)
 
 
 def _local_checkpoint_file(path: str | os.PathLike[str]) -> Path:
     ckpt_path = Path(path)
+    if (
+        _is_distributed_checkpoint_ranked()
+        and not ckpt_path.is_dir()
+        and ckpt_path.suffix != ""
+    ):
+        raise ValueError(
+            "Distributed local checkpoints require a directory path so every "
+            f"rank receives a distinct file; explicit file path is unsafe: {ckpt_path}"
+        )
     if ckpt_path.is_dir() or ckpt_path.suffix == "":
         if _is_distributed_checkpoint_ranked():
             return ckpt_path / f"training_state_{_rank_suffix()}.pt"
@@ -1960,10 +2174,308 @@ def _local_checkpoint_file(path: str | os.PathLike[str]) -> Path:
     return ckpt_path
 
 
-def _local_optimizer_parameter_state_file(ckpt_file: Path) -> Path:
-    return ckpt_file.with_name(
-        f"{ckpt_file.stem}.optimizer_parameter_state{ckpt_file.suffix}"
+def _local_checkpoint_parallel_identity(
+    config, ps: ParallelState | None
+) -> tuple[dict[str, Any] | None, dict[str, int] | None]:
+    if config is None or ps is None:
+        if _is_distributed_checkpoint_ranked():
+            raise ValueError(
+                "Distributed local checkpoints require ParallelConfig and "
+                "ParallelState to bind each rank shard to its topology."
+            )
+        return None, None
+
+    world_size = _checkpoint_world_size()
+    tp = int(getattr(config, "tp", 1) or 1)
+    etp = max(int(getattr(config, "etp", 1) or 1), 1)
+    ep = int(getattr(config, "ep", 1) or 1)
+    pp = max(int(getattr(config, "pp", 1) or 1), 1)
+    vpp = max(int(getattr(config, "vpp", 1) or 1), 1)
+    cp = max(int(getattr(config, "cp", 1) or 1), 1)
+    if world_size % (tp * cp * pp) != 0 or world_size % (etp * ep * pp) != 0:
+        raise RuntimeError(
+            "local checkpoint parallel topology does not divide world size: "
+            f"world={world_size}, tp={tp}, etp={etp}, ep={ep}, pp={pp}, cp={cp}"
+        )
+    dense_dp = world_size // (tp * cp * pp)
+    expert_dp = world_size // (etp * ep * pp)
+    expected_sizes = {
+        "tp_size": tp,
+        "etp_size": etp,
+        "ep_size": ep,
+        "pp_size": pp,
+        "cp_size": cp,
+        "dp_size": dense_dp,
+        "expert_dp_size": expert_dp,
+    }
+    actual_sizes = {name: int(getattr(ps, name)) for name in expected_sizes}
+    if actual_sizes != expected_sizes:
+        raise RuntimeError(
+            "ParallelState sizes do not match local checkpoint config: "
+            f"expected={expected_sizes}, actual={actual_sizes}"
+        )
+    pp_layout = getattr(config, "pp_layout", None)
+    pp_layout_json = (
+        None
+        if pp_layout is None
+        else json.dumps(pp_layout, sort_keys=True, separators=(",", ":"))
     )
+    topology: dict[str, Any] = {
+        "world_size": world_size,
+        "tp": tp,
+        "etp": etp,
+        "ep": ep,
+        "pp": pp,
+        "vpp": vpp,
+        "cp": cp,
+        "dp": dense_dp,
+        "expert_dp": expert_dp,
+        "pp_layout": pp_layout_json,
+    }
+    coordinate = {
+        "global_rank": dist.get_rank() if _is_distributed_checkpoint_ranked() else 0,
+        "tp_rank": int(ps.tp_rank),
+        "etp_rank": int(ps.etp_rank),
+        "ep_rank": int(ps.ep_rank),
+        "pp_rank": int(ps.pp_rank),
+        "cp_rank": int(ps.cp_rank),
+        "dp_rank": int(ps.dp_rank),
+        "expert_dp_rank": int(ps.expert_dp_rank),
+    }
+    bounds = {
+        "global_rank": world_size,
+        "tp_rank": tp,
+        "etp_rank": etp,
+        "ep_rank": ep,
+        "pp_rank": pp,
+        "cp_rank": cp,
+        "dp_rank": dense_dp,
+        "expert_dp_rank": expert_dp,
+    }
+    invalid = {
+        name: value
+        for name, value in coordinate.items()
+        if value < 0 or value >= bounds[name]
+    }
+    if invalid:
+        raise RuntimeError(f"invalid local checkpoint rank coordinate: {invalid}")
+    return topology, coordinate
+
+
+def _new_local_checkpoint_generation() -> str:
+    generation: str | None = os.urandom(16).hex()
+    if dist.is_available() and dist.is_initialized():
+        values: list[str | None] = [generation if dist.get_rank() == 0 else None]
+        dist.broadcast_object_list(values, src=0)
+        generation = values[0]
+    if (
+        not isinstance(generation, str)
+        or len(generation) != 32
+        or any(character not in "0123456789abcdef" for character in generation)
+    ):
+        raise RuntimeError(f"invalid local checkpoint generation: {generation!r}")
+    return generation
+
+
+def _local_checkpoint_completion_path(path: str | os.PathLike[str]) -> Path:
+    return Path(path) / _LOCAL_TRAINING_COMPLETION
+
+
+def _local_checkpoint_completion_payload(
+    *, step: int, generation: str, topology: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "format": _LOCAL_TRAINING_FORMAT_V3,
+        "step": step,
+        "generation": generation,
+        "world_size": _checkpoint_world_size(),
+        "topology": dict(topology),
+    }
+
+
+def _read_local_checkpoint_completion_with_consensus(
+    path: str | os.PathLike[str], *, allow_missing: bool = False
+) -> dict[str, Any] | None:
+    if not _is_distributed_checkpoint_ranked():
+        return None
+    marker_path = _local_checkpoint_completion_path(path)
+    marker_present = marker_path.is_file()
+    _assert_world_consensus(
+        marker_present,
+        context="local checkpoint completion presence differs across ranks",
+    )
+    if not marker_present and allow_missing:
+        log_rank0(
+            "Loading a distributed local checkpoint without a V3 completion marker "
+            "through explicit allow_legacy_checkpoint migration mode."
+        )
+        return None
+    marker: dict[str, Any] | None = None
+    local_exception: Exception | None = None
+    try:
+        parsed = json.loads(marker_path.read_text())
+        if not isinstance(parsed, dict):
+            raise TypeError("local checkpoint completion marker must be a dictionary")
+        expected_keys = {"format", "step", "generation", "world_size", "topology"}
+        if set(parsed) != expected_keys:
+            raise RuntimeError(
+                "local checkpoint completion marker schema mismatch: "
+                f"missing={sorted(expected_keys - set(parsed))}, "
+                f"unexpected={sorted(set(parsed) - expected_keys)}"
+            )
+        if parsed["format"] != _LOCAL_TRAINING_FORMAT_V3:
+            raise RuntimeError("unsupported local checkpoint completion format")
+        if type(parsed["step"]) is not int or parsed["step"] < 0:
+            raise RuntimeError("invalid local checkpoint completion step")
+        generation = parsed["generation"]
+        if (
+            not isinstance(generation, str)
+            or len(generation) != 32
+            or any(character not in "0123456789abcdef" for character in generation)
+        ):
+            raise RuntimeError("invalid local checkpoint completion generation")
+        if parsed["world_size"] != _checkpoint_world_size():
+            raise RuntimeError(
+                "local checkpoint completion world size mismatch: "
+                f"saved={parsed['world_size']}, current={_checkpoint_world_size()}"
+            )
+        if not isinstance(parsed["topology"], dict):
+            raise RuntimeError("invalid local checkpoint completion topology")
+        marker = parsed
+    except Exception as exc:
+        local_exception = exc
+    _raise_checkpoint_phase_error(
+        local_exception, context="local checkpoint completion validation failed"
+    )
+    assert marker is not None
+    _assert_world_consensus(
+        marker, context="local checkpoint completion differs across ranks"
+    )
+    return marker
+
+
+def _local_optimizer_parameter_state_file(
+    ckpt_file: Path, *, generation: str | None = None
+) -> Path:
+    generation_suffix = f".{generation}" if generation is not None else ""
+    return ckpt_file.with_name(
+        f"{ckpt_file.stem}.optimizer_parameter_state"
+        f"{generation_suffix}{ckpt_file.suffix}"
+    )
+
+
+def _generation_scoped_optimizer_parameter_state_files(
+    ckpt_file: Path,
+) -> tuple[Path, ...]:
+    """Return generation sidecars scoped to one rank-local checkpoint file."""
+
+    prefix = f"{ckpt_file.stem}.optimizer_parameter_state."
+    suffix = ckpt_file.suffix
+    candidates: list[Path] = []
+    for candidate in ckpt_file.parent.glob(f"{prefix}*{suffix}"):
+        name = candidate.name
+        generation = name[len(prefix) :]
+        if suffix:
+            generation = generation[: -len(suffix)]
+        if len(generation) == 32 and all(
+            character in "0123456789abcdef" for character in generation
+        ):
+            candidates.append(candidate)
+    return tuple(sorted(candidates))
+
+
+def _garbage_collect_optimizer_parameter_state_files(
+    candidates: Iterable[Path], *, keep: Path | None
+) -> None:
+    deleted_parents: set[Path] = set()
+    for candidate in candidates:
+        if keep is not None and candidate == keep:
+            continue
+        if candidate.is_symlink() or (candidate.exists() and not candidate.is_file()):
+            raise RuntimeError(
+                "optimizer parameter-state garbage-collection target must be a "
+                f"regular file: {candidate}"
+            )
+        if candidate.exists():
+            candidate.unlink()
+            deleted_parents.add(candidate.parent)
+    for parent in sorted(deleted_parents):
+        directory_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+
+def _local_transaction_file(destination: Path, phase: str) -> Path:
+    for _ in range(1000):
+        candidate = destination.with_name(
+            f".{destination.name}.mlite-{phase}-{os.getpid()}-{os.urandom(8).hex()}"
+        )
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(
+        f"could not reserve local checkpoint staging path for {destination}"
+    )
+
+
+def _backup_local_checkpoint_file(destination: Path) -> Path | None:
+    if not destination.exists():
+        return None
+    if destination.is_symlink() or not destination.is_file():
+        raise RuntimeError(
+            f"local checkpoint destination must be a regular file: {destination}"
+        )
+    backup = _local_transaction_file(destination, "backup")
+    os.link(destination, backup)
+    return backup
+
+
+def _cleanup_local_checkpoint_transaction(
+    prepared: Iterable[tuple[Path, Path, Path | None]], *, remove_backups: bool = True
+) -> Exception | None:
+    errors: list[str] = []
+    for staged, _destination, backup in prepared:
+        try:
+            staged.unlink(missing_ok=True)
+        except Exception as exc:
+            errors.append(f"{staged}: {type(exc).__name__}: {exc}")
+        if backup is not None and remove_backups:
+            try:
+                backup.unlink(missing_ok=True)
+            except Exception as exc:
+                errors.append(f"{backup}: {type(exc).__name__}: {exc}")
+    if errors:
+        return RuntimeError("; ".join(errors))
+    return None
+
+
+def _rollback_local_checkpoint_commit(
+    committed: Iterable[tuple[Path, Path | None]]
+) -> Exception | None:
+    errors: list[str] = []
+    restored_parents: set[Path] = set()
+    for destination, backup in reversed(list(committed)):
+        try:
+            if backup is None:
+                destination.unlink(missing_ok=True)
+            else:
+                os.replace(backup, destination)
+                _fsync_file(destination)
+            restored_parents.add(destination.parent)
+        except Exception as exc:
+            errors.append(
+                f"destination={destination}, backup={backup}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    for parent in sorted(restored_parents):
+        try:
+            _fsync_directory(parent)
+        except Exception as exc:
+            errors.append(f"parent={parent}: {type(exc).__name__}: {exc}")
+    if errors:
+        return RuntimeError("; ".join(errors))
+    return None
 
 
 _UNSUPPORTED_PARAMETER_STATE_TEMPLATE = object()
@@ -2040,6 +2552,39 @@ def _optimizer_parameter_state_template(optimizer) -> Any:
     return builder(empty_data=True)
 
 
+def _optimizer_parameter_state_writer(optimizer) -> bool:
+    """Return whether this rank owns the MCore DP-zero sidecar file."""
+
+    chained = getattr(optimizer, "chained_optimizers", None)
+    if isinstance(chained, (list, tuple)):
+        eligible = [
+            child
+            for child in chained
+            if callable(getattr(child, "save_parameter_state", None))
+            or callable(getattr(child, "get_parameter_state_dp_zero", None))
+        ]
+        return any(_optimizer_parameter_state_writer(child) for child in eligible)
+
+    group = getattr(optimizer, "data_parallel_group", None)
+    if group is not None:
+        group_rank = getattr(group, "rank", None)
+        if callable(group_rank):
+            return int(group_rank()) == 0
+        return dist.get_rank(group) == 0
+
+    inner = getattr(optimizer, "optimizer", None)
+    if (
+        inner is not None
+        and inner is not optimizer
+        and callable(getattr(inner, "save_parameter_state", None))
+    ):
+        return _optimizer_parameter_state_writer(inner)
+
+    # Custom wrappers without an exposed DP group historically write on every
+    # rank. Preserve that contract while handling MCore's explicit owner group.
+    return True
+
+
 def _hardlink_parameter_state_for_load(source: Path) -> Path:
     for counter in range(1000):
         staged = source.with_name(f".{source.name}.mlite-load-{os.getpid()}-{counter}")
@@ -2060,7 +2605,10 @@ def _atomic_save_optimizer_parameter_state(save_fn, destination: Path) -> None:
     try:
         save_fn(str(temporary))
         if temporary.exists():
+            _fsync_file(temporary)
             os.replace(temporary, destination)
+            _fsync_file(destination)
+            _fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -2071,8 +2619,15 @@ def _preflight_local_optimizer_parameter_state(
     staged_path: Path | None = None
     staged_fingerprint: tuple[int, str] | None = None
     load_path = parameter_state_path
-    local_error = None
     try:
+        is_writer = _optimizer_parameter_state_writer(optimizer)
+        if not is_writer:
+            if parameter_state_path.exists():
+                raise RuntimeError(
+                    "non-owner rank unexpectedly has an optimizer parameter-state "
+                    f"file: {parameter_state_path}"
+                )
+            return load_path, None, None
         validator = getattr(optimizer, "validate_parameter_state", None)
         template = _UNSUPPORTED_PARAMETER_STATE_TEMPLATE
         if not callable(validator):
@@ -2103,16 +2658,12 @@ def _preflight_local_optimizer_parameter_state(
                     f"before={before_fingerprint!r}, after={staged_fingerprint!r}"
                 )
     except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
-
-    try:
-        _distributed_raise_if_error(
-            local_error, context="local optimizer parameter-state preflight failed"
-        )
-    except Exception:
         if staged_path is not None:
             staged_path.unlink(missing_ok=True)
-        raise
+        raise RuntimeError(
+            "local optimizer parameter-state preflight failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     if staged_path is None:
         return load_path, None, None
     assert staged_fingerprint is not None
@@ -2122,7 +2673,6 @@ def _preflight_local_optimizer_parameter_state(
 def _revalidate_local_optimizer_parameter_state(
     staged_path: Path | None, expected_fingerprint: tuple[int, str] | None
 ) -> None:
-    local_error = None
     try:
         if staged_path is not None:
             current_fingerprint = _local_file_fingerprint(staged_path)
@@ -2132,10 +2682,21 @@ def _revalidate_local_optimizer_parameter_state(
                     f"expected={expected_fingerprint!r}, current={current_fingerprint!r}"
                 )
     except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
-    _distributed_raise_if_error(
-        local_error, context="local optimizer parameter-state revalidation failed"
-    )
+        raise RuntimeError(
+            "local optimizer parameter-state revalidation failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _cleanup_local_optimizer_parameter_state_staging(
+    staged_path: Path | None,
+) -> Exception | None:
+    try:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+    except Exception as exc:
+        return exc
+    return None
 
 
 def _rank_suffix() -> str:
@@ -2283,44 +2844,97 @@ def _read_rng_sidecar(
     )
 
 
+def _rng_state_values_equal(lhs: Any, rhs: Any) -> bool:
+    """Compare nested RNG snapshots without ambiguous tensor/array truth values."""
+
+    if isinstance(lhs, torch.Tensor) or isinstance(rhs, torch.Tensor):
+        return (
+            isinstance(lhs, torch.Tensor)
+            and isinstance(rhs, torch.Tensor)
+            and lhs.dtype == rhs.dtype
+            and tuple(lhs.shape) == tuple(rhs.shape)
+            and torch.equal(lhs, rhs)
+        )
+    if isinstance(lhs, np.ndarray) or isinstance(rhs, np.ndarray):
+        return (
+            isinstance(lhs, np.ndarray)
+            and isinstance(rhs, np.ndarray)
+            and lhs.dtype == rhs.dtype
+            and lhs.shape == rhs.shape
+            and np.array_equal(lhs, rhs)
+        )
+    if isinstance(lhs, Mapping) or isinstance(rhs, Mapping):
+        return (
+            isinstance(lhs, Mapping)
+            and isinstance(rhs, Mapping)
+            and set(lhs) == set(rhs)
+            and all(_rng_state_values_equal(lhs[key], rhs[key]) for key in lhs)
+        )
+    if isinstance(lhs, (tuple, list)) or isinstance(rhs, (tuple, list)):
+        return (
+            type(lhs) is type(rhs)
+            and len(lhs) == len(rhs)
+            and all(
+                _rng_state_values_equal(left, right)
+                for left, right in zip(lhs, rhs, strict=True)
+            )
+        )
+    return type(lhs) is type(rhs) and lhs == rhs
+
+
 def _preflight_rng_checkpoint_state(state: dict[str, Any] | None) -> None:
     if state is None:
         return
     state = _validate_rng_state(state)
     original_state = _get_rng_state()
-    candidate_error: Exception | None = None
+    candidate_error: BaseException | None = None
     try:
         _restore_rng_state(state)
-    except Exception as exc:
+    except BaseException as exc:
         candidate_error = exc
+    rollback_error: BaseException | None = None
     try:
         _restore_rng_state(original_state)
-    except Exception as exc:
-        detail = f"RNG rollback failed: {type(exc).__name__}: {exc}"
+    except BaseException as exc:
+        rollback_error = exc
+    if rollback_error is None:
+        try:
+            restored_state = _get_rng_state()
+            if not _rng_state_values_equal(restored_state, original_state):
+                raise RuntimeError(
+                    "RNG rollback returned without error but the restored state "
+                    "does not match the preflight snapshot"
+                )
+        except BaseException as exc:
+            rollback_error = exc
+    if rollback_error is not None:
+        if _is_control_flow_exception(rollback_error):
+            _mark_checkpoint_mutation(rollback_error)
+            raise rollback_error
+        if _is_control_flow_exception(candidate_error):
+            assert candidate_error is not None
+            _mark_checkpoint_mutation(candidate_error)
+            raise candidate_error
+        detail = (
+            f"RNG rollback failed or could not be verified: "
+            f"{type(rollback_error).__name__}: {rollback_error}"
+        )
         if candidate_error is not None:
             detail = (
                 f"candidate RNG load failed: {type(candidate_error).__name__}: "
                 f"{candidate_error}; {detail}"
             )
-        raise RuntimeError(detail) from exc
+        raise CheckpointLoadFatalError(
+            "RNG checkpoint preflight mutated live state and could not restore it; "
+            f"runtime must be poisoned: {detail}"
+        ) from rollback_error
     if candidate_error is not None:
+        if _is_control_flow_exception(candidate_error):
+            raise candidate_error
         raise RuntimeError(
             f"RNG checkpoint is incompatible: {type(candidate_error).__name__}: "
             f"{candidate_error}"
         ) from candidate_error
-
-
-def _load_rng_sidecar(path: str | os.PathLike[str], *, required: bool = False) -> None:
-    state = _read_rng_sidecar(path, required=required)
-    _preflight_rng_checkpoint_state(state)
-    if state is not None:
-        _restore_rng_state(state)
-
-
-def _extra_state_target_fingerprints(targets: Mapping[str, Any]) -> dict[str, str]:
-    return {
-        filename: repr(targets[filename].fingerprint()) for filename in sorted(targets)
-    }
 
 
 def _assert_extra_state_target_fingerprints_match(
@@ -2346,110 +2960,374 @@ def _restore_extra_state_targets(
     targets: Mapping[str, Any],
     snapshots: Mapping[str, Any],
     baseline_fingerprints: Mapping[str, str],
-) -> str | None:
+) -> BaseException | str | None:
     errors: list[str] = []
+    control_flow_error: BaseException | None = None
     for filename in reversed(sorted(snapshots)):
         target = targets[filename]
         try:
             target.restore(snapshots[filename])
-            restored = repr(target.fingerprint())
+            restored = _canonical_extra_state_fingerprint(target.fingerprint())
             if restored != baseline_fingerprints[filename]:
                 raise RuntimeError(
                     f"fingerprint {restored} != baseline "
                     f"{baseline_fingerprints[filename]}"
                 )
-        except Exception as exc:
-            errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+        except BaseException as exc:
+            if _is_control_flow_exception(exc) and control_flow_error is None:
+                _mark_checkpoint_mutation(exc)
+                control_flow_error = exc
+            else:
+                errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+    try:
+        _assert_extra_state_targets_unchanged(
+            targets, baseline_fingerprints, callback="extra-state target rollback"
+        )
+    except BaseException as exc:
+        if _is_control_flow_exception(exc) and control_flow_error is None:
+            _mark_checkpoint_mutation(exc)
+            control_flow_error = exc
+        else:
+            errors.append(f"global rollback verification: {type(exc).__name__}: {exc}")
+    if control_flow_error is not None:
+        return control_flow_error
     return "; ".join(errors) or None
 
 
-def _preflight_extra_state_targets(
-    targets: Mapping[str, Any], extra_state_values: Mapping[str, Any]
-) -> None:
-    if not targets:
-        return
-    snapshots: dict[str, Any] = {}
-    baseline_fingerprints: dict[str, str] = {}
-    candidate_fingerprints: dict[str, str] = {}
-    local_error = None
-    try:
-        for filename in sorted(targets):
-            target = targets[filename]
-            snapshots[filename] = target.snapshot()
-            baseline_fingerprints[filename] = repr(target.fingerprint())
-        for filename in sorted(targets):
-            target = targets[filename]
-            target.apply(extra_state_values[filename])
-            candidate_fingerprints[filename] = repr(target.fingerprint())
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
+def _canonical_extra_state_fingerprint(value: Any) -> str:
+    """Hash a side-effect-free plain-data fingerprint deterministically."""
 
-    rollback_error = _restore_extra_state_targets(
-        targets, snapshots, baseline_fingerprints
-    )
-    if rollback_error is not None:
-        local_error = (
-            f"{local_error}; target rollback failed: {rollback_error}"
-            if local_error is not None
-            else f"target rollback failed: {rollback_error}"
+    def frame(tag: bytes, *parts: bytes) -> bytes:
+        payload = bytearray(tag)
+        for part in parts:
+            payload.extend(len(part).to_bytes(8, "big"))
+            payload.extend(part)
+        return bytes(payload)
+
+    def encode(item: Any) -> bytes:
+        if item is None:
+            return b"N"
+        if isinstance(item, bool):
+            return b"B1" if item else b"B0"
+        if isinstance(item, int):
+            return frame(b"I", str(item).encode("ascii"))
+        if isinstance(item, float):
+            return frame(b"F", item.hex().encode("ascii"))
+        if isinstance(item, str):
+            return frame(b"S", item.encode("utf-8"))
+        if isinstance(item, bytes):
+            return frame(b"Y", item)
+        if isinstance(item, torch.Tensor):
+            tensor = item.detach().cpu().contiguous()
+            raw = tensor.view(torch.uint8).numpy().tobytes()
+            return frame(
+                b"T",
+                str(tensor.dtype).encode("ascii"),
+                encode(tuple(tensor.shape)),
+                hashlib.sha256(raw).digest(),
+            )
+        if isinstance(item, np.ndarray):
+            if item.dtype.hasobject:
+                raise TypeError("object-dtype NumPy arrays are not canonical")
+            array = np.ascontiguousarray(item)
+            return frame(
+                b"A",
+                array.dtype.str.encode("ascii"),
+                encode(tuple(array.shape)),
+                hashlib.sha256(array.tobytes()).digest(),
+            )
+        if isinstance(item, np.generic):
+            return frame(b"G", item.dtype.str.encode("ascii"), encode(item.item()))
+        if isinstance(item, tuple):
+            return frame(b"U", *(encode(element) for element in item))
+        if isinstance(item, list):
+            return frame(b"L", *(encode(element) for element in item))
+        if isinstance(item, Mapping):
+            encoded_items = sorted(
+                (encode(key), encode(mapped_value))
+                for key, mapped_value in item.items()
+            )
+            return frame(
+                b"M",
+                *(
+                    frame(b"K", key, mapped_value)
+                    for key, mapped_value in encoded_items
+                ),
+            )
+        raise TypeError(
+            "extra-state fingerprint must contain only canonical plain data; "
+            f"got {type(item).__name__}"
         )
-    _distributed_raise_if_error(
-        local_error, context="extra-state target preflight failed"
+
+    return hashlib.sha256(encode(value)).hexdigest()
+
+
+def _capture_extra_state_target_fingerprints(
+    targets: Mapping[str, ExtraStateCheckpointTarget],
+    ordered_filenames: Iterable[str],
+    *,
+    context: str,
+) -> dict[str, str]:
+    fingerprints: dict[str, str] = {}
+    for filename in ordered_filenames:
+        try:
+            fingerprints[filename] = _canonical_extra_state_fingerprint(
+                targets[filename].fingerprint()
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"extra-state target {filename!r} fingerprint failed during "
+                f"{context}; live-state purity cannot be established: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+    return fingerprints
+
+
+def _assert_extra_state_targets_unchanged(
+    targets: Mapping[str, ExtraStateCheckpointTarget],
+    baseline_fingerprints: Mapping[str, str],
+    *,
+    callback: str,
+) -> None:
+    current_fingerprints = _capture_extra_state_target_fingerprints(
+        targets, sorted(targets), context=f"purity check after {callback}"
     )
-    _assert_extra_state_target_fingerprints_match(
-        candidate_fingerprints,
-        context="extra-state target preflight fingerprint validation failed",
-    )
+    for filename, baseline in baseline_fingerprints.items():
+        current = current_fingerprints[filename]
+        if current != baseline:
+            raise RuntimeError(
+                f"{callback} mutated live target {filename!r}: "
+                f"before={baseline}, after={current}"
+            )
+
+
+def _preflight_extra_state_targets(
+    targets: Mapping[str, ExtraStateCheckpointTarget],
+    extra_state_values: Mapping[str, Any],
+    *,
+    validators: Mapping[str, ExtraStateValidator] | None = None,
+    checkpoint_step: int | None = None,
+) -> None:
+    """Run pure callbacks without applying payloads to live target state."""
+
+    validators = validators or {}
+    if not targets and not validators:
+        return
+    local_exception: BaseException | None = None
+    mutation_observed = False
+    baseline_fingerprints: dict[str, str] = {}
+    try:
+        ordered_filenames = sorted(targets)
+        baseline_fingerprints = _capture_extra_state_target_fingerprints(
+            targets, ordered_filenames, context="initial preflight baseline"
+        )
+
+        def run_pure_callback(callback, *, label: str) -> None:
+            nonlocal mutation_observed
+            callback_exception: BaseException | None = None
+            try:
+                callback()
+            except BaseException as exc:
+                callback_exception = exc
+            try:
+                _assert_extra_state_targets_unchanged(
+                    targets, baseline_fingerprints, callback=label
+                )
+            except BaseException:
+                mutation_observed = True
+                if _is_control_flow_exception(callback_exception):
+                    assert callback_exception is not None
+                    _mark_checkpoint_mutation(callback_exception)
+                    raise callback_exception
+                raise
+            if callback_exception is not None:
+                raise callback_exception
+
+        for filename in sorted(validators):
+            run_pure_callback(
+                lambda filename=filename: validators[filename](
+                    extra_state_values[filename]
+                ),
+                label=f"extra-state validator {filename!r}",
+            )
+
+        for filename in ordered_filenames:
+            validate_step = getattr(targets[filename], "validate_step", None)
+            if callable(validate_step):
+                run_pure_callback(
+                    lambda filename=filename, validate_step=validate_step: validate_step(
+                        extra_state_values[filename], checkpoint_step
+                    ),
+                    label=f"extra-state target {filename!r} validate_step()",
+                )
+
+        for filename in ordered_filenames:
+            target = targets[filename]
+            run_pure_callback(
+                lambda filename=filename, target=target: target.validate(
+                    extra_state_values[filename]
+                ),
+                label=f"extra-state target {filename!r} validate()",
+            )
+    except BaseException as exc:
+        local_exception = exc
+        if targets and not baseline_fingerprints:
+            # A target's first fingerprint failed before a trusted baseline was
+            # available. It may have changed live state before raising.
+            mutation_observed = True
+    if mutation_observed:
+        _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=True,
+            context="extra-state target preflight failed",
+        )
+    else:
+        _raise_checkpoint_phase_error(
+            local_exception,
+            context="extra-state target preflight failed",
+            wrap_local_exception=True,
+        )
 
 
 def _commit_extra_state_targets(
-    targets: Mapping[str, Any], extra_state_values: Mapping[str, Any]
-) -> None:
+    targets: Mapping[str, ExtraStateCheckpointTarget],
+    extra_state_values: Mapping[str, Any],
+    *,
+    prior_live_state_mutation: bool = False,
+) -> bool:
     if not targets:
-        return
+        return prior_live_state_mutation
     snapshots: dict[str, Any] = {}
     baseline_fingerprints: dict[str, str] = {}
     candidate_fingerprints: dict[str, str] = {}
-    local_error = None
+    local_exception: BaseException | None = None
+    snapshot_mutation_observed = False
     try:
-        for filename in sorted(targets):
+        ordered_filenames = sorted(targets)
+        baseline_fingerprints = _capture_extra_state_target_fingerprints(
+            targets, ordered_filenames, context="initial commit baseline"
+        )
+        for filename in ordered_filenames:
             target = targets[filename]
-            snapshots[filename] = target.snapshot()
-            baseline_fingerprints[filename] = repr(target.fingerprint())
-        for filename in sorted(targets):
-            target = targets[filename]
-            target.apply(extra_state_values[filename])
-            candidate_fingerprints[filename] = repr(target.fingerprint())
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
+            try:
+                snapshots[filename] = target.snapshot()
+            except BaseException as exc:
+                snapshot_mutation_observed = True
+                if _is_control_flow_exception(exc):
+                    _mark_checkpoint_mutation(exc)
+                    raise
+                raise RuntimeError(
+                    f"extra-state target {filename!r} snapshot() failed; "
+                    "live-state purity cannot be established: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            try:
+                _assert_extra_state_targets_unchanged(
+                    targets,
+                    baseline_fingerprints,
+                    callback=f"extra-state target {filename!r} snapshot()",
+                )
+            except BaseException:
+                snapshot_mutation_observed = True
+                raise
+    except BaseException as exc:
+        local_exception = exc
+        if not baseline_fingerprints:
+            snapshot_mutation_observed = True
+    mutation_started = _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=prior_live_state_mutation or snapshot_mutation_observed,
+        context="extra-state target commit snapshot failed",
+    )
 
-    commit_error: Exception | None = None
+    local_apply_started = False
+    local_exception = None
     try:
-        _distributed_raise_if_error(
-            local_error, context="extra-state target commit failed"
+        applied_filenames: set[str] = set()
+        for filename in ordered_filenames:
+            target = targets[filename]
+            local_apply_started = True
+            target.apply(extra_state_values[filename])
+            live_fingerprints = _capture_extra_state_target_fingerprints(
+                targets,
+                ordered_filenames,
+                context=f"commit verification after applying {filename!r}",
+            )
+            candidate_fingerprints[filename] = live_fingerprints[filename]
+            applied_filenames.add(filename)
+            expected_fingerprints = {
+                observed_filename: (
+                    candidate_fingerprints[observed_filename]
+                    if observed_filename in applied_filenames
+                    else baseline_fingerprints[observed_filename]
+                )
+                for observed_filename in ordered_filenames
+            }
+            for observed_filename, expected in expected_fingerprints.items():
+                current = live_fingerprints[observed_filename]
+                if current != expected:
+                    raise RuntimeError(
+                        f"extra-state target {filename!r} apply() mutated target "
+                        f"{observed_filename!r} outside its own transaction: "
+                        f"expected={expected}, current={current}"
+                    )
+        final_fingerprints = _capture_extra_state_target_fingerprints(
+            targets, ordered_filenames, context="final commit verification"
         )
-        _assert_extra_state_target_fingerprints_match(
-            candidate_fingerprints,
-            context="extra-state target commit fingerprint validation failed",
+        if final_fingerprints != candidate_fingerprints:
+            raise RuntimeError(
+                "extra-state target final live fingerprints differ from the "
+                f"applied candidates: expected={candidate_fingerprints}, "
+                f"current={final_fingerprints}"
+            )
+    except BaseException as exc:
+        local_exception = exc
+
+    commit_error: CheckpointLoadFatalError | None = None
+    try:
+        mutation_started = _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=mutation_started or local_apply_started,
+            context="extra-state target commit failed",
         )
-    except Exception as exc:
+        try:
+            _assert_extra_state_target_fingerprints_match(
+                final_fingerprints,
+                context="extra-state target commit fingerprint validation failed",
+            )
+        except Exception as exc:
+            _raise_checkpoint_load_commit_error(
+                exc,
+                mutation_started=mutation_started,
+                context="extra-state target commit fingerprint validation failed",
+            )
+    except CheckpointLoadFatalError as exc:
+        if exc._peer_control_flow:
+            raise
         commit_error = exc
     if commit_error is None:
-        return
+        return mutation_started
 
     rollback_error = _restore_extra_state_targets(
         targets, snapshots, baseline_fingerprints
     )
+    rollback_exception = (
+        rollback_error
+        if isinstance(rollback_error, BaseException)
+        else RuntimeError(rollback_error) if rollback_error is not None else None
+    )
     try:
-        _distributed_raise_if_error(
-            rollback_error, context="extra-state target rollback failed"
+        _raise_checkpoint_load_commit_error(
+            rollback_exception,
+            mutation_started=True,
+            context="extra-state target rollback failed",
         )
-    except Exception as exc:
-        raise RuntimeError(
+    except CheckpointLoadFatalError as exc:
+        raise CheckpointLoadFatalError(
             "extra-state target commit failed after core checkpoint commit; "
             f"runtime must be poisoned; rollback also failed: {exc}"
         ) from commit_error
-    raise RuntimeError(
+    raise CheckpointLoadFatalError(
         "extra-state target commit failed after core checkpoint commit; "
         f"runtime must be poisoned: {commit_error}"
     ) from commit_error
@@ -2464,8 +3342,8 @@ def _preload_checkpoint_sidecars(
     load_rng: bool,
     rng_required: bool,
     extra_state_files: Iterable[str],
-    extra_state_validators: Mapping[str, Callable[[Any], None]],
-    extra_state_targets: Mapping[str, Any],
+    extra_state_validators: Mapping[str, ExtraStateValidator],
+    extra_state_targets: Mapping[str, ExtraStateCheckpointTarget],
     checkpoint_step: int | None,
 ) -> tuple[Any, dict[str, Any] | None, dict[str, Any]]:
     """Deserialize and validate all sidecars before any model checkpoint commit."""
@@ -2473,7 +3351,7 @@ def _preload_checkpoint_sidecars(
     optimizer_state: Any = None
     rng_state: dict[str, Any] | None = None
     extra_state_values: dict[str, Any] = {}
-    local_error = None
+    local_exception: BaseException | None = None
     try:
         if load_optimizer:
             optimizer_state = _read_optimizer_checkpoint(optimizer, checkpoint_path)
@@ -2492,18 +3370,19 @@ def _preload_checkpoint_sidecars(
             )
         if load_rng:
             _preflight_rng_checkpoint_state(rng_state)
-        for filename, validator in extra_state_validators.items():
-            validator(extra_state_values[filename])
-        for filename, target in extra_state_targets.items():
-            validate_step = getattr(target, "validate_step", None)
-            if callable(validate_step):
-                validate_step(extra_state_values[filename], checkpoint_step)
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
-    _distributed_raise_if_error(
-        local_error, context="checkpoint sidecar preflight failed"
+    except BaseException as exc:
+        local_exception = exc
+    _raise_checkpoint_phase_error(
+        local_exception,
+        context="checkpoint sidecar preflight failed",
+        wrap_local_exception=True,
     )
-    _preflight_extra_state_targets(extra_state_targets, extra_state_values)
+    _preflight_extra_state_targets(
+        extra_state_targets,
+        extra_state_values,
+        validators=extra_state_validators,
+        checkpoint_step=checkpoint_step,
+    )
     return optimizer_state, rng_state, extra_state_values
 
 
@@ -2515,19 +3394,53 @@ def _commit_preloaded_sidecars(
     loaded_extra_states: MutableMapping[str, Any] | None,
     extra_state_values: Mapping[str, Any],
     extra_state_targets: Mapping[str, Any],
+    prior_live_state_mutation: bool = False,
 ) -> None:
-    local_error = None
-    try:
-        if optimizer is not None:
+    mutation_started = prior_live_state_mutation
+    if optimizer is not None:
+        local_exception: BaseException | None = None
+        optimizer_apply_started = False
+        try:
+            optimizer_apply_started = True
             _apply_optimizer_checkpoint_state(optimizer, optimizer_state)
-        if rng_state is not None:
+        except BaseException as exc:
+            local_exception = exc
+        mutation_started = _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=mutation_started or optimizer_apply_started,
+            context="checkpoint optimizer sidecar commit failed",
+        )
+    if rng_state is not None:
+        local_exception = None
+        rng_apply_started = False
+        try:
+            rng_apply_started = True
             _restore_rng_state(rng_state)
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
-    _distributed_raise_if_error(local_error, context="checkpoint sidecar commit failed")
-    _commit_extra_state_targets(extra_state_targets, extra_state_values)
+        except BaseException as exc:
+            local_exception = exc
+        mutation_started = _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=mutation_started or rng_apply_started,
+            context="checkpoint RNG sidecar commit failed",
+        )
+    mutation_started = _commit_extra_state_targets(
+        extra_state_targets,
+        extra_state_values,
+        prior_live_state_mutation=mutation_started,
+    )
     if loaded_extra_states is not None:
-        loaded_extra_states.update(extra_state_values)
+        local_exception = None
+        publication_started = False
+        try:
+            publication_started = True
+            loaded_extra_states.update(extra_state_values)
+        except BaseException as exc:
+            local_exception = exc
+        _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=mutation_started or publication_started,
+            context="checkpoint extra-state publication failed",
+        )
 
 
 def _save_local_training_checkpoint(
@@ -2536,45 +3449,380 @@ def _save_local_training_checkpoint(
     step: int,
     path: str,
     *,
+    config=None,
+    ps: ParallelState | None = None,
     save_rng: bool = True,
 ) -> None:
-    chunks = _model_chunks(model)
-    ckpt_file = _local_checkpoint_file(path)
-    ckpt_file.parent.mkdir(parents=True, exist_ok=True)
-    save_parameter_state = getattr(optimizer, "save_parameter_state", None)
-    optimizer_parameter_state_file = (
-        _local_optimizer_parameter_state_file(ckpt_file)
-        if callable(save_parameter_state)
-        else None
+    _assert_world_consensus(
+        {"checkpoint_path": _canonical_checkpoint_path(path), "requested_step": step},
+        context="local checkpoint save identity differs across ranks",
     )
-    state = {
-        "format": _LOCAL_TRAINING_FORMAT_V2,
-        "step": int(step),
-        "model": [_chunk_tensor_state(chunk) for chunk in chunks],
-        "optimizer": optimizer.state_dict() if optimizer is not None else None,
-        "optimizer_parameter_state": (
-            optimizer_parameter_state_file.name
-            if optimizer_parameter_state_file is not None
-            else None
-        ),
-        "rng_state": _get_rng_state() if save_rng else None,
-    }
-    if optimizer_parameter_state_file is not None:
-        _atomic_save_optimizer_parameter_state(
-            save_parameter_state, optimizer_parameter_state_file
+    topology: dict[str, Any] | None = None
+    rank_coordinate: dict[str, int] | None = None
+    local_exception: Exception | None = None
+    try:
+        topology, rank_coordinate = _local_checkpoint_parallel_identity(config, ps)
+    except Exception as exc:
+        local_exception = exc
+    _raise_checkpoint_phase_error(
+        local_exception, context="local checkpoint save topology preflight failed"
+    )
+    if _is_distributed_checkpoint_ranked():
+        assert topology is not None
+        _assert_world_consensus(
+            topology, context="local checkpoint save topology differs across ranks"
         )
-    _atomic_torch_save(state, ckpt_file)
+    generation = _new_local_checkpoint_generation()
+    ckpt_file = _local_checkpoint_file(path)
+    prepared: list[tuple[Path, Path, Path | None]] = []
+    staged_parameter_state: Path | None = None
+    staged_checkpoint: Path | None = None
+    optimizer_parameter_state_file: Path | None = None
+    save_parameter_state: Callable | None = None
+    parameter_state_writer = False
+    state: dict[str, Any] | None = None
+    previous_parameter_state_files: tuple[Path, ...] = ()
+
+    # Phase 1 is local-only. No rank may enter MCore's DP collectives until
+    # every rank has built and validated its model/optimizer payload.
+    local_exception = None
+    try:
+        chunks = _model_chunks(model)
+        ckpt_file.parent.mkdir(parents=True, exist_ok=True)
+        previous_parameter_state_files = (
+            _generation_scoped_optimizer_parameter_state_files(ckpt_file)
+        )
+        save_parameter_state = getattr(optimizer, "save_parameter_state", None)
+        optimizer_parameter_state_file = (
+            _local_optimizer_parameter_state_file(ckpt_file, generation=generation)
+            if callable(save_parameter_state)
+            else None
+        )
+        parameter_state_writer = (
+            _optimizer_parameter_state_writer(optimizer)
+            if optimizer_parameter_state_file is not None
+            else False
+        )
+        state = {
+            "format": _LOCAL_TRAINING_FORMAT_V3,
+            "step": int(step),
+            "generation": generation,
+            "topology": topology,
+            "rank_coordinate": rank_coordinate,
+            "model": [_chunk_tensor_state(chunk) for chunk in chunks],
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
+            "optimizer_parameter_state": (
+                optimizer_parameter_state_file.name
+                if optimizer_parameter_state_file is not None
+                else None
+            ),
+            "rng_state": _get_rng_state() if save_rng else None,
+        }
+        if optimizer_parameter_state_file is not None:
+            staged_parameter_state = _local_transaction_file(
+                optimizer_parameter_state_file, "prepare"
+            )
+        staged_checkpoint = _local_transaction_file(ckpt_file, "prepare")
+    except Exception as exc:
+        local_exception = exc
+    _raise_checkpoint_phase_error(
+        local_exception, context="local checkpoint save payload preparation failed"
+    )
+    assert state is not None
+    assert staged_checkpoint is not None
+
+    # Phase 2 deliberately calls save_parameter_state on every rank. MCore
+    # gathers within each DP group but materializes a file only on that group's
+    # rank 0; the other ranks keep their rank-local logical filename for load.
+    if optimizer_parameter_state_file is not None:
+        assert callable(save_parameter_state)
+        assert staged_parameter_state is not None
+        local_exception = None
+        try:
+            _atomic_save_optimizer_parameter_state(
+                save_parameter_state, staged_parameter_state
+            )
+            if parameter_state_writer and not staged_parameter_state.is_file():
+                raise RuntimeError(
+                    "optimizer parameter-state owner did not create its staging file: "
+                    f"{staged_parameter_state}"
+                )
+            if not parameter_state_writer and staged_parameter_state.exists():
+                prepared.append(
+                    (staged_parameter_state, optimizer_parameter_state_file, None)
+                )
+                raise RuntimeError(
+                    "non-owner rank unexpectedly created optimizer parameter-state "
+                    f"staging file: {staged_parameter_state}"
+                )
+            if parameter_state_writer:
+                prepared.append(
+                    (staged_parameter_state, optimizer_parameter_state_file, None)
+                )
+        except Exception as exc:
+            local_exception = exc
+        try:
+            _raise_checkpoint_phase_error(
+                local_exception,
+                context="local checkpoint optimizer parameter-state save failed",
+            )
+        except Exception as parameter_state_exception:
+            cleanup_exception = _cleanup_local_checkpoint_transaction(prepared)
+            try:
+                _raise_checkpoint_phase_error(
+                    cleanup_exception,
+                    context="local checkpoint optimizer parameter-state cleanup failed",
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "local checkpoint optimizer parameter-state save failed and "
+                    f"cleanup also failed: {exc}"
+                ) from parameter_state_exception
+            raise
+
+    # Phase 3 contains only rank-local file work and is followed by WORLD
+    # consensus before any destination is published.
+    local_exception = None
+    try:
+        if parameter_state_writer:
+            assert optimizer_parameter_state_file is not None
+            assert staged_parameter_state is not None
+            prepared[-1] = (
+                staged_parameter_state,
+                optimizer_parameter_state_file,
+                _backup_local_checkpoint_file(optimizer_parameter_state_file),
+            )
+        _atomic_torch_save(state, staged_checkpoint)
+        prepared.append((staged_checkpoint, ckpt_file, None))
+        prepared[-1] = (
+            staged_checkpoint,
+            ckpt_file,
+            _backup_local_checkpoint_file(ckpt_file),
+        )
+    except Exception as exc:
+        local_exception = exc
+
+    try:
+        _raise_checkpoint_phase_error(
+            local_exception, context="local checkpoint save file materialization failed"
+        )
+    except Exception as preparation_exception:
+        cleanup_exception = _cleanup_local_checkpoint_transaction(prepared)
+        try:
+            _raise_checkpoint_phase_error(
+                cleanup_exception,
+                context="local checkpoint save preparation cleanup failed",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "local checkpoint save preparation failed and transaction cleanup "
+                f"also failed: {exc}"
+            ) from preparation_exception
+        raise
+
+    committed: list[tuple[Path, Path | None]] = []
+    local_exception = None
+    try:
+        for staged, destination, backup in prepared:
+            os.replace(staged, destination)
+            committed.append((destination, backup))
+            _fsync_file(destination)
+        for parent in sorted(
+            {destination.parent for destination, _backup in committed}
+        ):
+            _fsync_directory(parent)
+    except Exception as exc:
+        local_exception = exc
+
+    commit_exception: Exception | None = None
+    try:
+        _raise_checkpoint_phase_error(
+            local_exception, context="local checkpoint save commit failed"
+        )
+    except Exception as exc:
+        commit_exception = exc
+    if commit_exception is not None:
+        rollback_exception = _rollback_local_checkpoint_commit(committed)
+        cleanup_exception = _cleanup_local_checkpoint_transaction(
+            prepared, remove_backups=rollback_exception is None
+        )
+        try:
+            _raise_checkpoint_phase_error(
+                rollback_exception, context="local checkpoint save rollback failed"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "local checkpoint save commit failed; rollback backups were "
+                f"preserved where possible; rollback also failed: {exc}"
+            ) from commit_exception
+        _raise_checkpoint_phase_error(
+            cleanup_exception, context="local checkpoint save rollback cleanup failed"
+        )
+        raise commit_exception
+
+    if _is_distributed_checkpoint_ranked():
+        completion = _local_checkpoint_completion_payload(
+            step=step, generation=generation, topology=topology
+        )
+        completion_path = _local_checkpoint_completion_path(path)
+        completion_backup: Path | None = None
+        completion_publish_attempted = False
+        local_exception = None
+        try:
+            if dist.get_rank() == 0:
+                completion_backup = _backup_local_checkpoint_file(completion_path)
+        except Exception as exc:
+            local_exception = exc
+        completion_exception: Exception | None = None
+        try:
+            _raise_checkpoint_phase_error(
+                local_exception, context="local checkpoint completion backup failed"
+            )
+        except Exception as exc:
+            completion_exception = exc
+        if completion_exception is None:
+            completion_publish_attempted = True
+            local_exception = None
+            try:
+                if dist.get_rank() == 0:
+                    _atomic_write_json(completion_path, completion)
+            except Exception as exc:
+                local_exception = exc
+            try:
+                _raise_checkpoint_phase_error(
+                    local_exception,
+                    context="local checkpoint completion publish failed",
+                )
+            except Exception as exc:
+                completion_exception = exc
+        if completion_exception is None:
+            local_exception = None
+            try:
+                readback = _read_local_checkpoint_completion_with_consensus(path)
+                if readback != completion:
+                    raise RuntimeError(
+                        "local checkpoint completion readback mismatch: "
+                        f"expected={completion!r}, actual={readback!r}"
+                    )
+            except Exception as exc:
+                local_exception = exc
+            try:
+                _raise_checkpoint_phase_error(
+                    local_exception,
+                    context="local checkpoint completion readback failed",
+                )
+            except Exception as exc:
+                completion_exception = exc
+        if completion_exception is not None:
+            marker_rollback_exception: Exception | None = None
+            try:
+                if dist.get_rank() == 0 and completion_publish_attempted:
+                    if completion_backup is None:
+                        completion_path.unlink(missing_ok=True)
+                    else:
+                        os.replace(completion_backup, completion_path)
+                    directory_fd = os.open(completion_path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                elif dist.get_rank() == 0 and completion_backup is not None:
+                    completion_backup.unlink(missing_ok=True)
+            except Exception as exc:
+                marker_rollback_exception = exc
+            try:
+                _raise_checkpoint_phase_error(
+                    marker_rollback_exception,
+                    context="local checkpoint completion rollback failed",
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "local checkpoint completion failed and its previous marker "
+                    f"could not be restored: {exc}"
+                ) from completion_exception
+
+            rollback_exception = _rollback_local_checkpoint_commit(committed)
+            cleanup_exception = _cleanup_local_checkpoint_transaction(
+                prepared, remove_backups=rollback_exception is None
+            )
+            try:
+                _raise_checkpoint_phase_error(
+                    rollback_exception,
+                    context=(
+                        "local checkpoint completion failure payload rollback failed"
+                    ),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "local checkpoint completion publish failed; payload rollback "
+                    f"backups were preserved where possible; rollback also failed: {exc}"
+                ) from completion_exception
+            _raise_checkpoint_phase_error(
+                cleanup_exception,
+                context="local checkpoint completion failure cleanup failed",
+            )
+            raise completion_exception
+        local_exception = None
+        try:
+            if dist.get_rank() == 0 and completion_backup is not None:
+                completion_backup.unlink(missing_ok=True)
+        except Exception as exc:
+            local_exception = exc
+        _raise_checkpoint_phase_error(
+            local_exception, context="local checkpoint completion backup cleanup failed"
+        )
+
+    cleanup_exception = _cleanup_local_checkpoint_transaction(prepared)
+    _raise_checkpoint_phase_error(
+        cleanup_exception, context="local checkpoint save success cleanup failed"
+    )
+    local_exception = None
+    try:
+        _garbage_collect_optimizer_parameter_state_files(
+            previous_parameter_state_files,
+            keep=(optimizer_parameter_state_file if parameter_state_writer else None),
+        )
+    except Exception as exc:
+        local_exception = exc
+    _raise_checkpoint_phase_error(
+        local_exception,
+        context="local checkpoint optimizer parameter-state garbage collection failed",
+    )
     log_rank0(f"Saved local training checkpoint at step {step} to {ckpt_file}")
 
 
-def _load_local_training_checkpoint(
+@dataclass(frozen=True)
+class _LocalTrainingCheckpointLoadPlan:
+    ckpt_file: Path
+    checkpoint_format: str
+    step: int
+    generation: str | None
+    topology: dict[str, Any] | None
+    rank_coordinate: dict[str, int] | None
+    chunks: list[nn.Module]
+    chunk_states: list[dict[str, torch.Tensor]]
+    optimizer: Any
+    saved_optimizer_state: Any
+    saved_rng_state: dict[str, Any] | None
+    load_rng: bool
+    target_parameter_state_loader: Callable | None
+    parameter_state_path: Path | None
+    parameter_state_load_path: Path | None
+    staged_parameter_state_path: Path | None
+    parameter_state_fingerprint: tuple[int, str] | None
+    load_parameter_state_update_legacy_format: bool
+    ignored_legacy_buffer_keys: list[str]
+
+
+def _preflight_local_training_checkpoint(
     model: nn.Module | Iterable[nn.Module],
     optimizer,
     path: str,
     *,
     load_rng: bool = True,
     load_parameter_state_update_legacy_format: bool = False,
-) -> int:
+    allow_legacy_checkpoint: bool = False,
+) -> _LocalTrainingCheckpointLoadPlan:
     ckpt_file = _local_checkpoint_file(path)
     state = torch.load(ckpt_file, map_location="cpu", weights_only=False)
     if not isinstance(state, dict):
@@ -2582,8 +3830,26 @@ def _load_local_training_checkpoint(
             f"Local checkpoint root must be a dict, got {type(state).__name__}"
         )
     checkpoint_format = state.get("format")
-    if checkpoint_format not in {_LOCAL_TRAINING_FORMAT_V1, _LOCAL_TRAINING_FORMAT_V2}:
+    if checkpoint_format not in {
+        _LOCAL_TRAINING_FORMAT_V1,
+        _LOCAL_TRAINING_FORMAT_V2,
+        _LOCAL_TRAINING_FORMAT_V3,
+    }:
         raise RuntimeError(f"Unsupported local checkpoint format in {ckpt_file}")
+    if checkpoint_format != _LOCAL_TRAINING_FORMAT_V3 and not allow_legacy_checkpoint:
+        raise RuntimeError(
+            "Legacy local checkpoints are rejected by default: "
+            f"format={checkpoint_format!r}. Pass allow_legacy_checkpoint=True "
+            "only for an explicit one-time migration load, then immediately "
+            "re-save it as V3."
+        )
+    if checkpoint_format != _LOCAL_TRAINING_FORMAT_V3 and allow_legacy_checkpoint:
+        scope = "distributed " if _is_distributed_checkpoint_ranked() else ""
+        log_rank0(
+            f"Legacy {scope}local checkpoint load is not crash-generation "
+            f"protected (format={checkpoint_format!r}); use only for one-time "
+            "migration and re-save as V3 immediately."
+        )
     expected_root_keys = {
         "format",
         "step",
@@ -2592,6 +3858,8 @@ def _load_local_training_checkpoint(
         "optimizer_parameter_state",
         "rng_state",
     }
+    if checkpoint_format == _LOCAL_TRAINING_FORMAT_V3:
+        expected_root_keys.update({"generation", "topology", "rank_coordinate"})
     if set(state) != expected_root_keys:
         raise RuntimeError(
             "Local checkpoint root schema mismatch: "
@@ -2603,6 +3871,28 @@ def _load_local_training_checkpoint(
         raise RuntimeError(
             f"Local checkpoint step must be a non-negative integer, got {step!r}"
         )
+    generation = state.get("generation")
+    if checkpoint_format == _LOCAL_TRAINING_FORMAT_V3 and (
+        not isinstance(generation, str)
+        or len(generation) != 32
+        or any(character not in "0123456789abcdef" for character in generation)
+    ):
+        raise RuntimeError(f"Local checkpoint generation is invalid: {generation!r}")
+    topology = state.get("topology")
+    rank_coordinate = state.get("rank_coordinate")
+    if checkpoint_format == _LOCAL_TRAINING_FORMAT_V3:
+        if topology is not None and not isinstance(topology, dict):
+            raise RuntimeError("Local checkpoint topology must be a dictionary or None")
+        if rank_coordinate is not None and not isinstance(rank_coordinate, dict):
+            raise RuntimeError(
+                "Local checkpoint rank_coordinate must be a dictionary or None"
+            )
+        if _is_distributed_checkpoint_ranked() and (
+            not isinstance(topology, dict) or not isinstance(rank_coordinate, dict)
+        ):
+            raise RuntimeError(
+                "Distributed V3 local checkpoint requires topology and rank coordinate"
+            )
     chunks = _model_chunks(model)
     chunk_states = state.get("model")
     if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
@@ -2644,7 +3934,10 @@ def _load_local_training_checkpoint(
     parameter_state_path: Path | None = None
     if parameter_state_name is not None:
         expected_parameter_state_name = _local_optimizer_parameter_state_file(
-            ckpt_file
+            ckpt_file,
+            generation=(
+                generation if checkpoint_format == _LOCAL_TRAINING_FORMAT_V3 else None
+            ),
         ).name
         if (
             not isinstance(parameter_state_name, str)
@@ -2657,7 +3950,14 @@ def _load_local_training_checkpoint(
             )
         parameter_state_path = ckpt_file.with_name(parameter_state_name)
     if optimizer is not None:
-        _preflight_optimizer_checkpoint_state(optimizer, saved_optimizer_state)
+        saved_optimizer_state = _prepare_optimizer_checkpoint_state(
+            optimizer,
+            saved_optimizer_state,
+            allow_legacy_optimizer_state=(
+                allow_legacy_checkpoint
+                and checkpoint_format == _LOCAL_TRAINING_FORMAT_V1
+            ),
+        )
     saved_rng_state = state.get("rng_state")
     if load_rng:
         if saved_rng_state is None:
@@ -2678,37 +3978,354 @@ def _load_local_training_checkpoint(
             parameter_state_path,
             update_legacy_format=load_parameter_state_update_legacy_format,
         )
+    return _LocalTrainingCheckpointLoadPlan(
+        ckpt_file=ckpt_file,
+        checkpoint_format=checkpoint_format,
+        step=step,
+        generation=generation,
+        topology=topology,
+        rank_coordinate=rank_coordinate,
+        chunks=chunks,
+        chunk_states=chunk_states,
+        optimizer=optimizer,
+        saved_optimizer_state=saved_optimizer_state,
+        saved_rng_state=saved_rng_state,
+        load_rng=load_rng,
+        target_parameter_state_loader=(
+            target_parameter_state_loader
+            if callable(target_parameter_state_loader)
+            else None
+        ),
+        parameter_state_path=parameter_state_path,
+        parameter_state_load_path=parameter_state_load_path,
+        staged_parameter_state_path=staged_parameter_state_path,
+        parameter_state_fingerprint=parameter_state_fingerprint,
+        load_parameter_state_update_legacy_format=(
+            load_parameter_state_update_legacy_format
+        ),
+        ignored_legacy_buffer_keys=ignored_legacy_buffer_keys,
+    )
+
+
+def _commit_local_training_checkpoint_core(
+    plan: _LocalTrainingCheckpointLoadPlan, *, mark_mutation_started: Callable[[], None]
+) -> None:
+    for chunk, chunk_state in zip(plan.chunks, plan.chunk_states, strict=True):
+        _load_chunk_tensor_state(chunk, chunk_state, before_copy=mark_mutation_started)
+    if plan.optimizer is not None:
+        mark_mutation_started()
+        plan.optimizer.load_state_dict(plan.saved_optimizer_state)
+        if plan.parameter_state_load_path is None:
+            reload_model_params = getattr(plan.optimizer, "reload_model_params", None)
+            if callable(reload_model_params):
+                mark_mutation_started()
+                reload_model_params()
+
+
+def _commit_local_training_checkpoint_parameter_state(
+    plan: _LocalTrainingCheckpointLoadPlan, *, mark_mutation_started: Callable[[], None]
+) -> None:
+    if plan.parameter_state_load_path is None:
+        return
+    assert callable(plan.target_parameter_state_loader)
+    mark_mutation_started()
+    plan.target_parameter_state_loader(
+        str(plan.parameter_state_load_path),
+        update_legacy_format=plan.load_parameter_state_update_legacy_format,
+    )
+
+
+def _commit_local_training_checkpoint_rng(
+    plan: _LocalTrainingCheckpointLoadPlan, *, mark_mutation_started: Callable[[], None]
+) -> None:
+    if plan.load_rng:
+        mark_mutation_started()
+        _restore_rng_state(plan.saved_rng_state)
+
+
+def _load_local_training_checkpoint(
+    model: nn.Module | Iterable[nn.Module],
+    optimizer,
+    path: str,
+    *,
+    config=None,
+    ps: ParallelState | None = None,
+    load_rng: bool = True,
+    load_parameter_state_update_legacy_format: bool = False,
+    allow_legacy_checkpoint: bool = False,
+) -> int:
+    _assert_world_consensus(
+        _canonical_checkpoint_path(path),
+        context="local checkpoint load path differs across ranks",
+    )
+    current_topology: dict[str, Any] | None = None
+    current_rank_coordinate: dict[str, int] | None = None
+    local_exception: Exception | None = None
     try:
-        if parameter_state_path is not None:
-            _revalidate_local_optimizer_parameter_state(
-                staged_parameter_state_path, parameter_state_fingerprint
+        current_topology, current_rank_coordinate = _local_checkpoint_parallel_identity(
+            config, ps
+        )
+    except Exception as exc:
+        local_exception = exc
+    _raise_checkpoint_phase_error(
+        local_exception, context="local checkpoint load topology preflight failed"
+    )
+    if _is_distributed_checkpoint_ranked():
+        assert current_topology is not None
+        _assert_world_consensus(
+            current_topology,
+            context="local checkpoint load topology differs across ranks",
+        )
+    if _is_distributed_checkpoint_ranked():
+        _local_checkpoint_file(path)
+    completion = _read_local_checkpoint_completion_with_consensus(
+        path, allow_missing=allow_legacy_checkpoint
+    )
+    plan: _LocalTrainingCheckpointLoadPlan | None = None
+    local_exception: BaseException | None = None
+    try:
+        plan = _preflight_local_training_checkpoint(
+            model,
+            optimizer,
+            path,
+            load_rng=load_rng,
+            load_parameter_state_update_legacy_format=(
+                load_parameter_state_update_legacy_format
+            ),
+            allow_legacy_checkpoint=allow_legacy_checkpoint,
+        )
+    except BaseException as exc:
+        local_exception = exc
+
+    try:
+        _raise_checkpoint_phase_error(
+            local_exception, context="local checkpoint load preflight failed"
+        )
+    except BaseException:
+        if plan is not None and plan.staged_parameter_state_path is not None:
+            plan.staged_parameter_state_path.unlink(missing_ok=True)
+        raise
+    assert plan is not None
+    try:
+        _assert_world_consensus(
+            {
+                "checkpoint_format": plan.checkpoint_format,
+                "step": plan.step,
+                "generation": plan.generation,
+                "topology": plan.topology,
+                "optimizer_present": plan.optimizer is not None,
+                "parameter_state_present": plan.parameter_state_path is not None,
+            },
+            context="local checkpoint loaded identity differs across ranks",
+        )
+    except Exception as identity_exception:
+        cleanup_exception = _cleanup_local_optimizer_parameter_state_staging(
+            plan.staged_parameter_state_path
+        )
+        try:
+            _raise_checkpoint_phase_error(
+                cleanup_exception,
+                context="local checkpoint identity failure cleanup failed",
             )
-        for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
-            _load_chunk_tensor_state(chunk, chunk_state)
-        if optimizer is not None:
-            optimizer.load_state_dict(saved_optimizer_state)
-            if parameter_state_load_path is not None:
-                assert callable(target_parameter_state_loader)
-                target_parameter_state_loader(
-                    str(parameter_state_load_path),
-                    update_legacy_format=load_parameter_state_update_legacy_format,
-                )
-            else:
-                reload_model_params = getattr(optimizer, "reload_model_params", None)
-                if callable(reload_model_params):
-                    reload_model_params()
-        if load_rng:
-            _restore_rng_state(saved_rng_state)
-    finally:
-        if staged_parameter_state_path is not None:
-            staged_parameter_state_path.unlink(missing_ok=True)
-    if ignored_legacy_buffer_keys:
+        except Exception as exc:
+            raise RuntimeError(
+                "local checkpoint identity validation failed and staging cleanup "
+                f"also failed: {exc}"
+            ) from identity_exception
+        raise
+    if plan.checkpoint_format == _LOCAL_TRAINING_FORMAT_V3:
+        local_exception = None
+        if (
+            plan.topology != current_topology
+            or plan.rank_coordinate != current_rank_coordinate
+        ):
+            local_exception = RuntimeError(
+                "local checkpoint topology/rank coordinate does not match runtime: "
+                f"saved_topology={plan.topology}, current_topology={current_topology}, "
+                f"saved_rank={plan.rank_coordinate}, "
+                f"current_rank={current_rank_coordinate}"
+            )
+        topology_exception: Exception | None = None
+        try:
+            _raise_checkpoint_phase_error(
+                local_exception, context="local checkpoint topology validation failed"
+            )
+        except Exception as exc:
+            topology_exception = exc
+        if topology_exception is not None:
+            cleanup_exception = _cleanup_local_optimizer_parameter_state_staging(
+                plan.staged_parameter_state_path
+            )
+            _raise_checkpoint_phase_error(
+                cleanup_exception,
+                context="local checkpoint topology mismatch cleanup failed",
+            )
+            raise topology_exception
+    if (
+        _is_distributed_checkpoint_ranked()
+        and plan.checkpoint_format == _LOCAL_TRAINING_FORMAT_V3
+        and completion is None
+    ):
+        cleanup_exception = _cleanup_local_optimizer_parameter_state_staging(
+            plan.staged_parameter_state_path
+        )
+        _raise_checkpoint_phase_error(
+            cleanup_exception,
+            context="local checkpoint missing completion cleanup failed",
+        )
+        raise RuntimeError(
+            "V3 distributed local checkpoint is missing its required completion "
+            "marker; allow_legacy_checkpoint cannot bypass a torn V3 transaction."
+        )
+    if completion is not None:
+        loaded_identity = {
+            "format": plan.checkpoint_format,
+            "step": plan.step,
+            "generation": plan.generation,
+            "topology": plan.topology,
+        }
+        expected_identity = {
+            "format": completion["format"],
+            "step": completion["step"],
+            "generation": completion["generation"],
+            "topology": completion["topology"],
+        }
+        if loaded_identity != expected_identity:
+            cleanup_exception = _cleanup_local_optimizer_parameter_state_staging(
+                plan.staged_parameter_state_path
+            )
+            _raise_checkpoint_phase_error(
+                cleanup_exception,
+                context="local checkpoint completion mismatch cleanup failed",
+            )
+            raise RuntimeError(
+                "local checkpoint payload does not match the completed generation: "
+                f"payload={loaded_identity}, completion={expected_identity}"
+            )
+
+    local_exception = None
+    try:
+        if plan.parameter_state_path is not None:
+            _revalidate_local_optimizer_parameter_state(
+                plan.staged_parameter_state_path, plan.parameter_state_fingerprint
+            )
+    except Exception as exc:
+        local_exception = exc
+    try:
+        _raise_checkpoint_phase_error(
+            local_exception, context="local checkpoint load revalidation failed"
+        )
+    except Exception:
+        if plan.staged_parameter_state_path is not None:
+            plan.staged_parameter_state_path.unlink(missing_ok=True)
+        raise
+
+    # Commit is split into local, DP-collective, and local phases. Each local
+    # phase reaches WORLD consensus before any rank may enter the next phase.
+    commit_exception: BaseException | None = None
+    mutation_started = False
+    commit_phases: list[tuple[str, Callable[[Callable[[], None]], None]]] = [
+        (
+            "local checkpoint load core commit failed",
+            lambda mark: _commit_local_training_checkpoint_core(
+                plan, mark_mutation_started=mark
+            ),
+        )
+    ]
+    if plan.parameter_state_load_path is not None:
+        commit_phases.append(
+            (
+                "local checkpoint load optimizer parameter-state commit failed",
+                lambda mark: _commit_local_training_checkpoint_parameter_state(
+                    plan, mark_mutation_started=mark
+                ),
+            )
+        )
+    commit_phases.append(
+        (
+            "local checkpoint load RNG commit failed",
+            lambda mark: _commit_local_training_checkpoint_rng(
+                plan, mark_mutation_started=mark
+            ),
+        )
+    )
+    for context, action in commit_phases:
+        local_exception = None
+        phase_mutation_started = False
+
+        def mark_phase_mutation_started() -> None:
+            nonlocal phase_mutation_started
+            phase_mutation_started = True
+
+        try:
+            action(mark_phase_mutation_started)
+        except BaseException as exc:
+            local_exception = exc
+        try:
+            mutation_started = _raise_checkpoint_load_commit_error(
+                local_exception,
+                mutation_started=mutation_started or phase_mutation_started,
+                context=context,
+            )
+        except BaseException as exc:
+            commit_exception = exc
+            break
+
+    if commit_exception is not None:
+        if _is_control_flow_exception(commit_exception) or (
+            isinstance(commit_exception, CheckpointLoadFatalError)
+            and commit_exception._peer_control_flow
+        ):
+            raise commit_exception
+        staging_cleanup_exception = _cleanup_local_optimizer_parameter_state_staging(
+            plan.staged_parameter_state_path
+        )
+        try:
+            _raise_checkpoint_load_commit_error(
+                staging_cleanup_exception,
+                mutation_started=_checkpoint_exception_started_mutation(
+                    commit_exception
+                ),
+                context="local checkpoint load failed-commit staging cleanup failed",
+            )
+        except CheckpointLoadFatalError as exc:
+            raise CheckpointLoadFatalError(
+                "local checkpoint load commit failed; runtime must be poisoned; "
+                "discard and reinitialize model/optimizer state; staging cleanup "
+                f"also failed: {exc}; original commit error: {commit_exception}"
+            ) from commit_exception
+        except Exception as exc:
+            raise RuntimeError(
+                "local checkpoint load failed before live-state mutation and "
+                f"staging cleanup also failed: {exc}; original error: "
+                f"{commit_exception}"
+            ) from commit_exception
+        if not isinstance(commit_exception, CheckpointLoadFatalError):
+            raise commit_exception
+        raise CheckpointLoadFatalError(
+            "local checkpoint load commit failed; runtime must be poisoned; "
+            "discard and reinitialize model/optimizer state before further use: "
+            f"{commit_exception}"
+        ) from commit_exception
+
+    staging_cleanup_exception = _cleanup_local_optimizer_parameter_state_staging(
+        plan.staged_parameter_state_path
+    )
+    _raise_checkpoint_load_commit_error(
+        staging_cleanup_exception,
+        mutation_started=mutation_started,
+        context="local checkpoint load staging cleanup failed",
+    )
+
+    if plan.ignored_legacy_buffer_keys:
         log_rank0(
             "Loaded legacy local checkpoint while ignoring current non-persistent "
-            f"runtime buffers: {ignored_legacy_buffer_keys}"
+            f"runtime buffers: {plan.ignored_legacy_buffer_keys}"
         )
-    log_rank0(f"Loaded local training checkpoint from {ckpt_file} at step {step}")
-    return step
+    log_rank0(
+        f"Loaded local training checkpoint from {plan.ckpt_file} at step {plan.step}"
+    )
+    return plan.step
 
 
 def _build_meshes(config):

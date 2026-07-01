@@ -35,6 +35,49 @@ All runtime backends implement the pretraining tier:
 The lite runtime also implements `export_weights` and `to` when the underlying
 model and optimizer support those operations.
 
+## Fatal Checkpoint Loads
+
+`MegatronLiteRuntime.load_checkpoint` separates read-only preflight from final
+live-state application. Metadata, sidecar, topology, and schema failures found
+during preflight raise their ordinary `Exception` and leave `handle` usable.
+
+If model, optimizer, RNG, or registered extra-state application has started and
+the load then fails, it raises `CheckpointLoadFatalError` and permanently sets
+`handle.poisoned` to `True`. The target state may be partially restored on this
+rank or a distributed peer. The handle must be discarded and rebuilt; every
+later lite-runtime operation using it (including save/load, mode changes,
+forward/backward, optimizer/scheduler steps, export, and offload) fails closed.
+The original error is available as `handle.poison_reason`.
+
+Non-`Exception` control flow (`KeyboardInterrupt`, `SystemExit`, cancellation,
+or another `BaseException`) is never converted or swallowed: the source rank
+re-raises the original object. Because the exact interruption point cannot be
+proven safe, every participating runtime fails closed and poisons its handle;
+peer ranks receive `CheckpointLoadFatalError`. Discard the handle even if the
+interrupt appeared to occur during preflight. `ModelHandle` is also deliberately
+uncopyable and unpicklable so an alias cannot bypass this shared-state poison
+boundary.
+
+Registered extra-state validators and target adapters are trusted transaction
+code. Their `validate`, optional `validate_step`, `snapshot`, and `fingerprint`
+callbacks must be side-effect free and may return only canonical plain-data
+fingerprints; `apply` and `restore` must mutate only their own target. Coupled
+state belongs in one composite target. MLite scans all registered fingerprints
+around every callback, but cannot dynamically prove that the very first
+successful `fingerprint()` call itself was pure; registering an adapter asserts
+that boundary explicitly.
+
+```python
+from megatron.lite.runtime import CheckpointLoadFatalError
+
+try:
+    runtime.load_checkpoint(handle, checkpoint_path)
+except CheckpointLoadFatalError:
+    # Never reuse handle here.
+    handle = runtime.build_model()
+    raise
+```
+
 The `mbridge` runtime implements the same runtime contract through the legacy
 `mbridge` package and Megatron-Core optimizer/checkpoint helpers. The benchmark
 example currently uses this backend for validated reference runs.

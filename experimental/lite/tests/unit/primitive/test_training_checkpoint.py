@@ -19,7 +19,7 @@ pytest.importorskip("megatron.core.dist_checkpointing")
 from megatron.core.dist_checkpointing.strategies.torch import (
     _replace_state_dict_keys_with_sharded_keys,
 )
-from megatron.lite.primitive.ckpt import dcp
+from megatron.lite.primitive.ckpt import CheckpointLoadFatalError, dcp
 from megatron.lite.primitive.ckpt.distckpt import (
     _iter_sharded_bases,
     _load_model_state_dict,
@@ -107,7 +107,25 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
             if torch.is_tensor(value):
                 value.zero_()
 
-    dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
+    optimizer_state, rng_state, extra_states = dcp._preload_checkpoint_sidecars(
+        str(tmp_path),
+        optimizer=optimizer,
+        load_optimizer=True,
+        load_rng=False,
+        rng_required=False,
+        extra_state_files=(),
+        extra_state_validators={},
+        extra_state_targets={},
+        checkpoint_step=None,
+    )
+    dcp._commit_preloaded_sidecars(
+        optimizer=optimizer,
+        optimizer_state=optimizer_state,
+        rng_state=rng_state,
+        loaded_extra_states=None,
+        extra_state_values=extra_states,
+        extra_state_targets={},
+    )
 
     assert (tmp_path / "optimizer_rank_0.pt").exists()
     _assert_state_equal(optimizer.state_dict(), expected)
@@ -119,10 +137,23 @@ def test_optimizer_checkpoint_load_fails_when_requested_state_is_missing(
     optimizer = torch.optim.AdamW(torch.nn.Linear(2, 2).parameters(), lr=0.01)
 
     with pytest.raises(
-        FileNotFoundError,
-        match="optimizer checkpoint requested by load_optimizer=True is missing",
+        RuntimeError,
+        match=(
+            "checkpoint sidecar preflight failed.*optimizer checkpoint requested "
+            "by load_optimizer=True is missing"
+        ),
     ):
-        dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
+        dcp._preload_checkpoint_sidecars(
+            str(tmp_path),
+            optimizer=optimizer,
+            load_optimizer=True,
+            load_rng=False,
+            rng_required=False,
+            extra_state_files=(),
+            extra_state_validators={},
+            extra_state_targets={},
+            checkpoint_step=None,
+        )
 
 
 def test_dcp_model_tensor_contract_includes_only_persistent_buffers() -> None:
@@ -968,6 +999,141 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
     torch.testing.assert_close(wrapped_module.weight, expected_weight)
     torch.testing.assert_close(wrapped_module.bias, expected_bias)
     assert optimizer.loaded_state == {"loaded": True}
+
+
+def test_dist_opt_optimizer_failure_after_model_application_is_fatal(
+    monkeypatch, tmp_path
+) -> None:
+    class FailingDistOpt(FakeDistOpt):
+        def load_state_dict(self, state):
+            super().load_state_dict(state)
+            raise RuntimeError("injected dist-opt application failure")
+
+    model = torch.nn.Linear(2, 2)
+    optimizer = FailingDistOpt()
+    attach_model_sharded_state_dict([model], ParallelState())
+    model_sd = _model_sharded_state_dict(model)
+    checkpoint_metadata = _fake_checkpoint_metadata(model_sd)
+    expected_weight = torch.full_like(model.weight, 13.0)
+    expected_bias = torch.full_like(model.bias, -6.0)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load",
+        lambda *_args, **_kwargs: {
+            "step": 8,
+            "model": {"weight": expected_weight, "bias": expected_bias},
+            "optimizer": {"loaded": True},
+        },
+    )
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt._load_checkpoint_sharded_metadata",
+        lambda _path: checkpoint_metadata,
+    )
+    _mock_distckpt_common_state(
+        monkeypatch,
+        {
+            "step": 8,
+            "optimizer": {"is_loading": False},
+            "content_metadata": DISTOPT_METADATA,
+        },
+    )
+
+    with pytest.raises(
+        CheckpointLoadFatalError,
+        match="distckpt optimizer state application failed after live-state mutation",
+    ):
+        load_dist_opt_checkpoint(model, optimizer, str(tmp_path))
+
+    torch.testing.assert_close(model.weight, expected_weight)
+    torch.testing.assert_close(model.bias, expected_bias)
+    assert optimizer.loaded_state == {"loaded": True}
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "message"),
+    [
+        ("load", "distckpt checkpoint load failed after live-state mutation"),
+        (
+            "step",
+            "distckpt checkpoint step validation failed after live-state mutation",
+        ),
+        (
+            "completeness",
+            "distckpt checkpoint completeness validation failed after live-state mutation",
+        ),
+        (
+            "plan",
+            "distckpt model state application validation failed after live-state mutation",
+        ),
+    ],
+)
+def test_distckpt_actual_load_and_post_load_failures_poison_handle(
+    monkeypatch, tmp_path, failure_mode, message
+) -> None:
+    model = torch.nn.Linear(2, 2)
+    optimizer = FakeDistOpt()
+    attach_model_sharded_state_dict([model], ParallelState())
+    model_sd = _model_sharded_state_dict(model)
+    optimizer_sd = optimizer.sharded_state_dict(
+        _single_or_all_model_state(model_sd), is_loading=True, metadata=DISTOPT_METADATA
+    )
+    checkpoint_metadata = _fake_checkpoint_metadata(model_sd, optimizer_sd)
+    step_path = tmp_path / "step_5"
+    manifest = dcp._begin_checkpoint_transaction(
+        str(step_path),
+        step=5,
+        save_model=True,
+        save_optimizer=True,
+        save_rng=False,
+        payload_format="distckpt",
+        optimizer_storage="distckpt",
+    )
+    dcp._complete_checkpoint_transaction(str(step_path), manifest)
+
+    def fake_load(*_args, **_kwargs):
+        with torch.no_grad():
+            model.weight.fill_(37)
+        if failure_mode == "load":
+            raise RuntimeError("injected MCore load failure")
+        payload = {
+            "step": 6 if failure_mode == "step" else 5,
+            "model": {
+                "weight": torch.full_like(model.weight, 37),
+                "bias": torch.full_like(model.bias, -4),
+            },
+            "optimizer": {"loaded": True},
+        }
+        if failure_mode == "completeness":
+            payload.pop("optimizer")
+        if failure_mode == "plan":
+            payload["model"].pop("bias")
+        return payload
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load
+    )
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt._load_checkpoint_sharded_metadata",
+        lambda _path: checkpoint_metadata,
+    )
+    _mock_distckpt_common_state(
+        monkeypatch,
+        {
+            "step": 5,
+            "optimizer": {"is_loading": False},
+            "content_metadata": DISTOPT_METADATA,
+        },
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    handle = ModelHandle(model=model, optimizer=optimizer)
+
+    with pytest.raises(CheckpointLoadFatalError, match=message):
+        runtime.load_checkpoint(handle, str(step_path), load_rng=False)
+
+    assert handle.poisoned is True
+    torch.testing.assert_close(model.weight, torch.full_like(model.weight, 37))
+    with pytest.raises(RuntimeError, match="ModelHandle is poisoned"):
+        runtime.optimizer_step(handle)
 
 
 @pytest.mark.parametrize(

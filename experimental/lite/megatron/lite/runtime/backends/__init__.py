@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import torch
-
     from megatron.lite.runtime.contracts.data import ForwardResult
     from megatron.lite.runtime.contracts.handle import ModelHandle
 
@@ -44,7 +43,9 @@ class Runtime(ABC):
     # Model lifecycle
 
     @abstractmethod
-    def build_model(self, hf_path: str | None = None, cfg: Any = None, **kwargs) -> ModelHandle:
+    def build_model(
+        self, hf_path: str | None = None, cfg: Any = None, **kwargs
+    ) -> ModelHandle:
         """Build model state for this runtime.
 
         Implementations should default to the ``hf_path`` / ``backend_cfg``
@@ -58,7 +59,17 @@ class Runtime(ABC):
     def save_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None: ...
 
     @abstractmethod
-    def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int: ...
+    def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int:
+        """Load checkpoint state into ``handle``.
+
+        Backends that expose a post-mutation fatal-load exception must document
+        whether it permanently invalidates the handle. Megatron Lite raises
+        ``CheckpointLoadFatalError`` and rejects every subsequent operation on
+        the poisoned handle. It also propagates non-``Exception`` control flow
+        unchanged while conservatively poisoning the handle because the safe
+        point is unknown. Ordinary read-only preflight failures do not poison it.
+        """
+        ...
 
     # Mode switching
 
@@ -119,7 +130,9 @@ class Runtime(ABC):
 
     # ── L2: RL Ready (覆盖即解锁) ───────────────────────────────
 
-    def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+    def export_weights(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         """Iterate over (name, tensor) pairs for HF-compatible weight export.
 
         Required by RL frameworks to send weights to the inference engine.

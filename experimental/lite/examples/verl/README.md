@@ -148,7 +148,21 @@ Useful GRPO knobs:
   backend in text-only mode for GSM8K by default.
 - `ACTOR_TP`, `ACTOR_PP`, `ACTOR_VPP`, `ACTOR_CP`, `ACTOR_EP`, `ACTOR_ETP`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
-- `INFER_BACKEND=vllm`
+- `INFER_BACKEND=vllm|sglang` for Qwen3.5. The launcher exports vLLM's internal
+  keyspace for vLLM v0.20.2 and the released Hugging Face keyspace for SGLang
+  v0.5.9.
+- The launcher defaults `MLITE_MODEL_NAME=qwen3_5`. It rejects
+  `MLITE_MODEL_NAME=auto` because the consumer keyspace must be selected before
+  Python resolves the Hugging Face config, and model-path strings are not an
+  authoritative model-type signal. Set an explicit model name for other models.
+- Qwen3.5 with `INFER_BACKEND=trtllm` is deliberately blocked for the pinned
+  VERL commit `1ff76cc625e9820d2434dad1b6d9b8e5dd26a359` and TensorRT-LLM
+  v1.3.0rc19. The live dynamic-reload path has not been validated end to end;
+  static mapper and key-normalization inspection alone is insufficient evidence
+  for a readiness claim.
+- `INFER_BACKEND=trtllm` remains accepted only when `MLITE_MODEL_NAME`
+  explicitly selects a non-Qwen3.5 model; that compatibility route keeps the
+  released Hugging Face keyspace and is not a Qwen3.5 readiness claim.
 - `POLICY_LOSS_MODE=vanilla` and `LOSS_AGG_MODE=seq-mean-token-sum-norm`
   select the pure GRPO baseline policy loss and aggregation mode.
 

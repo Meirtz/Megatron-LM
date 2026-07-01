@@ -1,10 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import asyncio
 import copy
 import math
 from types import SimpleNamespace
 
 import pytest
 import torch
+from megatron.lite.primitive.ckpt import CheckpointLoadFatalError
+from megatron.lite.runtime.contracts.handle import ModelHandle
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import (
     _LR_SCHEDULER_CONFIG_FIELDS,
@@ -13,9 +16,11 @@ from verl_mlite.engine.mlite_engine import (
     _LR_SCHEDULER_STATE,
     MegatronLiteEngine,
     _checkpoint_components_with_consensus,
+    _checkpoint_load_phase_with_consensus,
     _content_set,
     _LRSchedulerCheckpointTarget,
     _MegatronLiteLRScheduler,
+    _MegatronLiteModeCtx,
     _scheduler_payload,
     _scheduler_state_with_consensus,
     _validate_lr_scheduler_payload,
@@ -166,18 +171,23 @@ def _initialized_engine(*, checkpoint_config=None, param_offload=False):
     )
     scheduler = _Scheduler(optimizer)
     engine.module = module
-    engine.handle = SimpleNamespace(
-        _optimizer=optimizer,
-        _lr_scheduler=scheduler,
-        _config=SimpleNamespace(parallel=parallel),
-        _parallel_state=parallel_state,
+    engine.handle = ModelHandle(
+        model=module,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        config=SimpleNamespace(parallel=parallel),
+        parallel_state=parallel_state,
         _extras={
             "protocol": SimpleNamespace(
                 PLACEMENT_FN=placement_fn, EXPERT_CLASSIFIER=expert_classifier
             )
         },
     )
-    engine.runtime = object()
+    engine.runtime = SimpleNamespace(
+        load_checkpoint=lambda *_args, **_kwargs: pytest.fail(
+            "unexpected runtime checkpoint load"
+        )
+    )
     return (
         engine,
         module,
@@ -188,6 +198,19 @@ def _initialized_engine(*, checkpoint_config=None, param_offload=False):
         placement_fn,
         expert_classifier,
     )
+
+
+def _successful_scheduler_runtime_load(payload):
+    def load_checkpoint(_handle, _path, **kwargs):
+        targets = kwargs.get("extra_state_targets")
+        if targets:
+            target = targets[_LR_SCHEDULER_STATE]
+            target.validate_step(payload, payload["checkpoint_step"])
+            target.apply(payload)
+            kwargs["loaded_extra_states"][_LR_SCHEDULER_STATE] = payload
+        return payload["checkpoint_step"]
+
+    return load_checkpoint
 
 
 def test_checkpoint_content_set_uses_exact_keys_and_rejects_unknown_values():
@@ -443,11 +466,14 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(
         kwargs["loaded_extra_states"][_LR_SCHEDULER_STATE] = saved_scheduler_payload
         return 23
 
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint", fake_load
-    )
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", fake_load)
 
-    engine.load_checkpoint(str(tmp_path))
+    engine.load_checkpoint(
+        str(tmp_path),
+        use_dcp=False,
+        update_legacy_format=True,
+        consumer_token="sentinel",
+    )
 
     assert to_calls == [
         {"device": "cuda", "model": True, "optimizer": False, "grad": False},
@@ -458,13 +484,17 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(
     assert optimizer.param_groups[0]["lr"] == 0.125
     assert len(load_calls) == 1
     load_args, load_kwargs = load_calls[0]
-    assert load_args == (module, optimizer, str(tmp_path), parallel, parallel_state)
+    assert load_args == (engine.handle, str(tmp_path))
     assert load_kwargs["get_placements"] is placement_fn
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["load_model"] is True
     assert load_kwargs["load_optimizer"] is True
     assert load_kwargs["load_rng"] is True
     assert load_kwargs["allow_legacy_checkpoint"] is False
+    assert load_kwargs["use_dcp"] is False
+    assert load_kwargs["load_parameter_state_update_legacy_format"] is True
+    assert "update_legacy_format" not in load_kwargs
+    assert load_kwargs["consumer_token"] == "sentinel"
     assert load_kwargs["load_extra_state_files"] == (_LR_SCHEDULER_STATE,)
     assert load_kwargs["loaded_extra_states"] == {
         _LR_SCHEDULER_STATE: saved_scheduler_payload
@@ -508,9 +538,7 @@ def test_load_checkpoint_component_policy_is_symmetric(
             kwargs["loaded_extra_states"][_LR_SCHEDULER_STATE] = payload
         return 5
 
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint", fake_load
-    )
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", fake_load)
 
     load_model, load_optimizer, load_rng, has_scheduler_target = expected
     if load_optimizer and not load_rng:
@@ -537,7 +565,8 @@ def test_load_contents_defaults_to_saved_partial_component_policy(
     engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["model"]})
     calls = []
     monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        engine.runtime,
+        "load_checkpoint",
         lambda *args, **kwargs: calls.append((args, kwargs)) or 3,
     )
 
@@ -550,7 +579,7 @@ def test_load_contents_defaults_to_saved_partial_component_policy(
     assert kwargs["extra_state_targets"] is None
 
 
-def test_load_setup_failure_reaches_consensus_before_checkpoint_collectives(
+def test_load_setup_preflight_failure_reaches_consensus_without_poisoning(
     tmp_path, monkeypatch
 ):
     engine, *_ = _initialized_engine()
@@ -558,7 +587,8 @@ def test_load_setup_failure_reaches_consensus_before_checkpoint_collectives(
         engine, "_checkpoint_hooks", lambda: (_ for _ in ()).throw(OSError("hook boom"))
     )
     monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        engine.runtime,
+        "load_checkpoint",
         lambda *args, **kwargs: pytest.fail("checkpoint load must not run"),
     )
     monkeypatch.setattr(
@@ -568,11 +598,9 @@ def test_load_setup_failure_reaches_consensus_before_checkpoint_collectives(
     gathered_errors = []
 
     def fake_all_gather_object(output, value):
-        if isinstance(value, str):
-            gathered_errors.append(value)
-            output[:] = [value, None]
-        else:
-            output[:] = [copy.deepcopy(value), copy.deepcopy(value)]
+        if isinstance(value, dict) and value.get("error") is not None:
+            gathered_errors.append(value["error"])
+        output[:] = [copy.deepcopy(value), copy.deepcopy(value)]
 
     monkeypatch.setattr(
         "verl_mlite.engine.mlite_engine.dist.all_gather_object", fake_all_gather_object
@@ -582,7 +610,177 @@ def test_load_setup_failure_reaches_consensus_before_checkpoint_collectives(
         engine.load_checkpoint(str(tmp_path))
 
     assert any("hook boom" in error for error in gathered_errors)
+    assert engine._checkpoint_load_poisoned is False
+    assert engine.handle.poisoned is False
+    engine._require_initialized()
+
+
+def test_runtime_preflight_failure_restores_offload_without_poisoning(
+    tmp_path, monkeypatch
+):
+    engine, *_ = _initialized_engine(param_offload=True)
+    preflight_error = ValueError("checkpoint metadata mismatch")
+    to_calls = []
+    monkeypatch.setattr(engine, "to", lambda **kwargs: to_calls.append(kwargs))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def fail_preflight(*_args, **_kwargs):
+        raise preflight_error
+
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", fail_preflight)
+
+    with pytest.raises(ValueError) as exc_info:
+        engine.load_checkpoint(str(tmp_path))
+
+    assert exc_info.value is preflight_error
+    assert to_calls == [
+        {"device": "cuda", "model": True, "optimizer": False, "grad": False},
+        {"device": "cpu", "model": True, "optimizer": False, "grad": False},
+    ]
+    assert engine._checkpoint_load_poisoned is False
+    assert engine.handle.poisoned is False
+    engine._require_initialized()
+
+
+def test_runtime_fatal_load_poisons_both_layers_and_skips_offload_cleanup(
+    tmp_path, monkeypatch
+):
+    engine, *_ = _initialized_engine(param_offload=True)
+    to_calls = []
+    monkeypatch.setattr(engine, "to", lambda **kwargs: to_calls.append(kwargs))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def fail_after_core_mutation(*_args, **_kwargs):
+        raise CheckpointLoadFatalError("core checkpoint commit boom")
+
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", fail_after_core_mutation)
+
+    with pytest.raises(CheckpointLoadFatalError, match="core checkpoint commit boom"):
+        engine.load_checkpoint(str(tmp_path))
+
+    assert to_calls == [
+        {"device": "cuda", "model": True, "optimizer": False, "grad": False}
+    ]
     assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+    with pytest.raises(RuntimeError, match="poisoned by a failed checkpoint load"):
+        engine._require_initialized()
+
+
+def test_cuda_reload_failure_is_fatal_and_never_attempts_cpu_cleanup(
+    tmp_path, monkeypatch
+):
+    engine, *_ = _initialized_engine(param_offload=True)
+    to_calls = []
+
+    def fail_cuda_reload(**kwargs):
+        to_calls.append(kwargs)
+        raise OSError("partial cuda transfer")
+
+    monkeypatch.setattr(engine, "to", fail_cuda_reload)
+    monkeypatch.setattr(
+        engine.runtime,
+        "load_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail("core load must not run"),
+    )
+
+    with pytest.raises(CheckpointLoadFatalError, match="partial cuda transfer"):
+        engine.load_checkpoint(str(tmp_path))
+
+    assert to_calls == [
+        {"device": "cuda", "model": True, "optimizer": False, "grad": False}
+    ]
+    assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+
+
+def test_preflight_offload_cleanup_failure_is_fatal(tmp_path, monkeypatch):
+    engine, *_ = _initialized_engine(param_offload=True)
+    to_calls = []
+
+    def fail_cpu_cleanup(**kwargs):
+        to_calls.append(kwargs)
+        if kwargs["device"] == "cpu":
+            raise RuntimeError("preflight cleanup boom")
+
+    monkeypatch.setattr(engine, "to", fail_cpu_cleanup)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        engine.runtime,
+        "load_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad metadata")),
+    )
+
+    with pytest.raises(CheckpointLoadFatalError, match="preflight cleanup boom"):
+        engine.load_checkpoint(str(tmp_path))
+
+    assert [call["device"] for call in to_calls] == ["cuda", "cpu"]
+    assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+
+
+class _CheckpointCancellation(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "control_flow",
+    [
+        KeyboardInterrupt("checkpoint interrupt"),
+        SystemExit("checkpoint exit"),
+        asyncio.CancelledError("checkpoint cancellation"),
+        GeneratorExit("checkpoint generator exit"),
+        _CheckpointCancellation("custom checkpoint cancellation"),
+    ],
+    ids=["interrupt", "exit", "cancelled", "generator-exit", "custom"],
+)
+def test_runtime_control_flow_preserves_identity_poisons_and_skips_cleanup(
+    tmp_path, monkeypatch, control_flow
+):
+    engine, *_ = _initialized_engine(param_offload=True)
+    to_calls = []
+    monkeypatch.setattr(engine, "to", lambda **kwargs: to_calls.append(kwargs))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def interrupt_runtime(*_args, **_kwargs):
+        raise control_flow
+
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", interrupt_runtime)
+
+    with pytest.raises(type(control_flow)) as exc_info:
+        engine.load_checkpoint(str(tmp_path))
+
+    assert exc_info.value is control_flow
+    assert to_calls == [
+        {"device": "cuda", "model": True, "optimizer": False, "grad": False}
+    ]
+    assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+
+
+def test_checkpoint_phase_converts_peer_control_flow_to_fatal(monkeypatch):
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.dist.get_world_size", lambda: 2)
+
+    def fake_all_gather_object(output, value):
+        peer = copy.deepcopy(value)
+        peer.update(
+            {"control_flow": True, "error": "_CheckpointCancellation: peer cancelled"}
+        )
+        output[:] = [copy.deepcopy(value), peer]
+
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.dist.all_gather_object", fake_all_gather_object
+    )
+
+    with pytest.raises(CheckpointLoadFatalError) as exc_info:
+        _checkpoint_load_phase_with_consensus(
+            lambda: None, mutation_started=False, context="peer control-flow test"
+        )
+
+    assert "peer cancelled" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -1038,31 +1236,95 @@ def test_checkpoint_component_presence_mismatch_fails_before_branch(monkeypatch)
         )
 
 
+@pytest.mark.parametrize(
+    "mismatch_field",
+    [
+        "param_offload",
+        "allow_legacy_checkpoint",
+        "use_dcp",
+        "update_legacy_format",
+        "runtime_option_keys",
+    ],
+    ids=[
+        "param-offload",
+        "allow-legacy",
+        "use-dcp",
+        "update-legacy-format",
+        "runtime-option-keys",
+    ],
+)
+def test_load_execution_policy_mismatch_fails_before_device_or_core_work(
+    tmp_path, monkeypatch, mismatch_field
+):
+    engine, *_ = _initialized_engine(param_offload=True)
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.dist.get_world_size", lambda: 2)
+
+    def fake_all_gather_object(output, value):
+        if isinstance(value, dict) and "reload_model_params" in value:
+            peer = copy.deepcopy(value)
+            if mismatch_field == "runtime_option_keys":
+                peer[mismatch_field] = (*peer[mismatch_field], "peer_only_option")
+            else:
+                peer[mismatch_field] = not peer[mismatch_field]
+            output[:] = [copy.deepcopy(value), peer]
+            return
+        output[:] = [copy.deepcopy(value), copy.deepcopy(value)]
+
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.dist.all_gather_object", fake_all_gather_object
+    )
+    monkeypatch.setattr(
+        engine, "to", lambda **_kwargs: pytest.fail("device movement must not start")
+    )
+    monkeypatch.setattr(
+        engine.runtime,
+        "load_checkpoint",
+        lambda *_args, **_kwargs: pytest.fail("core load must not start"),
+    )
+
+    with pytest.raises(RuntimeError, match="execution policy differs across ranks"):
+        engine.load_checkpoint(
+            str(tmp_path),
+            allow_legacy_checkpoint=True,
+            use_dcp=False,
+            update_legacy_format=True,
+        )
+
+    assert engine._checkpoint_load_poisoned is False
+    assert engine.handle.poisoned is False
+
+
 def test_load_checkpoint_rejects_missing_required_scheduler_extra_state(
     tmp_path, monkeypatch
 ):
-    engine, *_ = _initialized_engine()
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
-        lambda *args, **kwargs: 17,
-    )
+    engine, *_ = _initialized_engine(param_offload=True)
+    to_calls = []
+    monkeypatch.setattr(engine, "to", lambda **kwargs: to_calls.append(kwargs))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", lambda *args, **kwargs: 17)
 
-    with pytest.raises(RuntimeError, match="required lr_scheduler.pt extra state"):
+    with pytest.raises(
+        CheckpointLoadFatalError, match="required lr_scheduler.pt extra state"
+    ):
         engine.load_checkpoint(str(tmp_path))
 
     assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+    assert to_calls == [
+        {"device": "cuda", "model": True, "optimizer": False, "grad": False}
+    ]
     with pytest.raises(RuntimeError, match="poisoned by a failed checkpoint load"):
         engine.optimizer_step()
 
 
-def test_post_load_validation_reaches_error_consensus_before_barrier(
+def test_post_load_validation_reaches_fatal_consensus_without_barrier(
     tmp_path, monkeypatch
 ):
     engine, *_ = _initialized_engine()
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
-        lambda *args, **kwargs: 17,
-    )
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", lambda *args, **kwargs: 17)
     monkeypatch.setattr(
         "verl_mlite.engine.mlite_engine.dist.is_initialized", lambda: True
     )
@@ -1070,8 +1332,8 @@ def test_post_load_validation_reaches_error_consensus_before_barrier(
     gathered_errors = []
 
     def fake_all_gather_object(output, value):
-        if isinstance(value, str):
-            gathered_errors.append(value)
+        if isinstance(value, dict) and value.get("error") is not None:
+            gathered_errors.append(value["error"])
         output[:] = [copy.deepcopy(value), copy.deepcopy(value)]
 
     monkeypatch.setattr(
@@ -1082,13 +1344,16 @@ def test_post_load_validation_reaches_error_consensus_before_barrier(
         lambda: pytest.fail("barrier must not run after post-load validation failure"),
     )
 
-    with pytest.raises(RuntimeError, match="required lr_scheduler.pt extra state"):
+    with pytest.raises(
+        CheckpointLoadFatalError, match="required lr_scheduler.pt extra state"
+    ):
         engine.load_checkpoint(str(tmp_path))
 
     assert any(
         "required lr_scheduler.pt extra state" in error for error in gathered_errors
     )
     assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
 
 
 def test_legacy_step_validation_reaches_consensus_before_scheduler_commit(
@@ -1102,10 +1367,7 @@ def test_legacy_step_validation_reaches_consensus_before_scheduler_commit(
         "verl_mlite.engine.mlite_engine._legacy_scheduler_payload_with_consensus",
         lambda *_args, **_kwargs: payload,
     )
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
-        lambda *args, **kwargs: 9,
-    )
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", lambda *args, **kwargs: 9)
     monkeypatch.setattr(dcp_impl, "_preflight_extra_state_targets", lambda *_args: None)
     monkeypatch.setattr(
         dcp_impl,
@@ -1121,19 +1383,132 @@ def test_legacy_step_validation_reaches_consensus_before_scheduler_commit(
     gathered_errors = []
 
     def fake_all_gather_object(output, value):
-        if isinstance(value, str):
-            gathered_errors.append(value)
+        if isinstance(value, dict) and value.get("error") is not None:
+            gathered_errors.append(value["error"])
         output[:] = [copy.deepcopy(value), copy.deepcopy(value)]
 
     monkeypatch.setattr(
         "verl_mlite.engine.mlite_engine.dist.all_gather_object", fake_all_gather_object
     )
 
-    with pytest.raises(RuntimeError, match="sidecar/core step mismatch"):
+    with pytest.raises(CheckpointLoadFatalError, match="sidecar/core step mismatch"):
         engine.load_checkpoint(str(tmp_path), allow_legacy_checkpoint=True)
 
     assert any("sidecar/core step mismatch" in error for error in gathered_errors)
     assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+
+
+def test_legacy_scheduler_commit_failure_after_core_is_fatal(tmp_path, monkeypatch):
+    from megatron.lite.primitive.ckpt import dcp as dcp_impl
+
+    engine, *_ = _initialized_engine()
+    payload = _scheduler_payload_state(checkpoint_step=8, num_steps=8)
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine._legacy_scheduler_payload_with_consensus",
+        lambda *_args, **_kwargs: payload,
+    )
+    monkeypatch.setattr(dcp_impl, "_preflight_extra_state_targets", lambda *_args: None)
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", lambda *_args, **_kwargs: 8)
+    monkeypatch.setattr(
+        dcp_impl,
+        "_commit_extra_state_targets",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("legacy scheduler commit boom")
+        ),
+    )
+
+    with pytest.raises(CheckpointLoadFatalError, match="legacy scheduler commit boom"):
+        engine.load_checkpoint(str(tmp_path), allow_legacy_checkpoint=True)
+
+    assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+
+
+def test_legacy_scheduler_publication_failure_after_core_is_fatal(
+    tmp_path, monkeypatch
+):
+    from megatron.lite.primitive.ckpt import dcp as dcp_impl
+
+    engine, *_ = _initialized_engine()
+    payload = _scheduler_payload_state(checkpoint_step=8, num_steps=8)
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine._legacy_scheduler_payload_with_consensus",
+        lambda *_args, **_kwargs: payload,
+    )
+    monkeypatch.setattr(dcp_impl, "_preflight_extra_state_targets", lambda *_args: None)
+    monkeypatch.setattr(
+        dcp_impl, "_commit_extra_state_targets", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", lambda *_args, **_kwargs: 8)
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine._publish_loaded_extra_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("legacy scheduler publication boom")
+        ),
+    )
+
+    with pytest.raises(
+        CheckpointLoadFatalError, match="legacy scheduler publication boom"
+    ):
+        engine.load_checkpoint(str(tmp_path), allow_legacy_checkpoint=True)
+
+    assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+
+
+def test_completion_fence_failure_after_core_is_fatal(tmp_path, monkeypatch):
+    from verl_mlite.engine import mlite_engine as engine_impl
+
+    engine, *_ = _initialized_engine()
+    payload = _scheduler_payload_state(checkpoint_step=12, num_steps=12)
+    monkeypatch.setattr(
+        engine.runtime, "load_checkpoint", _successful_scheduler_runtime_load(payload)
+    )
+    original_consensus = engine_impl._raise_checkpoint_load_commit_error
+
+    def fail_completion_fence(local_exception, *, mutation_started, context):
+        if "completion fence" in context:
+            raise CheckpointLoadFatalError("completion fence boom")
+        return original_consensus(
+            local_exception, mutation_started=mutation_started, context=context
+        )
+
+    monkeypatch.setattr(
+        engine_impl, "_raise_checkpoint_load_commit_error", fail_completion_fence
+    )
+
+    with pytest.raises(CheckpointLoadFatalError, match="completion fence boom"):
+        engine.load_checkpoint(str(tmp_path))
+
+    assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
+
+
+def test_postcommit_offload_cleanup_failure_is_fatal(tmp_path, monkeypatch):
+    engine, *_ = _initialized_engine(param_offload=True)
+    payload = _scheduler_payload_state(checkpoint_step=12, num_steps=12)
+    to_calls = []
+
+    def fail_cpu_cleanup(**kwargs):
+        to_calls.append(kwargs)
+        if kwargs["device"] == "cpu":
+            raise RuntimeError("postcommit offload cleanup boom")
+
+    monkeypatch.setattr(engine, "to", fail_cpu_cleanup)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        engine.runtime, "load_checkpoint", _successful_scheduler_runtime_load(payload)
+    )
+
+    with pytest.raises(
+        CheckpointLoadFatalError, match="postcommit offload cleanup boom"
+    ):
+        engine.load_checkpoint(str(tmp_path))
+
+    assert [call["device"] for call in to_calls] == ["cuda", "cpu"]
+    assert engine._checkpoint_load_poisoned is True
+    assert engine.handle.poisoned is True
 
 
 def test_explicit_legacy_scheduler_migration_reads_root_sidecar(tmp_path, monkeypatch):
@@ -1146,9 +1521,7 @@ def test_explicit_legacy_scheduler_migration_reads_root_sidecar(tmp_path, monkey
         load_calls.append((args, kwargs))
         return 4
 
-    monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint", fake_load
-    )
+    monkeypatch.setattr(engine.runtime, "load_checkpoint", fake_load)
 
     engine.load_checkpoint(str(tmp_path), allow_legacy_checkpoint=True)
 
@@ -1157,6 +1530,63 @@ def test_explicit_legacy_scheduler_migration_reads_root_sidecar(tmp_path, monkey
     assert kwargs["load_extra_state_files"] is None
     assert kwargs["extra_state_targets"] is None
     assert kwargs["allow_legacy_checkpoint"] is True
+
+
+def test_legacy_migration_notice_failure_reaches_consensus_and_rolls_back_offload(
+    tmp_path, monkeypatch
+):
+    from megatron.lite.primitive.ckpt import dcp as dcp_impl
+
+    engine, *_ = _initialized_engine(param_offload=True)
+    step = tmp_path / "step_4"
+    step.mkdir()
+    torch.save({"num_steps": 4}, tmp_path / _LR_SCHEDULER_STATE)
+    to_calls = []
+    core_calls = []
+    notice_error_records = []
+    monkeypatch.setattr(
+        dcp_impl, "_resolve_step_checkpoint_path", lambda *_args, **_kwargs: str(step)
+    )
+    monkeypatch.setattr(engine, "to", lambda **kwargs: to_calls.append(kwargs))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        engine.runtime,
+        "load_checkpoint",
+        lambda *_args, **_kwargs: core_calls.append(True) or 4,
+    )
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.dist.is_initialized", lambda: True
+    )
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.dist.get_world_size", lambda: 2)
+    monkeypatch.setattr("verl_mlite.engine.mlite_engine.dist.get_rank", lambda: 0)
+
+    def fake_all_gather_object(output, value):
+        if (
+            isinstance(value, dict)
+            and "control_flow" in value
+            and value.get("error") is not None
+            and "migration notice" in value["error"]
+        ):
+            notice_error_records.append(copy.deepcopy(value))
+        output[:] = [copy.deepcopy(value), copy.deepcopy(value)]
+
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.dist.all_gather_object", fake_all_gather_object
+    )
+
+    def fail_notice(*_args, **_kwargs):
+        raise BrokenPipeError("migration notice sink closed")
+
+    monkeypatch.setattr("builtins.print", fail_notice)
+
+    with pytest.raises(RuntimeError, match="migration notice sink closed"):
+        engine.load_checkpoint(str(tmp_path), allow_legacy_checkpoint=True)
+
+    assert len(notice_error_records) == 1
+    assert core_calls == []
+    assert [call["device"] for call in to_calls] == ["cuda", "cpu"]
+    assert engine._checkpoint_load_poisoned is False
+    assert engine.handle.poisoned is False
 
 
 def test_legacy_scheduler_migration_rejects_root_and_step_sidecars(
@@ -1169,12 +1599,104 @@ def test_legacy_scheduler_migration_rejects_root_and_step_sidecars(
     torch.save({"num_steps": 4}, step / _LR_SCHEDULER_STATE)
     core_called = []
     monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        engine.runtime,
+        "load_checkpoint",
         lambda *args, **kwargs: core_called.append(True) or 4,
     )
 
-    with pytest.raises(RuntimeError, match="requires exactly one recognized"):
+    with pytest.raises(FileNotFoundError, match="requires exactly one recognized"):
         engine.load_checkpoint(str(tmp_path), allow_legacy_checkpoint=True)
 
     assert core_called == []
-    assert engine._checkpoint_load_poisoned is True
+    assert engine._checkpoint_load_poisoned is False
+    assert engine.handle.poisoned is False
+
+
+def test_require_initialized_rejects_a_runtime_poisoned_handle():
+    engine, *_ = _initialized_engine()
+    fatal = CheckpointLoadFatalError("runtime poisoned handle")
+    engine.handle._poison_after_checkpoint_load(fatal)
+
+    with pytest.raises(RuntimeError, match="runtime poisoned handle"):
+        engine._require_initialized()
+
+    assert engine._checkpoint_load_poisoned is False
+
+
+def test_poisoned_mode_exit_skips_base_offload_and_preserves_root_cause(monkeypatch):
+    engine, *_ = _initialized_engine(param_offload=True)
+    root_cause = CheckpointLoadFatalError("checkpoint root cause")
+    engine._poison_checkpoint_load(root_cause)
+    base_exit_calls = []
+    runtime_exit_calls = []
+
+    class RuntimeContext:
+        def __exit__(self, *_args):
+            runtime_exit_calls.append(True)
+            raise RuntimeError("runtime context cleanup boom")
+
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.BaseEngineCtx.__exit__",
+        lambda *_args: base_exit_calls.append(True),
+    )
+    ctx = _MegatronLiteModeCtx(engine, mode="eval")
+    ctx._runtime_ctx = RuntimeContext()
+    ctx._entry_grad_enabled = True
+    engine.mode = "eval"
+    previous_grad = torch.is_grad_enabled()
+    torch.set_grad_enabled(False)
+    try:
+        suppressed = ctx.__exit__(
+            CheckpointLoadFatalError, root_cause, root_cause.__traceback__
+        )
+        assert suppressed is False
+        assert torch.is_grad_enabled() is True
+    finally:
+        torch.set_grad_enabled(previous_grad)
+
+    assert runtime_exit_calls == [True]
+    assert base_exit_calls == []
+    assert engine.mode is None
+
+
+@pytest.mark.parametrize(
+    "cleanup_control_flow",
+    [
+        SystemExit("mode cleanup exit"),
+        asyncio.CancelledError("mode cleanup cancellation"),
+        _CheckpointCancellation("mode cleanup custom cancellation"),
+    ],
+    ids=["exit", "cancelled", "custom"],
+)
+def test_poisoned_mode_exit_propagates_new_control_flow_and_restores_state(
+    monkeypatch, cleanup_control_flow
+):
+    engine, *_ = _initialized_engine(param_offload=True)
+    root_cause = CheckpointLoadFatalError("checkpoint root cause")
+    engine._poison_checkpoint_load(root_cause)
+    base_exit_calls = []
+
+    class RuntimeContext:
+        def __exit__(self, *_args):
+            raise cleanup_control_flow
+
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.BaseEngineCtx.__exit__",
+        lambda *_args: base_exit_calls.append(True),
+    )
+    ctx = _MegatronLiteModeCtx(engine, mode="eval")
+    ctx._runtime_ctx = RuntimeContext()
+    ctx._entry_grad_enabled = True
+    engine.mode = "eval"
+    previous_grad = torch.is_grad_enabled()
+    torch.set_grad_enabled(False)
+    try:
+        with pytest.raises(type(cleanup_control_flow)) as exc_info:
+            ctx.__exit__(CheckpointLoadFatalError, root_cause, root_cause.__traceback__)
+        assert exc_info.value is cleanup_control_flow
+        assert torch.is_grad_enabled() is True
+    finally:
+        torch.set_grad_enabled(previous_grad)
+
+    assert base_exit_calls == []
+    assert engine.mode is None

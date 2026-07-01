@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from verl.workers.config.engine import EngineConfig
 
@@ -30,6 +30,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     router_aux_loss_coef: float | None = None
     cross_entropy_fusion: bool | None = None
     export_dtype: str | None = "bfloat16"
+    weight_sync_target: Literal["hf", "vllm"] = "hf"
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
@@ -38,6 +39,11 @@ class MegatronLiteEngineConfig(EngineConfig):
         if self.strategy != "mlite":
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
+            )
+        if self.weight_sync_target not in {"hf", "vllm"}:
+            raise ValueError(
+                "MegatronLiteEngineConfig.weight_sync_target must be 'hf' or "
+                f"'vllm', got {self.weight_sync_target!r}"
             )
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)

@@ -23,6 +23,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.lite.primitive.ckpt.errors import _raise_checkpoint_load_commit_error
 from megatron.lite.primitive.ckpt.hf_weights import (
     _distributed_raise_if_error,
     named_persistent_buffers,
@@ -224,7 +225,8 @@ def load_dist_opt_checkpoint(
     )
     _revalidate_distckpt_common_state_file(checkpoint_dir, common_state_fingerprint)
     state_dict: dict[str, Any] = {}
-    local_error = None
+    local_exception: BaseException | None = None
+    live_state_mutation_started = load_model or load_optimizer
     try:
         state_dict = _load_distckpt_with_preloaded_common(
             load_sd,
@@ -233,37 +235,84 @@ def load_dist_opt_checkpoint(
             validate_access_integrity=False,
             strict=StrictHandling.RAISE_UNEXPECTED,
         )
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
-    _distributed_raise_if_error(local_error, context="distckpt checkpoint load failed")
-    local_error = None
-    loaded_step = int(state_dict.get("step", 0))
-    if expected_step is not None and loaded_step != expected_step:
-        local_error = (
-            f"checkpoint payload step {loaded_step} does not match completion manifest "
-            f"step {expected_step}"
-        )
-    _distributed_raise_if_error(
-        local_error, context="distckpt checkpoint step validation failed"
+    except BaseException as exc:
+        local_exception = exc
+    live_state_mutation_started = _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=live_state_mutation_started,
+        context="distckpt checkpoint load failed",
     )
-    local_error = None
-    if load_optimizer and optimizer is not None and "optimizer" not in state_dict:
-        local_error = (
-            "checkpoint is missing optimizer state requested by load_optimizer=True"
-        )
-    _distributed_raise_if_error(
-        local_error, context="distckpt checkpoint completeness validation failed"
+
+    local_exception = None
+    loaded_step = 0
+    try:
+        loaded_step = int(state_dict.get("step", 0))
+        if expected_step is not None and loaded_step != expected_step:
+            raise RuntimeError(
+                f"checkpoint payload step {loaded_step} does not match completion "
+                f"manifest step {expected_step}"
+            )
+    except BaseException as exc:
+        local_exception = exc
+    live_state_mutation_started = _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=live_state_mutation_started,
+        context="distckpt checkpoint step validation failed",
     )
-    local_error = None
+
+    local_exception = None
+    try:
+        if load_optimizer and optimizer is not None and "optimizer" not in state_dict:
+            raise RuntimeError(
+                "checkpoint is missing optimizer state requested by "
+                "load_optimizer=True"
+            )
+    except BaseException as exc:
+        local_exception = exc
+    live_state_mutation_started = _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=live_state_mutation_started,
+        context="distckpt checkpoint completeness validation failed",
+    )
+    assignments: list[tuple[nn.Module, str, dict[str, Any], set[str]]] = []
+    local_exception = None
     if load_model:
         try:
-            _load_model_state_dict(model, state_dict, expected_state_dict=model_sd)
-        except Exception as exc:
-            local_error = f"{type(exc).__name__}: {exc}"
-    _distributed_raise_if_error(
-        local_error, context="distckpt model state application failed"
+            assignments = _plan_model_state_dict_load(
+                model, state_dict, expected_state_dict=model_sd
+            )
+        except BaseException as exc:
+            local_exception = exc
+    live_state_mutation_started = _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=live_state_mutation_started,
+        context="distckpt model state application validation failed",
     )
-    local_error = None
+
+    if load_model:
+        local_exception: BaseException | None = None
+        local_model_mutation_started = False
+
+        def mark_model_mutation_started() -> None:
+            nonlocal local_model_mutation_started
+            local_model_mutation_started = True
+
+        try:
+            _apply_model_state_dict_load(
+                assignments, mark_mutation_started=mark_model_mutation_started
+            )
+        except BaseException as exc:
+            local_exception = exc
+        live_state_mutation_started = _raise_checkpoint_load_commit_error(
+            local_exception,
+            mutation_started=(
+                live_state_mutation_started or local_model_mutation_started
+            ),
+            context="distckpt model state application failed",
+        )
+
+    local_exception = None
+    local_optimizer_mutation_started = False
     try:
         if load_optimizer and optimizer is not None:
             if "optimizer" not in state_dict:
@@ -272,6 +321,7 @@ def load_dist_opt_checkpoint(
                 )
             load_patches = _patch_native_optimizer_step_load(optimizer)
             try:
+                local_optimizer_mutation_started = True
                 optimizer.load_state_dict(state_dict["optimizer"])
             finally:
                 _restore_set_state_patches(load_patches)
@@ -279,11 +329,16 @@ def load_dist_opt_checkpoint(
         elif load_model and optimizer is not None:
             reload_model_params = getattr(optimizer, "reload_model_params", None)
             if callable(reload_model_params):
+                local_optimizer_mutation_started = True
                 reload_model_params()
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
-    _distributed_raise_if_error(
-        local_error, context="distckpt optimizer state application failed"
+    except BaseException as exc:
+        local_exception = exc
+    _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=(
+            live_state_mutation_started or local_optimizer_mutation_started
+        ),
+        context="distckpt optimizer state application failed",
     )
     return loaded_step
 
@@ -1531,12 +1586,12 @@ def _single_or_all_model_state(model_sd: dict[str, Any]) -> dict[str, Any]:
     return model_sd
 
 
-def _load_model_state_dict(
+def _plan_model_state_dict_load(
     model: nn.Module | Iterable[nn.Module],
     state_dict: dict[str, Any],
     *,
     expected_state_dict: dict[str, Any] | None = None,
-) -> None:
+) -> list[tuple[nn.Module, str, dict[str, Any], set[str]]]:
     chunks = _model_chunks(model)
     if not chunks:
         raise RuntimeError("distckpt model load requires at least one model chunk")
@@ -1595,12 +1650,22 @@ def _load_model_state_dict(
                 f"distckpt model subtree {key!r} metadata mismatch: {metadata_errors}"
             )
         assignments.append((chunk, key, loaded_subtree, expected_keys))
+    return assignments
+
+
+def _apply_model_state_dict_load(
+    assignments: Iterable[tuple[nn.Module, str, dict[str, Any], set[str]]],
+    *,
+    mark_mutation_started: Callable[[], None],
+) -> None:
+    """Apply a fully preflighted distckpt model plan to live modules."""
 
     # Commit only after every chunk passes the read-only preflight. Shared/tied
     # module aliases are intentionally absent from ``named_parameters`` and thus
     # from the sharded template, so strict=False is required; missing checkpoint
     # keys and unexpected loaded keys were already rejected above.
     for chunk, key, loaded_subtree, expected_keys in assignments:
+        mark_mutation_started()
         incompatible = _wrapped_module(chunk).load_state_dict(
             loaded_subtree, strict=False
         )
@@ -1611,6 +1676,20 @@ def _load_model_state_dict(
                 f"missing_required={missing_required}, "
                 f"unexpected={sorted(incompatible.unexpected_keys)}"
             )
+
+
+def _load_model_state_dict(
+    model: nn.Module | Iterable[nn.Module],
+    state_dict: dict[str, Any],
+    *,
+    expected_state_dict: dict[str, Any] | None = None,
+) -> None:
+    """Preflight every model chunk, then apply it as one local transaction."""
+
+    assignments = _plan_model_state_dict_load(
+        model, state_dict, expected_state_dict=expected_state_dict
+    )
+    _apply_model_state_dict_load(assignments, mark_mutation_started=lambda: None)
 
 
 def _chunk_parallel_state(chunk: nn.Module) -> ParallelState | None:

@@ -348,6 +348,7 @@ class MegatronLiteRuntime(RuntimeBase):
     # ── Checkpoint ──
 
     def save_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
+        _require_usable_handle(handle)
         from megatron.lite.primitive.ckpt import save_training_checkpoint
 
         step = kwargs.pop("step", None)
@@ -375,7 +376,11 @@ class MegatronLiteRuntime(RuntimeBase):
         )
 
     def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int:
-        from megatron.lite.primitive.ckpt import load_training_checkpoint
+        _require_usable_handle(handle)
+        from megatron.lite.primitive.ckpt import (
+            CheckpointLoadFatalError,
+            load_training_checkpoint,
+        )
 
         use_dcp = bool(kwargs.pop("use_dcp", True))
         load_rng = bool(kwargs.pop("load_rng", True))
@@ -386,35 +391,65 @@ class MegatronLiteRuntime(RuntimeBase):
             )
         )
         get_placements, is_expert = _checkpoint_hooks(handle)
-        return load_training_checkpoint(
-            _checkpoint_model(handle, use_dcp=use_dcp),
-            handle._optimizer,
-            path,
-            _checkpoint_parallel_config(handle),
-            handle._parallel_state,
-            get_placements=kwargs.pop("get_placements", get_placements),
-            is_expert=kwargs.pop("is_expert", is_expert),
-            use_dcp=use_dcp,
-            load_rng=load_rng,
-            load_parameter_state_update_legacy_format=update_legacy_format,
-            load_model=kwargs.pop("load_model", True),
-            load_optimizer=kwargs.pop("load_optimizer", True),
-            **kwargs,
-        )
+        try:
+            return load_training_checkpoint(
+                _checkpoint_model(handle, use_dcp=use_dcp),
+                handle._optimizer,
+                path,
+                _checkpoint_parallel_config(handle),
+                handle._parallel_state,
+                get_placements=kwargs.pop("get_placements", get_placements),
+                is_expert=kwargs.pop("is_expert", is_expert),
+                use_dcp=use_dcp,
+                load_rng=load_rng,
+                load_parameter_state_update_legacy_format=update_legacy_format,
+                load_model=kwargs.pop("load_model", True),
+                load_optimizer=kwargs.pop("load_optimizer", True),
+                **kwargs,
+            )
+        except CheckpointLoadFatalError as exc:
+            handle._poison_after_checkpoint_load(exc)
+            raise
+        except BaseException as exc:
+            # KeyboardInterrupt/SystemExit must retain their control-flow
+            # semantics. A load cannot prove which mutation boundary the
+            # interruption crossed, so fail closed without wrapping it.
+            if isinstance(exc, Exception):
+                raise
+            handle._poison_after_checkpoint_load(exc)
+            raise
 
     def export_weights(
         self, handle: ModelHandle, **kwargs
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        model_chunks = handle._extras.get("model_chunks", [handle._model])
-        proto = handle._extras.get("protocol")
-        model_cfg = handle._extras.get("model_cfg")
-        ps = handle._parallel_state
+        _require_usable_handle(handle)
 
-        if proto and hasattr(proto, "export_hf_weights"):
-            yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
-        else:
-            for chunk in model_chunks:
-                yield from chunk.named_parameters()
+        def iterate_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            # A caller may obtain the iterator and load a checkpoint before
+            # consuming it, so enforce the poison boundary again at iteration.
+            _require_usable_handle(handle)
+            model_chunks = handle._extras.get("model_chunks", [handle._model])
+            proto = handle._extras.get("protocol")
+            model_cfg = handle._extras.get("model_cfg")
+            ps = handle._parallel_state
+
+            if proto and hasattr(proto, "export_hf_weights"):
+                weights = proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
+            else:
+                weights = (
+                    item for chunk in model_chunks for item in chunk.named_parameters()
+                )
+            iterator = iter(weights)
+            while True:
+                _require_usable_handle(handle)
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+                _require_usable_handle(handle)
+                yield item
+
+        return iterate_weights()
 
     # ── Memory ──
 
@@ -427,6 +462,7 @@ class MegatronLiteRuntime(RuntimeBase):
         optimizer: bool = True,
         grad: bool = True,
     ) -> None:
+        _require_usable_handle(handle)
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         from megatron.lite.runtime.megatron_utils import (
             load_model_to_gpu,
@@ -457,9 +493,11 @@ class MegatronLiteRuntime(RuntimeBase):
     # ── Mode switching ──
 
     def train_mode(self, handle: ModelHandle):
+        _require_usable_handle(handle)
         return _TrainModeCtx(handle)
 
     def eval_mode(self, handle: ModelHandle):
+        _require_usable_handle(handle)
         return _EvalModeCtx(handle)
 
     # ── Training atoms ──
@@ -473,6 +511,7 @@ class MegatronLiteRuntime(RuntimeBase):
         num_microbatches: int = 1,
         forward_only: bool = False,
     ) -> ForwardResult:
+        _require_usable_handle(handle)
         from megatron.lite.primitive.train_step import run_microbatch_loop
 
         forward_step = handle._extras["forward_step"]
@@ -570,10 +609,12 @@ class MegatronLiteRuntime(RuntimeBase):
         )
 
     def is_mp_src_rank_with_outputs(self, handle: ModelHandle) -> bool:
+        _require_usable_handle(handle)
         ps = handle._parallel_state
         return ps.tp_rank == 0 and ps.cp_rank == 0 and ps.pp_rank == ps.pp_size - 1
 
     def zero_grad(self, handle: ModelHandle) -> None:
+        _require_usable_handle(handle)
         for chunk in handle._extras.get("model_chunks", [handle._model]):
             if hasattr(chunk, "zero_grad_buffer"):
                 chunk.zero_grad_buffer()
@@ -581,12 +622,14 @@ class MegatronLiteRuntime(RuntimeBase):
             handle._optimizer.zero_grad()
 
     def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
+        _require_usable_handle(handle)
         if handle._optimizer is None:
             return True, 0.0, 0
         update_successful, grad_norm, num_zeros = handle._optimizer.step()
         return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
+        _require_usable_handle(handle)
         if handle._lr_scheduler is not None:
             handle._lr_scheduler.step()
             return handle._lr_scheduler.get_last_lr()
@@ -603,6 +646,7 @@ class _TrainModeCtx:
         self._handle = handle
 
     def __enter__(self):
+        _require_usable_handle(self._handle)
         for chunk in self._handle._extras.get("model_chunks", [self._handle._model]):
             chunk.train()
         return self
@@ -617,6 +661,7 @@ class _EvalModeCtx:
         self._prev_grad = torch.is_grad_enabled()
 
     def __enter__(self):
+        _require_usable_handle(self._handle)
         for chunk in self._handle._extras.get("model_chunks", [self._handle._model]):
             chunk.eval()
         torch.set_grad_enabled(False)
@@ -632,6 +677,18 @@ def _checkpoint_parallel_config(handle: ModelHandle):
     if cfg is None:
         return None
     return getattr(cfg, "parallel", cfg)
+
+
+def _require_usable_handle(handle: ModelHandle) -> None:
+    """Fail closed once a post-mutation checkpoint load invalidates a handle."""
+
+    if handle.poisoned:
+        reason = handle.poison_reason or "unknown fatal checkpoint load"
+        raise RuntimeError(
+            "ModelHandle is poisoned by a checkpoint load that failed after "
+            "live-state mutation; discard it and build a fresh handle before "
+            f"any further runtime operation. Original failure: {reason}"
+        )
 
 
 def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):

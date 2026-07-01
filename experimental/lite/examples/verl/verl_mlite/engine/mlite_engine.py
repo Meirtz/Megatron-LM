@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -15,8 +15,12 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import (
-    load_training_checkpoint,
+    CheckpointLoadFatalError,
     save_training_checkpoint,
+)
+from megatron.lite.primitive.ckpt.errors import (
+    _checkpoint_exception_started_mutation,
+    _raise_checkpoint_load_commit_error,
 )
 from megatron.lite.primitive.protocols import (
     default_expert_classifier,
@@ -387,6 +391,37 @@ def _checkpoint_components_with_consensus(
         )
 
 
+def _checkpoint_load_policy_with_consensus(
+    *,
+    param_offload: bool,
+    optimizer_offload: bool,
+    reload_model_params: bool,
+    allow_legacy_checkpoint: bool,
+    use_dcp: bool,
+    update_legacy_format: bool,
+    runtime_option_keys: tuple[str, ...],
+    context: str,
+) -> None:
+    if not dist.is_initialized():
+        return
+    local = {
+        "param_offload": bool(param_offload),
+        "optimizer_offload": bool(optimizer_offload),
+        "reload_model_params": bool(reload_model_params),
+        "allow_legacy_checkpoint": bool(allow_legacy_checkpoint),
+        "use_dcp": bool(use_dcp),
+        "update_legacy_format": bool(update_legacy_format),
+        "runtime_option_keys": tuple(runtime_option_keys),
+    }
+    per_rank: list[dict[str, object] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(per_rank, local)
+    if any(item != per_rank[0] for item in per_rank[1:]):
+        raise RuntimeError(
+            f"Megatron Lite {context} execution policy differs across ranks: "
+            f"{per_rank}."
+        )
+
+
 def _distributed_raise_if_error(local_error: str | None, *, context: str) -> None:
     if dist.is_initialized():
         errors: list[str | None] = [None] * dist.get_world_size()
@@ -396,6 +431,46 @@ def _distributed_raise_if_error(local_error: str | None, *, context: str) -> Non
             raise RuntimeError(f"Megatron Lite {context}: {first_error}")
     elif local_error is not None:
         raise RuntimeError(f"Megatron Lite {context}: {local_error}")
+
+
+def _checkpoint_load_phase_with_consensus(
+    action: Callable[[], Any],
+    *,
+    mutation_started: bool | Callable[[], bool],
+    context: str,
+) -> Any:
+    """Run one load phase and enforce mutation and control-flow consensus.
+
+    Ordinary ``Exception`` instances retain the recoverable-preflight contract
+    until a rank reports live mutation. Non-``Exception`` ``BaseException``
+    instances are different: the source rank must preserve the exact control
+    flow object, while every peer fails fatally instead of entering the next
+    checkpoint collective.
+    """
+
+    result: Any = None
+    local_exception: BaseException | None = None
+    try:
+        result = action()
+    except BaseException as exc:
+        local_exception = exc
+    live_state_mutated = (
+        mutation_started() if callable(mutation_started) else mutation_started
+    ) or _checkpoint_exception_started_mutation(local_exception)
+    _raise_checkpoint_load_commit_error(
+        local_exception,
+        mutation_started=live_state_mutated,
+        context=f"Megatron Lite {context}",
+    )
+    return result
+
+
+def _publish_loaded_extra_state(
+    loaded_extra_states: dict[str, Any], filename: str, value: Any
+) -> None:
+    """Publish a post-commit sidecar for final engine-level validation."""
+
+    loaded_extra_states[filename] = value
 
 
 def _isolate_compile_cache_per_rank() -> None:
@@ -700,6 +775,12 @@ class _LRSchedulerCheckpointTarget:
     def validate_step(self, candidate: Any, expected_step: int | None) -> None:
         _validate_lr_scheduler_payload(candidate, expected_step=expected_step)
 
+    @staticmethod
+    def validate(candidate: Any) -> None:
+        """Pure validation hook used before any live scheduler application."""
+
+        _validate_lr_scheduler_payload(candidate)
+
     def apply(self, candidate: Any) -> None:
         _validate_lr_scheduler_payload(candidate)
         self.scheduler.load_state_dict(copy.deepcopy(candidate["scheduler_state"]))
@@ -743,9 +824,7 @@ def _legacy_scheduler_payload_with_consensus(
 
     from megatron.lite.primitive.ckpt import dcp as dcp_impl
 
-    payload: dict[str, Any] | None = None
-    local_error: str | None = None
-    try:
+    def load_local_payload() -> dict[str, Any] | None:
         resolved = Path(
             dcp_impl._resolve_step_checkpoint_path(  # noqa: SLF001 - migration boundary
                 local_path, allow_legacy_checkpoint=True
@@ -794,15 +873,15 @@ def _legacy_scheduler_payload_with_consensus(
                 "scheduler_state": current_state,
             }
             _validate_lr_scheduler_payload(payload, expected_step=checkpoint_step)
-    except Exception as exc:
-        local_error = f"{type(exc).__name__}: {exc}"
+        return payload
+
+    payload = _checkpoint_load_phase_with_consensus(
+        load_local_payload,
+        mutation_started=False,
+        context="legacy LR scheduler migration preflight failed",
+    )
 
     if dist.is_initialized():
-        errors: list[str | None] = [None] * dist.get_world_size()
-        dist.all_gather_object(errors, local_error)
-        first_error = next((error for error in errors if error is not None), None)
-        if first_error is not None:
-            raise RuntimeError(f"Legacy LR scheduler migration failed: {first_error}")
         per_rank_payloads: list[dict[str, Any] | None] = [None] * dist.get_world_size()
         dist.all_gather_object(per_rank_payloads, payload)
         if any(item != per_rank_payloads[0] for item in per_rank_payloads[1:]):
@@ -811,15 +890,20 @@ def _legacy_scheduler_payload_with_consensus(
                 f"{per_rank_payloads}."
             )
         payload = per_rank_payloads[0]
-    elif local_error is not None:
-        raise RuntimeError(f"Legacy LR scheduler migration failed: {local_error}")
 
-    if payload is not None and (not dist.is_initialized() or dist.get_rank() == 0):
-        print(
-            "Migrating a pre-manifest VERL LR scheduler with the current runtime "
-            "schedule config; re-save the checkpoint immediately.",
-            flush=True,
-        )
+    def log_migration_notice() -> None:
+        if payload is not None and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(
+                "Migrating a pre-manifest VERL LR scheduler with the current runtime "
+                "schedule config; re-save the checkpoint immediately.",
+                flush=True,
+            )
+
+    _checkpoint_load_phase_with_consensus(
+        log_migration_notice,
+        mutation_started=False,
+        context="legacy LR scheduler migration notice failed",
+    )
     return payload
 
 
@@ -864,8 +948,10 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
     def __init__(self, engine: MegatronLiteEngine, mode: str, **kwargs):
         super().__init__(engine=engine, mode=mode, **kwargs)
         self._runtime_ctx = None
+        self._entry_grad_enabled: bool | None = None
 
     def __enter__(self):
+        self._entry_grad_enabled = torch.is_grad_enabled()
         super().__enter__()
         assert self.engine.runtime is not None and self.engine.handle is not None
         if self.mode == "train":
@@ -877,8 +963,52 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         assert self._runtime_ctx is not None
-        self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
-        super().__exit__(exc_type, exc_val, exc_tb)
+        poisoned = (
+            isinstance(exc_val, CheckpointLoadFatalError)
+            or self.engine._checkpoint_load_poisoned
+            or bool(getattr(self.engine.handle, "poisoned", False))
+        )
+        if poisoned:
+            runtime_exit_error: BaseException | None = None
+            try:
+                self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
+            except BaseException as cleanup_error:
+                runtime_exit_error = cleanup_error
+
+            grad_restore_error: BaseException | None = None
+            try:
+                if self._entry_grad_enabled is not None:
+                    torch.set_grad_enabled(self._entry_grad_enabled)
+            except BaseException as cleanup_error:
+                grad_restore_error = cleanup_error
+            finally:
+                self.engine.mode = None
+
+            # Preserve process-control exceptions even when another fatal error
+            # was already unwinding. Ordinary cleanup failures are suppressed
+            # only when doing so preserves that original root cause.
+            cleanup_errors = (runtime_exit_error, grad_restore_error)
+            for cleanup_error in cleanup_errors:
+                if cleanup_error is not None and not isinstance(
+                    cleanup_error, Exception
+                ):
+                    if exc_val is not None:
+                        raise cleanup_error from exc_val
+                    raise cleanup_error
+            if exc_val is None:
+                first_cleanup_error = next(
+                    (error for error in cleanup_errors if error is not None), None
+                )
+                if first_cleanup_error is not None:
+                    raise first_cleanup_error
+            return False
+        try:
+            self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
+            super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            if self._entry_grad_enabled is not None:
+                torch.set_grad_enabled(self._entry_grad_enabled)
+            self.engine.mode = None
         return False
 
 
@@ -1023,7 +1153,12 @@ class MegatronLiteEngine(BaseEngine):
         }
         assert self._mlite_config is not None
         if self._mlite_config.model_name == "qwen3_5":
-            export_kwargs["target"] = "vllm"
+            export_kwargs["target"] = self.engine_config.weight_sync_target
+        elif self.engine_config.weight_sync_target != "hf":
+            raise ValueError(
+                "weight_sync_target='vllm' is implemented only for Qwen3.5; "
+                f"resolved model is {self._mlite_config.model_name!r}"
+            )
         if self.engine_config.export_dtype:
             export_kwargs["export_dtype"] = self.engine_config.export_dtype
         return self.runtime.export_weights(self.handle, **export_kwargs), None
@@ -1168,162 +1303,255 @@ class MegatronLiteEngine(BaseEngine):
         **kwargs,
     ) -> None:
         allow_legacy_checkpoint = bool(kwargs.pop("allow_legacy_checkpoint", False))
-        del hdfs_path, del_local_after_load, kwargs
+        del hdfs_path, del_local_after_load
         self._require_initialized()
 
         try:
-            load_contents = self.checkpoint_config.get(
-                "load_contents", self.checkpoint_config.get("save_contents", None)
+            self._load_checkpoint_impl(
+                local_path,
+                allow_legacy_checkpoint=allow_legacy_checkpoint,
+                runtime_kwargs=kwargs,
             )
-            load_content_keys = _content_set_with_consensus(
-                load_contents, key="checkpoint_config.load_contents"
-            )
-            load_model = load_contents is None or "model" in load_content_keys
-            load_optimizer = load_contents is None or "optimizer" in load_content_keys
-            load_extra = load_contents is None or "extra" in load_content_keys
-            scheduler = self.handle._lr_scheduler
-            load_scheduler = load_extra and scheduler is not None
-            _checkpoint_components_with_consensus(
-                model=load_model,
-                optimizer=load_optimizer,
-                extra=load_extra,
-                scheduler_present=scheduler is not None,
-                context="checkpoint load",
-            )
-            if scheduler is not None and load_optimizer and not load_extra:
-                raise ValueError(
-                    "Loading optimizer state without extra state would restore optimizer "
-                    "LR/WD without the matching LR scheduler progress. Include 'extra' in "
-                    "checkpoint_config.load_contents."
-                )
-            if not load_model and not load_optimizer and not load_extra:
-                if dist.is_initialized():
-                    dist.barrier()
-                return
+        except CheckpointLoadFatalError as exc:
+            self._poison_checkpoint_load(exc)
+            raise
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                # Ordinary preflight failures are explicitly recoverable.
+                raise
+            # A non-Exception control-flow exit can interrupt a device transfer
+            # or collective at an unknowable point. Preserve its exact identity
+            # on the source rank and conservatively invalidate both layers.
+            self._poison_checkpoint_load(exc)
+            raise
 
-            reload_params_for_load = self.is_param_offload_enabled and load_model
-            reload_started = False
+    def _load_checkpoint_impl(
+        self,
+        local_path: str,
+        *,
+        allow_legacy_checkpoint: bool,
+        runtime_kwargs: Mapping[str, Any],
+    ) -> None:
+        """Load after the public control-flow and poison boundary is installed."""
+
+        load_contents = self.checkpoint_config.get(
+            "load_contents", self.checkpoint_config.get("save_contents", None)
+        )
+        load_content_keys = _content_set_with_consensus(
+            load_contents, key="checkpoint_config.load_contents"
+        )
+        load_model = load_contents is None or "model" in load_content_keys
+        load_optimizer = load_contents is None or "optimizer" in load_content_keys
+        load_extra = load_contents is None or "extra" in load_content_keys
+        scheduler = self.handle._lr_scheduler
+        load_scheduler = load_extra and scheduler is not None
+        _checkpoint_components_with_consensus(
+            model=load_model,
+            optimizer=load_optimizer,
+            extra=load_extra,
+            scheduler_present=scheduler is not None,
+            context="checkpoint load",
+        )
+        if scheduler is not None and load_optimizer and not load_extra:
+            raise ValueError(
+                "Loading optimizer state without extra state would restore optimizer "
+                "LR/WD without the matching LR scheduler progress. Include 'extra' in "
+                "checkpoint_config.load_contents."
+            )
+        if not load_model and not load_optimizer and not load_extra:
+            return
+
+        runtime_load_options = dict(runtime_kwargs)
+        use_dcp = bool(runtime_load_options.get("use_dcp", True))
+        runtime_load_options["use_dcp"] = use_dcp
+        update_legacy_format = bool(
+            runtime_load_options.get(
+                "load_parameter_state_update_legacy_format",
+                runtime_load_options.get("update_legacy_format", False),
+            )
+        )
+        runtime_load_options.pop("update_legacy_format", None)
+        runtime_load_options["load_parameter_state_update_legacy_format"] = (
+            update_legacy_format
+        )
+        reload_params_for_load = self.is_param_offload_enabled and load_model
+        _checkpoint_load_policy_with_consensus(
+            param_offload=self.is_param_offload_enabled,
+            optimizer_offload=self.is_optimizer_offload_enabled,
+            reload_model_params=reload_params_for_load,
+            allow_legacy_checkpoint=allow_legacy_checkpoint,
+            use_dcp=use_dcp,
+            update_legacy_format=update_legacy_format,
+            runtime_option_keys=tuple(sorted(runtime_load_options)),
+            context="checkpoint load",
+        )
+        reload_started = False
+
+        def cleanup_before_core_commit() -> None:
+            if not reload_started:
+                return
+            _checkpoint_load_phase_with_consensus(
+                lambda: self.to(device="cpu", model=True, optimizer=False, grad=False),
+                mutation_started=True,
+                context="checkpoint load pre-commit offload cleanup failed",
+            )
+
+        try:
             placement_fn = None
             expert_classifier = None
-            setup_error: str | None = None
-            try:
+
+            def setup() -> None:
+                nonlocal placement_fn, expert_classifier, reload_started
                 placement_fn, expert_classifier = self._checkpoint_hooks()
                 if reload_params_for_load:
+                    # Set this before moving parameters: a failing transfer may
+                    # have changed only part of the live placement.
                     reload_started = True
                     self.to(device="cuda", model=True, optimizer=False, grad=False)
                     torch.cuda.synchronize()
-            except Exception as exc:
-                setup_error = f"{type(exc).__name__}: {exc}"
-            try:
-                _distributed_raise_if_error(
-                    setup_error, context="checkpoint load setup failed"
-                )
-                loaded_extra_states: dict[str, Any] | None = (
-                    {} if load_scheduler else None
-                )
-                scheduler_target = (
-                    _LRSchedulerCheckpointTarget(scheduler) if load_scheduler else None
-                )
-                legacy_scheduler_payload = (
-                    _legacy_scheduler_payload_with_consensus(local_path, scheduler)
-                    if load_scheduler and allow_legacy_checkpoint
-                    else None
-                )
-                strict_scheduler_extra = (
-                    load_scheduler and legacy_scheduler_payload is None
-                )
-                if legacy_scheduler_payload is not None:
-                    from megatron.lite.primitive.ckpt import dcp as dcp_impl
 
-                    assert scheduler_target is not None
-                    scheduler_target.validate_step(
+            _checkpoint_load_phase_with_consensus(
+                setup,
+                mutation_started=lambda: reload_started,
+                context="checkpoint load setup failed",
+            )
+
+            loaded_extra_states: dict[str, Any] | None = {} if load_scheduler else None
+            scheduler_target = (
+                _LRSchedulerCheckpointTarget(scheduler) if load_scheduler else None
+            )
+            legacy_scheduler_payload = (
+                _legacy_scheduler_payload_with_consensus(local_path, scheduler)
+                if load_scheduler and allow_legacy_checkpoint
+                else None
+            )
+            strict_scheduler_extra = load_scheduler and legacy_scheduler_payload is None
+            if legacy_scheduler_payload is not None:
+                from megatron.lite.primitive.ckpt import dcp as dcp_impl
+
+                assert scheduler_target is not None
+                _checkpoint_load_phase_with_consensus(
+                    lambda: scheduler_target.validate_step(
                         legacy_scheduler_payload,
                         legacy_scheduler_payload["checkpoint_step"],
-                    )
-                    dcp_impl._preflight_extra_state_targets(  # noqa: SLF001
-                        {_LR_SCHEDULER_STATE: scheduler_target},
-                        {_LR_SCHEDULER_STATE: legacy_scheduler_payload},
-                    )
-                restored_step = load_training_checkpoint(
-                    self.module,
-                    self.handle._optimizer,
-                    local_path,
-                    self.handle._config.parallel,
-                    self.handle._parallel_state,
-                    get_placements=placement_fn,
-                    is_expert=expert_classifier,
-                    load_rng=load_extra,
-                    load_model=load_model,
-                    load_optimizer=load_optimizer,
-                    allow_legacy_checkpoint=allow_legacy_checkpoint,
-                    load_extra_state_files=(
+                    ),
+                    mutation_started=False,
+                    context="legacy LR scheduler target preflight failed",
+                )
+                dcp_impl._preflight_extra_state_targets(  # noqa: SLF001
+                    {_LR_SCHEDULER_STATE: scheduler_target},
+                    {_LR_SCHEDULER_STATE: legacy_scheduler_payload},
+                )
+
+            runtime_load_options.update(
+                {
+                    "get_placements": placement_fn,
+                    "is_expert": expert_classifier,
+                    "load_rng": load_extra,
+                    "load_model": load_model,
+                    "load_optimizer": load_optimizer,
+                    "allow_legacy_checkpoint": allow_legacy_checkpoint,
+                    "load_extra_state_files": (
                         (_LR_SCHEDULER_STATE,) if strict_scheduler_extra else None
                     ),
-                    loaded_extra_states=loaded_extra_states,
-                    extra_state_validators=(
+                    "loaded_extra_states": loaded_extra_states,
+                    "extra_state_validators": (
                         {_LR_SCHEDULER_STATE: _validate_lr_scheduler_payload}
                         if strict_scheduler_extra
                         else None
                     ),
-                    extra_state_targets=(
+                    "extra_state_targets": (
                         {_LR_SCHEDULER_STATE: scheduler_target}
                         if strict_scheduler_extra and scheduler_target is not None
                         else None
                     ),
-                )
-                if legacy_scheduler_payload is not None:
-                    assert scheduler_target is not None
-                    legacy_error: str | None = None
-                    try:
-                        _validate_lr_scheduler_payload(
-                            legacy_scheduler_payload, expected_step=restored_step
-                        )
-                    except Exception as exc:
-                        legacy_error = f"{type(exc).__name__}: {exc}"
-                    _distributed_raise_if_error(
-                        legacy_error,
-                        context="legacy LR scheduler/core step validation failed",
-                    )
-                    dcp_impl._commit_extra_state_targets(  # noqa: SLF001
-                        {_LR_SCHEDULER_STATE: scheduler_target},
-                        {_LR_SCHEDULER_STATE: legacy_scheduler_payload},
-                    )
-                    assert loaded_extra_states is not None
-                    loaded_extra_states[_LR_SCHEDULER_STATE] = legacy_scheduler_payload
-                post_load_error: str | None = None
-                try:
-                    if load_scheduler:
-                        assert loaded_extra_states is not None
-                        if _LR_SCHEDULER_STATE not in loaded_extra_states:
-                            raise RuntimeError(
-                                "Megatron Lite checkpoint load completed without the "
-                                f"required {_LR_SCHEDULER_STATE} extra state."
-                            )
-                        payload = loaded_extra_states[_LR_SCHEDULER_STATE]
-                        _validate_lr_scheduler_payload(
-                            payload, expected_step=restored_step
-                        )
-                except Exception as exc:
-                    post_load_error = f"{type(exc).__name__}: {exc}"
-                _distributed_raise_if_error(
-                    post_load_error,
-                    context="checkpoint load post-commit validation failed",
-                )
-                if dist.is_initialized():
-                    dist.barrier()
-            finally:
-                cleanup_error: str | None = None
-                if reload_started:
-                    try:
-                        self.to(device="cpu", model=True, optimizer=False, grad=False)
-                    except Exception as exc:
-                        cleanup_error = f"{type(exc).__name__}: {exc}"
-                _distributed_raise_if_error(
-                    cleanup_error, context="checkpoint load offload cleanup failed"
-                )
-        except Exception:
-            self._checkpoint_load_poisoned = True
+                }
+            )
+            restored_step = _checkpoint_load_phase_with_consensus(
+                lambda: self.runtime.load_checkpoint(
+                    self.handle, local_path, **runtime_load_options
+                ),
+                mutation_started=False,
+                context="checkpoint core load failed",
+            )
+        except CheckpointLoadFatalError:
+            # Runtime has crossed the core mutation boundary. Never touch this
+            # handle again, including an attempted parameter offload.
             raise
+        except Exception:
+            # Runtime ordinary failures are preflight failures by contract. A
+            # successful placement rollback keeps both public layers usable.
+            cleanup_before_core_commit()
+            raise
+
+        if legacy_scheduler_payload is not None:
+            assert scheduler_target is not None
+
+            def validate_legacy_scheduler() -> None:
+                _validate_lr_scheduler_payload(
+                    legacy_scheduler_payload, expected_step=restored_step
+                )
+
+            _checkpoint_load_phase_with_consensus(
+                validate_legacy_scheduler,
+                mutation_started=True,
+                context="legacy LR scheduler/core step validation failed",
+            )
+            _checkpoint_load_phase_with_consensus(
+                lambda: dcp_impl._commit_extra_state_targets(  # noqa: SLF001
+                    {_LR_SCHEDULER_STATE: scheduler_target},
+                    {_LR_SCHEDULER_STATE: legacy_scheduler_payload},
+                    prior_live_state_mutation=True,
+                ),
+                mutation_started=True,
+                context="legacy LR scheduler commit failed",
+            )
+            assert loaded_extra_states is not None
+            _checkpoint_load_phase_with_consensus(
+                lambda: _publish_loaded_extra_state(
+                    loaded_extra_states, _LR_SCHEDULER_STATE, legacy_scheduler_payload
+                ),
+                mutation_started=True,
+                context="legacy LR scheduler publication failed",
+            )
+
+        def validate_post_load_state() -> None:
+            if load_scheduler:
+                assert loaded_extra_states is not None
+                if _LR_SCHEDULER_STATE not in loaded_extra_states:
+                    raise RuntimeError(
+                        "Megatron Lite checkpoint load completed without the "
+                        f"required {_LR_SCHEDULER_STATE} extra state."
+                    )
+                payload = loaded_extra_states[_LR_SCHEDULER_STATE]
+                _validate_lr_scheduler_payload(payload, expected_step=restored_step)
+
+        _checkpoint_load_phase_with_consensus(
+            validate_post_load_state,
+            mutation_started=True,
+            context="checkpoint load post-commit validation failed",
+        )
+        # _raise_checkpoint_load_commit_error's all-gather is the completion
+        # fence. A separate barrier can become collective-misaligned when a peer
+        # reports a fatal error and must not be introduced here.
+        _checkpoint_load_phase_with_consensus(
+            lambda: None,
+            mutation_started=True,
+            context="checkpoint load completion fence failed",
+        )
+        if reload_started:
+            _checkpoint_load_phase_with_consensus(
+                lambda: self.to(device="cpu", model=True, optimizer=False, grad=False),
+                mutation_started=True,
+                context="checkpoint load offload cleanup failed",
+            )
+
+    def _poison_checkpoint_load(self, error: BaseException) -> None:
+        """Permanently invalidate the VERL engine and its runtime handle."""
+
+        self._checkpoint_load_poisoned = True
+        assert self.handle is not None
+        self.handle._poison_after_checkpoint_load(error)
 
     def is_mp_src_rank_with_outputs(self):
         if self.handle is None:
@@ -1340,10 +1568,14 @@ class MegatronLiteEngine(BaseEngine):
     def _require_initialized(self) -> None:
         if self.runtime is None or self.handle is None:
             raise RuntimeError("MegatronLiteEngine is not initialized yet.")
-        if self._checkpoint_load_poisoned:
+        handle_poisoned = bool(getattr(self.handle, "poisoned", False))
+        if self._checkpoint_load_poisoned or handle_poisoned:
+            reason = getattr(self.handle, "poison_reason", None)
+            suffix = f" Cause: {reason}." if reason else ""
             raise RuntimeError(
                 "MegatronLiteEngine is poisoned by a failed checkpoint load; "
                 "discard and reinitialize this engine before further use."
+                f"{suffix}"
             )
 
     def _build_mlite_config(self) -> MegatronLiteConfig:
