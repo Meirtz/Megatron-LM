@@ -149,12 +149,19 @@ def _apply_external_loss(
     return loss, metrics
 
 
-def _compact_pipeline_output(out: dict | None) -> dict:
+_FORWARD_PAYLOAD_KEYS = ("logits", "log_probs", "mtp_logits", "mtp_loss", "routed_experts")
+
+
+def _compact_pipeline_output(out: dict | None, *, keep_forward_payload: bool = False) -> dict:
     if not out:
         return {}
     compact: dict = {}
     if "model_output" in out:
         compact["model_output"] = out["model_output"]
+    if keep_forward_payload:
+        for key in _FORWARD_PAYLOAD_KEYS:
+            if key in out:
+                compact[key] = out[key]
     if "loss" in out and out["loss"] is not None:
         loss = out["loss"]
         compact["loss"] = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
@@ -206,7 +213,7 @@ def _forward_only_no_pipeline(
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
         output = forward_step_fn(model, batch)
         _apply_external_loss(output, batch, loss_fn)
-        outputs.append(_compact_pipeline_output(output))
+        outputs.append(_compact_pipeline_output(output, keep_forward_payload=True))
     return outputs
 
 
@@ -484,9 +491,22 @@ def _send_recv_pipeline(
     return fwd_buf, bwd_buf
 
 
-def _pipeline_stage_barrier(ps: ParallelState) -> None:
+def _pipeline_stage_barrier(ps: ParallelState, label: str = "") -> None:
     if ps.pp_cpu_group is not None and ps.pp_size > 1:
+        _dbg = int(os.environ.get("MEGATRON_LITE_PP_DEBUG", "0"))
+        if _dbg:
+            rank = dist.get_rank()
+            suffix = f" {label}" if label else ""
+            print(
+                f"[PP r{rank}] barrier enter{suffix} pp_rank={ps.pp_rank} "
+                f"pp_prev={ps.pp_prev_rank} pp_next={ps.pp_next_rank}",
+                flush=True,
+            )
         dist.barrier(group=ps.pp_cpu_group)
+        if _dbg:
+            rank = dist.get_rank()
+            suffix = f" {label}" if label else ""
+            print(f"[PP r{rank}] barrier exit{suffix}", flush=True)
 
 
 def _set_virtual_pipeline_rank(ps: ParallelState, chunk_id: int | None, num_chunks: int) -> None:
@@ -534,6 +554,7 @@ def _forward_only_pipeline_schedule(
     num_chunks = len(model_chunks)
     total_stages = ps.pp_size * num_chunks
     outputs: list[dict] = []
+    batch_p2p = bool(int(os.environ.get("MEGATRON_LITE_PP_FORWARD_ONLY_BATCH_P2P", "0")))
 
     for _mb in range(num_microbatches):
         batch = next(data_iter)
@@ -570,7 +591,11 @@ def _forward_only_pipeline_schedule(
 
             if stage_id < total_stages - 1:
                 recv_next = (stage_id + 1) % ps.pp_size == ps.pp_rank
-                _pipeline_stage_barrier(ps)
+                _pipeline_stage_barrier(
+                    ps,
+                    f"forward_only mb={_mb} boundary={stage_id} "
+                    f"local={is_local_stage} recv_next={recv_next}",
+                )
                 fwd_buf, _ = _send_recv_pipeline(
                     hidden if is_local_stage else None,
                     None,
@@ -578,13 +603,17 @@ def _forward_only_pipeline_schedule(
                     False,
                     ps,
                     tensor_shape,
-                    batch_p2p=False,
+                    batch_p2p=batch_p2p,
                     clone_recv=True,
                 )
                 if recv_next:
                     pending_activation = fwd_buf
 
-        outputs.append(_compact_pipeline_output(last_output) if last_output is not None else {})
+        outputs.append(
+            _compact_pipeline_output(last_output, keep_forward_payload=True)
+            if last_output is not None
+            else {}
+        )
 
     _set_virtual_pipeline_rank(ps, None, num_chunks)
     return outputs
@@ -690,7 +719,11 @@ def _interleaved_1f1b_schedule(
                         f"send={is_local_stage and hidden is not None} recv_next={recv_next}",
                         flush=True,
                     )
-                _pipeline_stage_barrier(ps)
+                _pipeline_stage_barrier(
+                    ps,
+                    f"vpp_fwd mb={mb_id} boundary={stage_id} "
+                    f"local={is_local_stage} recv_next={recv_next}",
+                )
                 fwd_buf, _ = _send_recv_pipeline(
                     hidden if is_local_stage else None,
                     None,
@@ -739,7 +772,11 @@ def _interleaved_1f1b_schedule(
                         f"send={is_local_stage and inp_grad is not None} recv_prev={recv_prev}",
                         flush=True,
                     )
-                _pipeline_stage_barrier(ps)
+                _pipeline_stage_barrier(
+                    ps,
+                    f"vpp_bwd mb={mb_id} boundary={stage_id} "
+                    f"local={is_local_stage} recv_prev={recv_prev}",
+                )
                 _, bwd_buf = _send_recv_pipeline(
                     None,
                     inp_grad if is_local_stage else None,

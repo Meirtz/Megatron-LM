@@ -308,23 +308,42 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
     """Wrap a module's forward with reentrant activation checkpointing."""
     original_forward = module.forward
     _routers = [m for m in module.modules() if hasattr(m, "expert_bias")]
+    _replay_routers = [
+        replay
+        for submodule in module.modules()
+        for replay in [getattr(submodule, "router_replay", None)]
+        if replay is not None
+    ]
+    for router in _replay_routers:
+        if hasattr(router, "enable_replay_backward_queue"):
+            router.enable_replay_backward_queue()
 
     def _checkpointed_forward(*args, **kwargs):
         # expert_bias is modified in-place by the router during forward.
         # Save and restore it so the recomputation in backward sees the same values.
-        if _routers:
-            saved = [r.expert_bias.clone() for r in _routers]
-            call_count = [0]
+        saved = [r.expert_bias.clone() for r in _routers]
+        call_count = [0]
 
-            def _fwd(*a, **kw):
-                call_count[0] += 1
-                if call_count[0] > 1:
-                    for r, s in zip(_routers, saved, strict=False):
-                        r.expert_bias.copy_(s)
-                return original_forward(*a, **kw)
+        def _fwd(*a, **kw):
+            call_count[0] += 1
+            is_recompute = call_count[0] > 1 and torch.is_grad_enabled()
+            if is_recompute:
+                for r, s in zip(_routers, saved, strict=False):
+                    r.expert_bias.copy_(s)
+            if is_recompute and any(
+                getattr(router, "replay_backward_list", None) for router in _replay_routers
+            ):
+                from megatron.lite.primitive.modules.router_replay import RouterReplayAction
 
-        else:
-            _fwd = original_forward
+                previous_actions = [router.router_replay_action for router in _replay_routers]
+                for router in _replay_routers:
+                    router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+                try:
+                    return original_forward(*a, **kw)
+                finally:
+                    for router, previous in zip(_replay_routers, previous_actions, strict=False):
+                        router.router_replay_action = previous
+            return original_forward(*a, **kw)
 
         # CheckpointFunction.apply only accepts positional tensor args.
         # Wrap kwargs into the function closure.

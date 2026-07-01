@@ -236,6 +236,18 @@ class TokenDispatcher:
             return self._combine_deepep(expert_output)
         return self._combine_alltoall(expert_output)
 
+    def _coalesced_routing_map_and_probs(self, topk_scores, topk_indices):
+        t = topk_indices.size(0)
+        e = self.num_experts
+        probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=topk_scores.device)
+        # DeepSeek-V4 hash routing may map multiple top-k slots for one token to
+        # the same expert. HF evaluates that expert once per duplicate slot and
+        # index_adds the weighted outputs, which is equivalent to summing the
+        # duplicate weights before a single expert call.
+        probs_2d.scatter_add_(1, topk_indices, topk_scores)
+        routing_map = probs_2d != 0
+        return routing_map, probs_2d
+
     def submit_deepep_combine(
         self, expert_output: torch.Tensor, *, allocate_on_comm_stream: bool = False
     ):
@@ -279,15 +291,8 @@ class TokenDispatcher:
         return state["combined"]
 
     def _dispatch_local(self, hidden_states, topk_scores, topk_indices):
-        t, h = hidden_states.shape
-        e = self.num_experts
-
-        routing_map = torch.zeros(t, e, dtype=torch.bool, device=hidden_states.device)
-        routing_map.scatter_(1, topk_indices, True)
+        routing_map, probs_2d = self._coalesced_routing_map_and_probs(topk_scores, topk_indices)
         num_out = int(routing_map.sum().item())
-
-        probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
-        probs_2d.scatter_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,
@@ -315,11 +320,7 @@ class TokenDispatcher:
         return result
 
     def _dispatch_alltoall(self, hidden_states, topk_scores, topk_indices):
-        t, h = hidden_states.shape
-        e = self.num_experts
-
-        routing_map = torch.zeros(t, e, dtype=torch.bool, device=hidden_states.device)
-        routing_map.scatter_(1, topk_indices, True)
+        routing_map, probs_2d = self._coalesced_routing_map_and_probs(topk_scores, topk_indices)
         # Use the actual number of routed (token, expert) pairs from routing_map
         # rather than t * topk: hash routing (ds4) can map a token's topk slots to
         # DUPLICATE experts, which scatter_ dedups, so t*topk would overcount and
@@ -327,9 +328,6 @@ class TokenDispatcher:
         # Unique-topk routers (every other model) have routing_map.sum() == t*topk,
         # so this is a no-op for them.
         num_out = int(routing_map.sum().item())
-
-        probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
-        probs_2d.scatter_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,
@@ -345,9 +343,10 @@ class TokenDispatcher:
         tpe_by_rank = tokens_per_expert.view(self.ep_size, self.num_local_experts).sum(dim=1)
         self._input_splits = tpe_by_rank.tolist()
 
-        global_tpe_flat = tokens_per_expert.new_empty(self.ep_size * e)
+        num_global_experts = tokens_per_expert.numel()
+        global_tpe_flat = tokens_per_expert.new_empty(self.ep_size * num_global_experts)
         dist.all_gather_into_tensor(global_tpe_flat, tokens_per_expert, group=self.ps.ep_group)
-        global_tpe_2d = global_tpe_flat.view(self.ep_size, e)
+        global_tpe_2d = global_tpe_flat.view(self.ep_size, num_global_experts)
         ep_rank = dist.get_rank(group=self.ps.ep_group)
         my_start = ep_rank * self.num_local_experts
         recv_tpe_2d = global_tpe_2d[:, my_start : my_start + self.num_local_experts].contiguous()

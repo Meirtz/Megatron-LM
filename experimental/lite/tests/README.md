@@ -11,6 +11,13 @@ Run unit coverage:
 PYTHONPATH="$(pwd):$(pwd)/experimental/lite" pytest experimental/lite/tests/unit
 ```
 
+Run local GLM5 LoRA/PEFT alignment gates without GPU:
+
+```bash
+TORCH_PYTHON_BIN=/path/to/python-with-torch-and-safetensors \
+  experimental/lite/tests/run_glm5_lora_local_gates.sh
+```
+
 Run smoke coverage on one node:
 
 ```bash
@@ -39,9 +46,11 @@ Current matrix:
 | FSDP2 save/load resume | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Checkpoint restore vs direct training | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | FSDP2 and distopt checkpoint smokes cover distributed restore paths |
 | Runtime backend registry/config | `unit/primitive/test_runtime_config_unit.py`, `unit/runtime/test_runtime_backend_unit.py` | covered through checkpoint/model handles |
+| VERL MLite LoRA adapter sidecar checkpointing | `unit/runtime/test_runtime_backend_unit.py`, `unit/verl/test_mlite_engine_checkpoint.py`, `run_glm5_lora_local_gates.sh` | end-to-end VERL training remains a follow-up |
 | Runtime env/offload controls | `unit/runtime/test_runtime_backend_unit.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Optimizer update-state offload fraction | `unit/primitive/test_runtime_config_unit.py` and single-process CUDA coverage in `unit/primitive/test_fsdp2_offload_gpu.py` | multi-rank offloaded grad clipping is checked against the non-offloaded baseline in `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Qwen3 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
 | Qwen3.5 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
+| GLM5 LoRA/PEFT reference alignment | `unit/model/test_glm5_lite_static.py`, `unit/model/test_glm5_lora_adapter_runtime.py`, `unit/primitive/test_peft_dsa_router_replay_static.py`, `unit/primitive/test_router_replay_runtime.py` | TE/GPU GLM5 LoRA smoke remains a follow-up gate |
 
 Classic FSDP is not a separate MLite primitive in the current source tree; MLite's native sharded optimizer coverage is FSDP2 plus Megatron DDP/distopt.

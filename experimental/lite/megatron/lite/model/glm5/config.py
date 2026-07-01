@@ -19,10 +19,15 @@ _HF_FIELDS = frozenset(
         "hidden_size",
         "index_head_dim",
         "index_n_heads",
+        "index_share_for_mtp_iteration",
+        "index_skip_topk_offset",
         "index_topk",
+        "index_topk_freq",
+        "index_topk_pattern",
         "indexer_layer_norm_eps",
         "indexer_rope_interleave",
         "indexer_rope_first",
+        "indexer_types",
         "indexer_use_hadamard",
         "initializer_range",
         "intermediate_size",
@@ -50,7 +55,9 @@ _HF_FIELDS = frozenset(
         "rope_interleave",
         "rope_theta",
         "routed_scaling_factor",
+        "scoring_func",
         "topk_group",
+        "topk_method",
         "v_head_dim",
         "vocab_size",
     }
@@ -82,6 +89,11 @@ class Glm5Config:
     index_head_dim: int = 128
     index_n_heads: int = 32
     index_topk: int = 2048
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int = 0
+    index_topk_pattern: list[int] | None = None
+    index_share_for_mtp_iteration: bool = False
+    indexer_types: list[str] | None = None
     indexer_layer_norm_eps: float = 1e-6
     indexer_rope_interleave: bool = False
     indexer_rope_first: bool = True
@@ -102,6 +114,8 @@ class Glm5Config:
     n_group: int = 1
     topk_group: int = 1
     routed_scaling_factor: float = 2.5
+    scoring_func: str = "sigmoid"
+    topk_method: str = "noaux_tc"
     norm_topk_prob: bool = True
     num_nextn_predict_layers: int = 1
     mtp_loss_scaling_factor: float = 0.1
@@ -119,6 +133,48 @@ class Glm5Config:
         if self.mlp_layer_types is not None and layer_idx < len(self.mlp_layer_types):
             return self.mlp_layer_types[layer_idx] == "sparse"
         return layer_idx >= self.first_k_dense_replace
+
+    def _is_implicit_mtp_layer(self, layer_idx: int) -> bool:
+        return self.num_hidden_layers <= layer_idx < (
+            self.num_hidden_layers + self.num_nextn_predict_layers
+        )
+
+    def dsa_indexer_type(self, layer_idx: int) -> str:
+        if self.indexer_types is not None and layer_idx < len(self.indexer_types):
+            return self.indexer_types[layer_idx]
+        if self.index_topk_freq <= 1:
+            return "full"
+        return "shared" if self.is_dsa_skip_topk_layer(layer_idx) else "full"
+
+    def is_dsa_skip_topk_layer(self, layer_idx: int) -> bool:
+        """Return whether a 0-indexed layer should reuse a previous DSA top-k."""
+
+        if self.indexer_types is not None and layer_idx < len(self.indexer_types):
+            return self.indexer_types[layer_idx] == "shared"
+        if self._is_implicit_mtp_layer(layer_idx) and not self.index_share_for_mtp_iteration:
+            return False
+        if self.index_topk_freq <= 1:
+            return False
+        layer_number = layer_idx + 1
+        return (max(layer_number - self.index_skip_topk_offset, 0) % self.index_topk_freq) != 0
+
+    def dsa_source_compute_layer(self, layer_idx: int) -> int:
+        """Return the 0-indexed computing layer for a DSA skip layer."""
+
+        if not self.is_dsa_skip_topk_layer(layer_idx):
+            return layer_idx
+        if self.indexer_types is not None and layer_idx < len(self.indexer_types):
+            for source_idx in range(layer_idx, -1, -1):
+                if self.dsa_indexer_type(source_idx) == "full":
+                    return source_idx
+            return layer_idx
+        layer_number = layer_idx + 1
+        if layer_number <= self.index_skip_topk_offset:
+            return layer_idx
+        source_layer_number = layer_number - (
+            (layer_number - self.index_skip_topk_offset) % self.index_topk_freq
+        )
+        return source_layer_number - 1
 
     def _validate(self) -> None:
         errors: list[str] = []
@@ -139,7 +195,12 @@ class Glm5Config:
             self.index_head_dim >= self.qk_rope_head_dim,
             "index_head_dim must be >= qk_rope_head_dim",
         )
+        check(self.index_topk > 0, "index_topk must be > 0")
+        check(self.index_topk_freq > 0, "index_topk_freq must be > 0")
+        check(self.index_skip_topk_offset >= 0, "index_skip_topk_offset must be >= 0")
         check(self.dsa_indexer_loss_coeff >= 0.0, "dsa_indexer_loss_coeff must be >= 0")
+        check(self.scoring_func == "sigmoid", "GLM5 lite currently supports scoring_func='sigmoid'")
+        check(self.topk_method == "noaux_tc", "GLM5 lite currently supports topk_method='noaux_tc'")
         check(
             self.num_key_value_heads == self.num_attention_heads,
             "initial GLM5 native path expects MLA heads to be ungrouped",
@@ -167,6 +228,34 @@ class Glm5Config:
                     layer_type in {"dense", "sparse"},
                     f"mlp_layer_types[{idx}] must be 'dense' or 'sparse'",
                 )
+
+        if self.indexer_types is not None:
+            expected_indexer_type_lengths = {
+                self.num_hidden_layers,
+                self.num_hidden_layers + self.num_nextn_predict_layers,
+            }
+            check(
+                len(self.indexer_types) in expected_indexer_type_lengths,
+                "len(indexer_types) must equal num_hidden_layers or "
+                "num_hidden_layers + num_nextn_predict_layers",
+            )
+            for idx, indexer_type in enumerate(self.indexer_types):
+                check(
+                    indexer_type in {"full", "shared"},
+                    f"indexer_types[{idx}] must be 'full' or 'shared'",
+                )
+            if self.indexer_types and self.indexer_types[0] == "shared":
+                check(False, "indexer_types[0] must be 'full' so a shared layer has a source")
+        if self.index_topk_pattern is not None:
+            expected_pattern_lengths = {
+                self.num_hidden_layers,
+                self.num_hidden_layers + self.num_nextn_predict_layers,
+            }
+            check(
+                len(self.index_topk_pattern) in expected_pattern_lengths,
+                "len(index_topk_pattern) must equal num_hidden_layers or "
+                "num_hidden_layers + num_nextn_predict_layers",
+            )
 
         if errors:
             raise ValueError(

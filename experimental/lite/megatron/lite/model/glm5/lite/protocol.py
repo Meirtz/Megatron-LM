@@ -16,6 +16,7 @@ identical to Kimi; the only adaptations are:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,10 +29,17 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_context,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.lora import (
+    LoraConfig,
+    freeze_non_lora_params,
+    normalize_lora_config,
+    trainable_param_stats,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
@@ -103,6 +111,9 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
+    lora: LoraConfig | Mapping[str, Any] | None = None
+    lora_init: bool | str | None = None
+    router_replay: bool = False
 
 
 def build_model_config(source: str | Path | dict, **overrides) -> Glm5Config:
@@ -120,7 +131,8 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
     kwargs = pack_thd_forward_kwargs(model, batch)
     add_loss_context_kwargs(kwargs)
     add_cross_entropy_fusion(kwargs, model)
-    return model(**kwargs)
+    with router_replay_context(model, batch):
+        return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -176,8 +188,32 @@ def _build_dist_opt_optimizer(
     )
 
 
+def _resolve_lora_init(impl_cfg: ImplConfig) -> str | None:
+    value = impl_cfg.lora_init
+    if value is None and isinstance(impl_cfg.lora, Mapping):
+        value = impl_cfg.lora.get("init_lora_weights")
+    if value in (None, True, False):
+        return None
+    if not isinstance(value, str):
+        raise TypeError(
+            f"GLM5 LoRA init must be a string, boolean, or None, got {type(value)!r}."
+        )
+    normalized = value.strip().lower()
+    if normalized in ("", "none", "null", "false", "true"):
+        return None
+    if normalized != "olora_tail":
+        raise ValueError(
+            f"Unsupported GLM5 LoRA init {value!r}; currently supported: 'olora_tail'."
+        )
+    return normalized
+
+
 def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     p = impl_cfg.parallel
+    lora_config = normalize_lora_config(impl_cfg.lora)
+    lora_init = _resolve_lora_init(impl_cfg)
+    if lora_init == "olora_tail" and not lora_config.enabled:
+        raise ValueError("GLM5 lora_init='olora_tail' requires enabled LoRA rank > 0.")
     _validate_parallel_scope(p)
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
         raise ValueError("use_deepep and etp>1 are mutually exclusive")
@@ -220,6 +256,8 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+        router_replay=impl_cfg.router_replay,
+        lora_config=lora_config,
     )
 
     if vpp is None:
@@ -249,6 +287,14 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
 
+    lora_stats = None
+    if lora_config.enabled:
+        lora_stats = {"chunks": []}
+        for chunk in chunks:
+            freeze_stats = freeze_non_lora_params(chunk)
+            trainable_stats = trainable_param_stats(chunk)
+            lora_stats["chunks"].append({**freeze_stats, **trainable_stats})
+
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
@@ -265,13 +311,22 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
         optimizer_backend = "dist_opt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
+    elif impl_cfg.optimizer is not None:
+        raise ValueError(f"Unknown glm5 lite optimizer: {impl_cfg.optimizer!r}.")
 
+    if lora_init == "olora_tail" or impl_cfg.optimizer == "fsdp2":
         def _post_model_load_hook():
-            from megatron.lite.model.glm5.lite.model import Glm5Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            updates: dict[str, Any] = {}
+            extra_updates: dict[str, Any] = {}
+            if lora_init == "olora_tail":
+                extra_updates["lora_init_result"] = initialize_lora_olora_tail(
+                    chunks, model_cfg, ps
+                )
+            if impl_cfg.optimizer == "fsdp2":
+                from megatron.lite.model.glm5.lite.model import Glm5Layer
+                from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
-            return {
-                "optimizer": build_fsdp2_training_optimizer(
+                updates["optimizer"] = build_fsdp2_training_optimizer(
                     chunks,
                     impl_cfg.optimizer_config,
                     ps,
@@ -281,11 +336,11 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
                 )
-            }
+            if extra_updates:
+                updates["extras"] = extra_updates
+            return updates
 
         post_model_load_hook = _post_model_load_hook
-    elif impl_cfg.optimizer is not None:
-        raise ValueError(f"Unknown glm5 lite optimizer: {impl_cfg.optimizer!r}.")
 
     return ModelBundle(
         chunks=chunks,
@@ -298,6 +353,9 @@ def build_model(model_cfg: Glm5Config, *, impl_cfg: ImplConfig) -> ModelBundle:
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
             "pre_forward_hook": _make_aux_loss_hook(),
+            "lora_config": lora_config,
+            "lora_init": lora_init,
+            "lora_stats": lora_stats,
         },
     )
 
@@ -324,6 +382,42 @@ def save_hf_weights(chunks, path: str, model_cfg: Glm5Config, ps: ParallelState,
     save_impl(chunks, path, model_cfg, ps, **kwargs)
 
 
+def export_lora_adapter_state(chunks, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.glm5.lite.lora_adapter import (
+        export_lora_adapter_state as export_impl,
+    )
+
+    return export_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def save_lora_adapter(chunks, model_cfg: Glm5Config, ps: ParallelState, output_dir: str | Path, **kwargs):
+    from megatron.lite.model.glm5.lite.lora_adapter import save_lora_adapter as save_impl
+
+    return save_impl(chunks, model_cfg, ps, output_dir, **kwargs)
+
+
+def initialize_lora_olora_tail(chunks, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.glm5.lite.lora_adapter import (
+        initialize_lora_olora_tail as initialize_impl,
+    )
+
+    return initialize_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def load_lora_adapter_state(chunks, state, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.glm5.lite.lora_adapter import (
+        load_lora_adapter_state as load_impl,
+    )
+
+    return load_impl(chunks, state, model_cfg, ps, **kwargs)
+
+
+def load_lora_adapter(chunks, adapter_dir: str | Path, model_cfg: Glm5Config, ps: ParallelState, **kwargs):
+    from megatron.lite.model.glm5.lite.lora_adapter import load_lora_adapter as load_impl
+
+    return load_impl(chunks, adapter_dir, model_cfg, ps, **kwargs)
+
+
 def vocab_size(model_cfg) -> int | None:
     cfg = getattr(model_cfg, "text_config", model_cfg)
     return getattr(cfg, "vocab_size", None)
@@ -335,9 +429,14 @@ __all__ = [
     "PLACEMENT_FN",
     "build_model",
     "build_model_config",
+    "export_lora_adapter_state",
     "export_hf_weights",
+    "initialize_lora_olora_tail",
     "is_expert_param",
+    "load_lora_adapter",
+    "load_lora_adapter_state",
     "load_hf_weights",
+    "save_lora_adapter",
     "save_hf_weights",
     "vocab_size",
 ]

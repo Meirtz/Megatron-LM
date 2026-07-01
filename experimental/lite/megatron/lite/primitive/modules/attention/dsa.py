@@ -7,12 +7,14 @@ keep model config classes out of the primitive layer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
+from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.parallel.cp import (
     zigzag_reconstruct_from_cp_parts,
     zigzag_slice_for_cp,
@@ -26,6 +28,9 @@ from megatron.lite.primitive.kernels import dsa_kernels as _dsa_kernels
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
+
+
+DSA_INDEX_SHARE_TOPK_HOLDER_ATTR = "_dsa_index_share_topk_holder"
 
 
 def _fused_indexer_sparse_attn(*args, value_dim: int | None = None, **kwargs):
@@ -348,9 +353,14 @@ class DynamicSparseAttention(nn.Module):
         indexer_loss_coeff: float = 0.0,
         indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
+        layer_idx: int | None = None,
+        dsa_index_share_enabled: bool = False,
+        dsa_indexer_type: str = "full",
+        dsa_source_layer_idx: int | None = None,
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_group=None,
+        lora_config: LoraConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         if cp_size < 1:
@@ -366,9 +376,23 @@ class DynamicSparseAttention(nn.Module):
         self.v_head_dim = v_head_dim
         self.rope_interleaved = rope_interleaved
         self.softmax_scale = self.qk_head_dim**-0.5
+        self.index_topk = index_topk
+        self.indexer_softmax_scale = index_head_dim**-0.5
         self.indexer_loss_coeff = indexer_loss_coeff
         self.indexer_use_sparse_loss = indexer_use_sparse_loss
         self.calculate_per_token_loss = calculate_per_token_loss
+        if dsa_indexer_type not in {"full", "shared"}:
+            raise ValueError(f"dsa_indexer_type must be 'full' or 'shared', got {dsa_indexer_type!r}")
+        self.layer_idx = layer_idx
+        self.index_share = bool(dsa_index_share_enabled)
+        self.skip_topk = dsa_indexer_type == "shared"
+        if self.skip_topk and not self.index_share:
+            raise ValueError("dsa_indexer_type='shared' requires dsa_index_share_enabled=True")
+        if self.index_share and self.layer_idx is None:
+            raise ValueError("DSA index-share requires a global layer_idx")
+        self.dsa_source_layer_idx = dsa_source_layer_idx if dsa_source_layer_idx is not None else layer_idx
+        if self.skip_topk and self.dsa_source_layer_idx is None:
+            raise ValueError("DSA shared layer requires dsa_source_layer_idx")
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_group = cp_group
@@ -388,18 +412,72 @@ class DynamicSparseAttention(nn.Module):
             kv_lora_rank, num_attention_heads * (qk_nope_head_dim + v_head_dim), bias=False
         )
         self.o_proj = nn.Linear(num_attention_heads * v_head_dim, hidden_size, bias=False)
-        self.indexer = DSAIndexer(
-            hidden_size=hidden_size,
-            q_lora_rank=q_lora_rank,
-            qk_rope_head_dim=qk_rope_head_dim,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-            rope_interleaved=indexer_rope_interleaved,
-            layer_norm_eps=indexer_layer_norm_eps,
-            rope_first=indexer_rope_first,
-            use_hadamard=indexer_use_hadamard,
-        )
+        lora = normalize_lora_config(lora_config)
+        input_projection_lora = lora.enabled and lora.targets_module("linear_qkv")
+        self.q_a_lora: LinearLoRA | None = None
+        self.q_b_lora: LinearLoRA | None = None
+        self.kv_a_lora: LinearLoRA | None = None
+        self.kv_b_lora: LinearLoRA | None = None
+        self.o_lora: LinearLoRA | None = None
+        if input_projection_lora or (lora.enabled and lora.targets_module("q_a_proj")):
+            self.q_a_lora = LinearLoRA(
+                hidden_size,
+                q_lora_rank,
+                lora.rank,
+                alpha=lora.alpha,
+                dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
+            )
+        if input_projection_lora or (lora.enabled and lora.targets_module("q_b_proj")):
+            self.q_b_lora = LinearLoRA(
+                q_lora_rank,
+                num_attention_heads * self.qk_head_dim,
+                lora.rank,
+                alpha=lora.alpha,
+                dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
+            )
+        if input_projection_lora or (lora.enabled and lora.targets_module("kv_a_proj_with_mqa")):
+            self.kv_a_lora = LinearLoRA(
+                hidden_size,
+                kv_lora_rank + qk_rope_head_dim,
+                lora.rank,
+                alpha=lora.alpha,
+                dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
+            )
+        if input_projection_lora or (lora.enabled and lora.targets_module("kv_b_proj")):
+            self.kv_b_lora = LinearLoRA(
+                kv_lora_rank,
+                num_attention_heads * (qk_nope_head_dim + v_head_dim),
+                lora.rank,
+                alpha=lora.alpha,
+                dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
+            )
+        if lora.enabled and lora.targets_module("linear_proj"):
+            self.o_lora = LinearLoRA(
+                num_attention_heads * v_head_dim,
+                hidden_size,
+                lora.rank,
+                alpha=lora.alpha,
+                dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
+            )
+        self.indexer: DSAIndexer | None = None
+        if not self.skip_topk:
+            self.indexer = DSAIndexer(
+                hidden_size=hidden_size,
+                q_lora_rank=q_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                index_n_heads=index_n_heads,
+                index_head_dim=index_head_dim,
+                index_topk=index_topk,
+                rope_interleaved=indexer_rope_interleaved,
+                layer_norm_eps=indexer_layer_norm_eps,
+                rope_first=indexer_rope_first,
+                use_hadamard=indexer_use_hadamard,
+            )
         self.register_buffer(
             "attn_sink",
             torch.full((num_attention_heads,), -1.0e20, dtype=torch.float32),
@@ -415,6 +493,7 @@ class DynamicSparseAttention(nn.Module):
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         packed_seq_params=None,
+        dsa_index_share_topk_holder: dict[Any, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if attention_mask is not None:
             raise NotImplementedError(
@@ -425,7 +504,14 @@ class DynamicSparseAttention(nn.Module):
             if self.cp_size > 1:
                 x, position_ids = self._gather_packed_cp_inputs(x, position_ids, packed_seq_params)
                 cos, sin = self._gather_packed_cp_rotary(cos, sin, packed_seq_params, x.device)
-            out = self._forward_packed_full(x, cos, sin, position_ids, packed_seq_params)
+            out = self._forward_packed_full(
+                x,
+                cos,
+                sin,
+                position_ids,
+                packed_seq_params,
+                dsa_index_share_topk_holder=dsa_index_share_topk_holder,
+            )
             if self.cp_size > 1:
                 out = split_packed_to_cp_local(
                     out,
@@ -442,7 +528,14 @@ class DynamicSparseAttention(nn.Module):
                 x, position_ids, attention_mask
             )
 
-        out = self._forward_dense_full(x, cos, sin, position_ids)
+        out = self._forward_dense_full(
+            x,
+            cos,
+            sin,
+            position_ids,
+            packed_seq_params=packed_seq_params,
+            dsa_index_share_topk_holder=dsa_index_share_topk_holder,
+        )
         if cp_restore:
             out = zigzag_slice_for_cp(out, self.cp_rank, self.cp_size, seq_dim=1)
         return out
@@ -454,6 +547,8 @@ class DynamicSparseAttention(nn.Module):
         sin: torch.Tensor,
         position_ids: torch.Tensor,
         packed_seq_params,
+        *,
+        dsa_index_share_topk_holder: dict[Any, torch.Tensor] | None,
     ) -> torch.Tensor:
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params, x.device)
         if position_ids.dim() == 1:
@@ -476,6 +571,9 @@ class DynamicSparseAttention(nn.Module):
                     seg_cos,
                     seg_sin,
                     position_ids[:, start:end],
+                    packed_seq_params=packed_seq_params,
+                    dsa_index_share_topk_holder=dsa_index_share_topk_holder,
+                    index_share_segment_idx=idx,
                 )
             )
         if pieces:
@@ -488,11 +586,21 @@ class DynamicSparseAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         position_ids: torch.Tensor,
+        *,
+        packed_seq_params=None,
+        dsa_index_share_topk_holder: dict[Any, torch.Tensor] | None = None,
+        index_share_segment_idx: int | None = None,
     ) -> torch.Tensor:
 
         batch, seq_len, _ = x.shape
-        q_resid = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(q_resid).view(batch, seq_len, self.num_heads, self.qk_head_dim)
+        q_a = self.q_a_proj(x)
+        if self.q_a_lora is not None:
+            q_a = q_a + self.q_a_lora(x)
+        q_resid = self.q_a_layernorm(q_a)
+        q = self.q_b_proj(q_resid)
+        if self.q_b_lora is not None:
+            q = q + self.q_b_lora(q_resid)
+        q = q.view(batch, seq_len, self.num_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         cos, sin = _rotary_embeddings_from_cache(
             cos, sin, position_ids, device=x.device, dtype=x.dtype, dim=self.qk_rope_head_dim
@@ -503,19 +611,37 @@ class DynamicSparseAttention(nn.Module):
         q_nope = torch.einsum("bshd,hdr->bshr", q_nope, k_up_weight)
         query_states = torch.cat([q_nope, q_pe], dim=-1).transpose(0, 1).contiguous()
 
-        kv_latent, k_pe = torch.split(
-            self.kv_a_proj_with_mqa(x), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        kv_a = self.kv_a_proj_with_mqa(x)
+        if self.kv_a_lora is not None:
+            kv_a = kv_a + self.kv_a_lora(x)
+        kv_latent, k_pe = torch.split(kv_a, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_latent = self.kv_a_layernorm(kv_latent)
         k_pe = apply_rotary_pos_emb(k_pe.unsqueeze(2), cos, sin, unsqueeze_dim=2).squeeze(2)
         kv_full = torch.cat([kv_latent, k_pe], dim=-1).transpose(0, 1).contiguous()
 
-        q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
-            x.detach(), q_resid.detach(), cos, sin, position_ids
-        )
-        effective_indexer_topk = min(self.indexer.index_topk, seq_len)
+        topk_indices = None
+        q_indexer = k_indexer = weights_indexer = None
+        if self.skip_topk:
+            topk_indices = self._load_index_share_topk(
+                packed_seq_params=packed_seq_params,
+                dsa_index_share_topk_holder=dsa_index_share_topk_holder,
+                index_share_segment_idx=index_share_segment_idx,
+            )
+        else:
+            assert self.indexer is not None
+            q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
+                x.detach(), q_resid.detach(), cos, sin, position_ids
+            )
+        effective_indexer_topk = min(self.index_topk, seq_len)
 
-        if self.training and torch.is_grad_enabled():
+        use_indexer_loss = (
+            self.training
+            and torch.is_grad_enabled()
+            and not self.index_share
+            and self.indexer_loss_coeff > 0
+        )
+        if use_indexer_loss:
+            assert q_indexer is not None and k_indexer is not None and weights_indexer is not None
             window_idxs = torch.empty(batch, seq_len, 0, device=x.device, dtype=torch.int32)
             out, indexer_loss = _fused_indexer_sparse_attn(
                 query_states,
@@ -525,10 +651,10 @@ class DynamicSparseAttention(nn.Module):
                 q_indexer,
                 k_indexer,
                 weights_indexer,
-                self.indexer.index_topk,
+                self.index_topk,
                 1,
                 self.softmax_scale,
-                self.indexer.softmax_scale,
+                self.indexer_softmax_scale,
                 self.indexer_loss_coeff,
                 sparse_loss=self.indexer_use_sparse_loss,
                 kv_offset=0,
@@ -538,14 +664,28 @@ class DynamicSparseAttention(nn.Module):
             if self.indexer_loss_coeff > 0:
                 out = DSAIndexerLossAutoScaler.apply(out, indexer_loss)
         else:
-            topk_indices, _ = _dsa_kernels.indexer_topk(
-                q_indexer,
-                k_indexer,
-                weights_indexer,
-                effective_indexer_topk,
-                1,
-                indexer_softmax_scale=self.indexer.softmax_scale,
-            )
+            if topk_indices is None:
+                if self.training and torch.is_grad_enabled() and self.indexer_loss_coeff > 0:
+                    raise NotImplementedError(
+                        "DSA IndexShare training with dsa_indexer_loss_coeff > 0 requires "
+                        "the fused training kernel to return top-k indices. Disable index "
+                        "sharing or set dsa_indexer_loss_coeff=0 until that kernel path is wired."
+                    )
+                assert q_indexer is not None and k_indexer is not None and weights_indexer is not None
+                topk_indices, _ = _dsa_kernels.indexer_topk(
+                    q_indexer,
+                    k_indexer,
+                    weights_indexer,
+                    effective_indexer_topk,
+                    1,
+                    indexer_softmax_scale=self.indexer_softmax_scale,
+                )
+                self._store_index_share_topk(
+                    topk_indices,
+                    packed_seq_params=packed_seq_params,
+                    dsa_index_share_topk_holder=dsa_index_share_topk_holder,
+                    index_share_segment_idx=index_share_segment_idx,
+                )
             flat_idxs, flat_tlen = _dsa_kernels.build_flat_topk_idxs(
                 topk_indices, batch_size=batch, seqlen_kv=seq_len, compact=True
             )
@@ -563,10 +703,80 @@ class DynamicSparseAttention(nn.Module):
         out = out.permute(1, 0, 2, 3).contiguous()
         out = torch.einsum("bshr,hvr->bshv", out, v_up_weight)
         out = out.reshape(batch, seq_len, self.num_heads * self.v_head_dim)
-        return self.o_proj(out)
+        projected = self.o_proj(out)
+        if self.o_lora is not None:
+            projected = projected + self.o_lora(out)
+        return projected
+
+    def _get_index_share_topk_holder(
+        self,
+        *,
+        packed_seq_params,
+        dsa_index_share_topk_holder: dict[Any, torch.Tensor] | None,
+    ) -> dict[Any, torch.Tensor]:
+        if dsa_index_share_topk_holder is not None:
+            return dsa_index_share_topk_holder
+        if packed_seq_params is None:
+            raise AssertionError(
+                "DSA index-share requires a per-forward top-k holder. Pass "
+                "dsa_index_share_topk_holder or use packed_seq_params carrying "
+                f"{DSA_INDEX_SHARE_TOPK_HOLDER_ATTR}."
+            )
+        holder = getattr(packed_seq_params, DSA_INDEX_SHARE_TOPK_HOLDER_ATTR, None)
+        if holder is None:
+            holder = {}
+            setattr(packed_seq_params, DSA_INDEX_SHARE_TOPK_HOLDER_ATTR, holder)
+        return holder
+
+    @staticmethod
+    def _index_share_holder_key(layer_idx: int, segment_idx: int | None) -> Any:
+        return layer_idx if segment_idx is None else (layer_idx, segment_idx)
+
+    def _load_index_share_topk(
+        self,
+        *,
+        packed_seq_params,
+        dsa_index_share_topk_holder: dict[Any, torch.Tensor] | None,
+        index_share_segment_idx: int | None,
+    ) -> torch.Tensor:
+        assert self.dsa_source_layer_idx is not None
+        holder = self._get_index_share_topk_holder(
+            packed_seq_params=packed_seq_params,
+            dsa_index_share_topk_holder=dsa_index_share_topk_holder,
+        )
+        key = self._index_share_holder_key(self.dsa_source_layer_idx, index_share_segment_idx)
+        if key not in holder:
+            raise AssertionError(
+                "DSA index-share skip layer "
+                f"(layer_idx={self.layer_idx}) needs top-k indices from source "
+                f"layer_idx={self.dsa_source_layer_idx}, but that layer did not run "
+                "earlier in this forward context. Cross-PP top-k sharing is not supported. "
+                f"Holder has keys {sorted(holder, key=repr)}."
+            )
+        return holder[key]
+
+    def _store_index_share_topk(
+        self,
+        topk_indices: torch.Tensor,
+        *,
+        packed_seq_params,
+        dsa_index_share_topk_holder: dict[Any, torch.Tensor] | None,
+        index_share_segment_idx: int | None,
+    ) -> None:
+        if not self.index_share:
+            return
+        assert self.layer_idx is not None
+        holder = self._get_index_share_topk_holder(
+            packed_seq_params=packed_seq_params,
+            dsa_index_share_topk_holder=dsa_index_share_topk_holder,
+        )
+        holder[self._index_share_holder_key(self.layer_idx, index_share_segment_idx)] = topk_indices
 
     def _split_kv_b_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        kv_b = self.kv_b_proj.weight.view(
+        weight = self.kv_b_proj.weight
+        if self.kv_b_lora is not None:
+            weight = weight + self.kv_b_lora.materialized_delta_weight().to(weight.dtype)
+        kv_b = weight.view(
             self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
         )
         return (kv_b[:, : self.qk_nope_head_dim, :], kv_b[:, self.qk_nope_head_dim :, :])
@@ -684,6 +894,7 @@ class DynamicSparseAttention(nn.Module):
 
 
 __all__ = [
+    "DSA_INDEX_SHARE_TOPK_HOLDER_ATTR",
     "DSAIndexer",
     "DSAIndexerLossAutoScaler",
     "DynamicSparseAttention",

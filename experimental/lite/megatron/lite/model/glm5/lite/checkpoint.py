@@ -23,6 +23,8 @@ no-ops here; they are kept for structural parity with Kimi.
 
 from __future__ import annotations
 
+import re
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -146,6 +148,101 @@ def _get(reader: SafeTensorReader, name: str) -> torch.Tensor:
     return _dequant_fp8_weight(reader, name, tensor)
 
 
+def _slice_to_target_shape(
+    tensor: torch.Tensor, target: torch.Tensor, *, offset: int = 0
+) -> torch.Tensor:
+    """Slice packed/full tensors to the target local shape.
+
+    This covers packed expert checkpoints where the first dimension is global
+    experts and the target tensor is only this rank's local expert shard.
+    """
+
+    expected = tuple(target.shape)
+    if tuple(tensor.shape) == expected:
+        return tensor
+    if tensor.ndim != target.ndim:
+        raise ValueError(
+            f"Cannot slice tensor with shape {tuple(tensor.shape)} to target shape {expected}."
+        )
+    slices = []
+    for dim, target_size in enumerate(target.shape):
+        source_size = tensor.shape[dim]
+        if dim == 0 and source_size >= offset + target_size:
+            slices.append(slice(offset, offset + target_size))
+        elif source_size >= target_size:
+            slices.append(slice(0, target_size))
+        else:
+            raise ValueError(
+                f"Cannot slice tensor with shape {tuple(tensor.shape)} to target shape {expected}."
+            )
+    return tensor[tuple(slices)].contiguous()
+
+
+def _expert_indexed_name(name: str) -> tuple[str, int, str] | None:
+    match = re.fullmatch(
+        r"(.+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight",
+        name,
+    )
+    if match is None:
+        return None
+    prefix, expert_idx, proj = match.groups()
+    return prefix, int(expert_idx), proj
+
+
+def _resolve_hf_tensor(reader: SafeTensorReader, name: str, target: torch.Tensor) -> torch.Tensor:
+    if _has(reader, name):
+        return _slice_to_target_shape(_get(reader, name), target)
+
+    expert = _expert_indexed_name(name)
+    if expert is None:
+        return _slice_to_target_shape(_get(reader, name), target)
+    prefix, expert_idx, proj = expert
+
+    if proj in {"gate_proj", "up_proj"}:
+        packed_gate_up = f"{prefix}.gate_up_proj"
+        if _has(reader, packed_gate_up):
+            gate_up = _get(reader, packed_gate_up)
+            expert_gate_up = gate_up[expert_idx]
+            gate, up = expert_gate_up.chunk(2, dim=0)
+            return _slice_to_target_shape(gate if proj == "gate_proj" else up, target)
+
+        automodel_gate_up = f"{prefix}.gate_and_up_projs"
+        if _has(reader, automodel_gate_up):
+            gate_up = _get(reader, automodel_gate_up)[expert_idx]
+            split = gate_up.shape[-1] // 2
+            tensor = gate_up[:, :split] if proj == "gate_proj" else gate_up[:, split:]
+            return _slice_to_target_shape(tensor.t().contiguous(), target)
+
+    if proj == "down_proj":
+        packed_down = f"{prefix}.down_proj"
+        if _has(reader, packed_down):
+            return _slice_to_target_shape(_get(reader, packed_down)[expert_idx], target)
+
+        automodel_down = f"{prefix}.down_projs"
+        if _has(reader, automodel_down):
+            tensor = _get(reader, automodel_down)[expert_idx].t().contiguous()
+            return _slice_to_target_shape(tensor, target)
+
+    raise KeyError(f"Could not resolve GLM-5 HF tensor {name!r}.")
+
+
+def _resolve_named_parameter_tensor(
+    reader: SafeTensorReader,
+    name: str,
+    target: torch.Tensor,
+    *,
+    config: Glm5Config,
+    ps: ParallelState,
+) -> torch.Tensor:
+    del config
+    offset = 0
+    if target.ndim >= 3 and ps.ep_size > 1:
+        offset = ps.ep_rank * target.shape[0]
+    if _has(reader, name):
+        return _slice_to_target_shape(_get(reader, name), target, offset=offset)
+    return _resolve_hf_tensor(reader, name, target)
+
+
 def _text_prefix(reader: SafeTensorReader) -> str:
     for prefix in ("model", "language_model.model", "model.language_model"):
         if _has(reader, f"{prefix}.embed_tokens.weight"):
@@ -185,6 +282,7 @@ def _load_attention(
     hf_prefix: str,
     reader: SafeTensorReader,
     ps: ParallelState,
+    load_indexer: bool = True,
 ) -> None:
     # GLM-5 ONLY: DSA attention.  Native params live under
     # `<local_prefix>.self_attention.self_attention.*` (the wrapper adds one
@@ -200,7 +298,10 @@ def _load_attention(
     out[f"{ap}.kv_a_layernorm.weight"] = _get(reader, f"{hf_prefix}.kv_a_layernorm.weight")
     out[f"{ap}.kv_b_proj.weight"] = _get(reader, f"{hf_prefix}.kv_b_proj.weight")
     out[f"{ap}.o_proj.weight"] = _get(reader, f"{hf_prefix}.o_proj.weight")
-    # DSA indexer.
+    # DSA indexer.  Shared-indexer layers reuse top-k from an earlier full
+    # layer and do not own indexer parameters in HF checkpoints.
+    if not load_indexer:
+        return
     ip = f"{ap}.indexer"
     hip = f"{hf_prefix}.indexer"
     out[f"{ip}.wq_b.weight"] = _get(reader, f"{hip}.wq_b.weight")
@@ -285,17 +386,19 @@ def _load_experts(
 ) -> None:
     num_local = ensure_divisible(cfg.num_experts, ps.ep_size)
     local_start = ps.ep_rank * num_local
+    gate_target = torch.empty(cfg.moe_intermediate_size, cfg.hidden_size)
+    down_target = torch.empty(cfg.hidden_size, cfg.moe_intermediate_size)
     for local_idx in range(num_local):
         global_idx = local_start + local_idx
         ep = f"{hf_mlp_prefix}.experts.{global_idx}"
         fc1 = torch.cat(
             [
-                _get(reader, f"{ep}.gate_proj.weight"),
-                _get(reader, f"{ep}.up_proj.weight"),
+                _resolve_hf_tensor(reader, f"{ep}.gate_proj.weight", gate_target),
+                _resolve_hf_tensor(reader, f"{ep}.up_proj.weight", gate_target),
             ],
             dim=0,
         )
-        fc2 = _get(reader, f"{ep}.down_proj.weight")
+        fc2 = _resolve_hf_tensor(reader, f"{ep}.down_proj.weight", down_target)
         if ps.etp_size > 1:
             fc1 = _split_gate_up(fc1, ps.etp_rank, ps.etp_size)
             fc2 = _tp(fc2, ps.etp_rank, ps.etp_size, dim=1)
@@ -330,6 +433,18 @@ def _copy_loaded_state(model: nn.Module, loaded: dict[str, torch.Tensor]) -> Non
             continue
         tensor = resolved[name].to(device=target.device)
         target.data.copy_(tensor.to(dtype=target.dtype) if target.is_floating_point() else tensor)
+
+
+def _unwrap_glm5_model(model: nn.Module) -> nn.Module:
+    base_model = unwrap_model(model)
+    inner = getattr(base_model, "model", None)
+    if (
+        isinstance(inner, nn.Module)
+        and isinstance(getattr(base_model, "config", None), Glm5Config)
+        and hasattr(inner, "layer_indices")
+    ):
+        return inner
+    return base_model
 
 
 class Glm5WeightSpec:
@@ -496,7 +611,7 @@ class Glm5WeightSpec:
 
 
 def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: ParallelState) -> None:
-    base_model = unwrap_model(model)
+    base_model = _unwrap_glm5_model(model)
     reader = SafeTensorReader(path)
     out: dict[str, torch.Tensor] = {}
 
@@ -530,6 +645,7 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
             hf_prefix=f"{hp}.self_attn",
             reader=reader,
             ps=ps,
+            load_indexer=not config.is_dsa_skip_topk_layer(global_idx),
         )
         if config.is_moe_layer(global_idx):
             out[f"{lp}.mlp_norm.weight"] = _get(reader, f"{hp}.post_attention_layernorm.weight")
@@ -586,6 +702,7 @@ def load_hf_weights(model: nn.Module, path: str, config: Glm5Config, ps: Paralle
                 hf_prefix=f"{hp}.self_attn",
                 reader=reader,
                 ps=ps,
+                load_indexer=not config.is_dsa_skip_topk_layer(global_idx),
             )
             if config.is_moe_layer(global_idx):
                 out[f"{tlp}.mlp_norm.weight"] = _get(
@@ -629,13 +746,19 @@ def export_hf_weights(model, config: Glm5Config, ps: ParallelState, **kwargs):
     spec = Glm5WeightSpec(config)
     rank0_only = bool(kwargs.get("rank0_only", False))
     export_dtype = _resolve_export_dtype(kwargs.get("export_dtype"))
-    yield from _export(model, spec, ps, vocab_size=config.vocab_size, **kwargs)
+    if isinstance(model, nn.ModuleList):
+        export_model = nn.ModuleList([_unwrap_glm5_model(chunk) for chunk in model])
+    elif isinstance(model, list):
+        export_model = [_unwrap_glm5_model(chunk) for chunk in model]
+    else:
+        export_model = _unwrap_glm5_model(model)
+    yield from _export(export_model, spec, ps, vocab_size=config.vocab_size, **kwargs)
     rank = dist.get_rank() if dist.is_initialized() else 0
     if rank0_only and rank != 0:
         return
     chunks = list(model) if isinstance(model, list | nn.ModuleList) else [model]
     for chunk in chunks:
-        base_chunk = unwrap_model(chunk)
+        base_chunk = _unwrap_glm5_model(chunk)
         layer_map = (
             {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
             if hasattr(base_chunk, "layer_indices")
@@ -660,13 +783,23 @@ def save_hf_weights(model, path: str, config: Glm5Config, ps: ParallelState, **k
         dist.barrier()
 
 
+def save_weights(model, path: str, config: Glm5Config, ps: ParallelState, **kwargs) -> None:
+    """Compatibility wrapper for saving GLM5 HF-style safetensors."""
+
+    save_hf_weights(model, path, config, ps, **kwargs)
+
+
 __all__ = [
     "EXPERT_CLASSIFIER",
     "Glm5WeightSpec",
     "PLACEMENT_FN",
     "_dequant_int4_weight",
     "_dequant_fp8_weight",
+    "_resolve_hf_tensor",
+    "_resolve_named_parameter_tensor",
+    "_slice_to_target_shape",
     "export_hf_weights",
     "load_hf_weights",
     "save_hf_weights",
+    "save_weights",
 ]

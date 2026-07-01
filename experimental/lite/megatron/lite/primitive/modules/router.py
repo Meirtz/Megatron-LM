@@ -10,9 +10,11 @@ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
+from megatron.lite.primitive.modules.router_replay import RouterReplay
 from megatron.lite.primitive.utils.moe import (
     compute_routing_scores_for_aux_loss,
     router_gating_linear,
+    routing_map_from_topk_indices,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
 )
@@ -48,6 +50,7 @@ class TopKRouter(nn.Module):
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
         router_dtype: torch.dtype | None = None,
+        router_replay: RouterReplay | None = None,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -63,6 +66,7 @@ class TopKRouter(nn.Module):
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
         self.router_dtype = router_dtype
+        self.router_replay = router_replay
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
@@ -76,15 +80,28 @@ class TopKRouter(nn.Module):
         logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
-        if self.moe_router_fusion:
+        replay_active = bool(getattr(self.router_replay, "active", False))
+        if self.moe_router_fusion and not replay_active:
             probs_dense, _ = topk_routing_with_score_function(
                 logits,
                 self.topk,
                 use_pre_softmax=self.use_pre_softmax,
                 score_function="softmax",
                 fused=True,
+                router_replay=self.router_replay,
             )
             topk_scores, topk_indices = torch.topk(probs_dense, k=self.topk, dim=-1)
+        elif replay_active:
+            topk_scores, topk_indices = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.use_pre_softmax,
+                score_function="softmax",
+                fused=False,
+                dense_output=True,
+                router_replay=self.router_replay,
+            )
+            routing_map = routing_map_from_topk_indices(logits, topk_indices)
         else:
             probs_dense, routing_map = topk_routing_with_score_function(
                 logits,
@@ -92,6 +109,7 @@ class TopKRouter(nn.Module):
                 use_pre_softmax=self.use_pre_softmax,
                 score_function="softmax",
                 fused=False,
+                router_replay=self.router_replay,
             )
             topk_scores, topk_indices = _ordered_topk_from_routing_map(
                 probs_dense, routing_map, self.topk
@@ -134,6 +152,7 @@ class SigmoidTopKRouter(nn.Module):
         compute_aux_loss: bool = True,
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
+        router_replay: RouterReplay | None = None,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -150,6 +169,7 @@ class SigmoidTopKRouter(nn.Module):
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
+        self.router_replay = router_replay
 
         self.gate = nn.Linear(config.hidden_size, config.n_routed_experts, bias=False)
         self.register_buffer(
@@ -164,17 +184,32 @@ class SigmoidTopKRouter(nn.Module):
         logits = self.gate(x)
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
-        probs_dense, routing_map = topk_routing_with_score_function(
-            logits,
-            self.topk,
-            score_function=self.score_function,
-            expert_bias=self.expert_bias.to(logits.dtype),
-            scaling_factor=(self.scaling_factor or None),
-            fused=self.moe_router_fusion,
-        )
-        topk_scores, topk_indices = _ordered_topk_from_routing_map(
-            probs_dense, routing_map, self.topk
-        )
+        replay_active = bool(getattr(self.router_replay, "active", False))
+        if replay_active:
+            topk_scores, topk_indices = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias.to(logits.dtype),
+                scaling_factor=(self.scaling_factor or None),
+                fused=False,
+                dense_output=True,
+                router_replay=self.router_replay,
+            )
+            routing_map = routing_map_from_topk_indices(logits, topk_indices)
+        else:
+            probs_dense, routing_map = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias.to(logits.dtype),
+                scaling_factor=(self.scaling_factor or None),
+                fused=self.moe_router_fusion,
+                router_replay=self.router_replay,
+            )
+            topk_scores, topk_indices = _ordered_topk_from_routing_map(
+                probs_dense, routing_map, self.topk
+            )
         topk_scores = topk_scores.to(logits.dtype)
 
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():

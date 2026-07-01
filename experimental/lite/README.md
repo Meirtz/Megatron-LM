@@ -14,11 +14,12 @@ refer to `megatron.lite`.
 
 ## Scope
 
-This initial drop contains:
+This experimental tree contains:
 
 - A lightweight runtime API in `megatron.lite.runtime`.
 - Common training primitives in `megatron.lite.primitive`.
-- Lite-only native model implementations for Qwen3 MoE and Qwen3.5 MoE.
+- Lite-only native model implementations for Qwen3 MoE, Qwen3.5 MoE, Kimi K2,
+  GLM-5, and DeepSeek-V4.
 - Hugging Face safetensors load/export helpers for the included models.
 - Megatron-Core optimizer wrapping for the lite runtime.
 - FSDP2 optimizer primitives for supported lite model protocols.
@@ -27,7 +28,7 @@ This initial drop contains:
 - A benchmark example that can dry-run or execute `mlite`, `mbridge`, and
   `bridge` backends.
 
-This initial drop intentionally does not include:
+This experimental tree intentionally does not include:
 
 - Hybrid model implementations.
 - Dense Qwen3 model support. The included Qwen3-family path is Qwen3 MoE only.
@@ -98,6 +99,12 @@ Canonical model names currently registered by default:
 
 - `qwen3_moe`: Qwen3 MoE lite implementation. Use this name in new configs.
 - `qwen3_5`: Qwen3.5 MoE lite implementation.
+- `kimi_k2`: Kimi K2 lite implementation. HF `model_type` values `kimi_k2`
+  and `deepseek_v3` resolve through this path.
+- `glm5`: GLM-5 MoE/DSA lite implementation. HF `model_type` value
+  `glm_moe_dsa` resolves through this path.
+- `deepseek_v4`: DeepSeek-V4 lite implementation. HF `model_type` value
+  `deepseek_v4` resolves through this path.
 
 Compatibility names:
 

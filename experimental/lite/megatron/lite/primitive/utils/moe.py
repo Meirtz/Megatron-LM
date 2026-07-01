@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -240,9 +240,13 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     dense_output: bool = False,
+    router_replay: Any | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
+    replay_active = bool(getattr(router_replay, "active", False))
+    if fused and replay_active:
+        fused = False
     if fused:
         return fused_topk_with_score_function(
             logits=logits,
@@ -273,12 +277,24 @@ def topk_routing_with_score_function(
             )
         return torch.topk(scores, k=k, dim=1, sorted=torch.is_grad_enabled())
 
+    def compute_or_replay_topk(
+        scores: torch.Tensor,
+        k: int,
+        groups: Optional[int] = None,
+        groups_topk: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if router_replay is not None:
+            return router_replay.get_replay_topk(
+                scores, k, groups, groups_topk, default_compute_topk=compute_topk
+            )
+        return compute_topk(scores, k, groups, groups_topk)
+
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            probs, top_indices = compute_or_replay_topk(scores, topk, num_groups, group_topk)
         else:
-            scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
+            scores, top_indices = compute_or_replay_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if score_function == "sigmoid":
@@ -287,10 +303,12 @@ def topk_routing_with_score_function(
             scores = torch.nn.functional.softplus(logits.float()).sqrt()
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            _, top_indices = compute_or_replay_topk(
+                scores_for_routing, topk, num_groups, group_topk
+            )
             scores = torch.gather(scores, dim=1, index=top_indices)
         else:
-            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            scores, top_indices = compute_or_replay_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
@@ -315,6 +333,15 @@ def topk_routing_with_score_function(
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
     return routing_probs, routing_map
+
+
+def routing_map_from_topk_indices(
+    logits: torch.Tensor, topk_indices: torch.Tensor
+) -> torch.Tensor:
+    routing_map = torch.zeros_like(logits, dtype=torch.bool)
+    if topk_indices.numel() == 0:
+        return routing_map
+    return routing_map.scatter(1, topk_indices.to(device=logits.device, dtype=torch.long), True)
 
 
 def compute_routing_scores_for_aux_loss(

@@ -34,7 +34,15 @@ class PackedBatch(Batch):
     """Variable-length packed batch — no padding.
 
     All token-level tensors are 1-D with length ``sum(seq_lens)``.
-    ``cu_seqlens`` and ``position_ids`` are derived automatically.
+    ``routed_experts`` follows the same true-token grain when it comes from a
+    rollout/reference pass; model protocols pad and CP-split replay tensors to
+    their local THD forward layout before calling routers. ROLL/SGLang-style
+    padded traces may also be passed as ``[batch, seq, routers, topk]`` and are
+    flattened via ``seq_lens`` first. Pre-packed replay tensors may set
+    ``extras["router_replay_layout"]`` to ``"full_padded"`` or ``"cp_local"``
+    to make the token grain explicit. Multi-turn traces should be concatenated
+    along the true-token dimension before construction. ``cu_seqlens`` and
+    ``position_ids`` are derived automatically.
     """
 
     input_ids: torch.Tensor  # [total_tokens]
@@ -42,7 +50,7 @@ class PackedBatch(Batch):
     seq_lens: torch.Tensor  # [num_seqs]
     loss_mask: torch.Tensor | None = None  # [total_tokens]
     position_ids: torch.Tensor | None = None  # [total_tokens], auto if None
-    routed_experts: torch.Tensor | None = None
+    routed_experts: torch.Tensor | list[torch.Tensor] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
     def __len__(self) -> int:
@@ -82,7 +90,7 @@ class TrainBatch:
     labels: torch.Tensor
     loss_mask: torch.Tensor | None = None
     position_ids: torch.Tensor | None = None
-    routed_experts: torch.Tensor | None = None
+    routed_experts: torch.Tensor | list[torch.Tensor] | None = None
     cp_size: int | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -100,7 +108,10 @@ class ModelOutputs:
     mtp_logits: torch.Tensor | None = None
     mtp_loss: torch.Tensor | None = None
     # Router Replay: recorded routing decisions
-    routed_experts: torch.Tensor | None = None
+    routed_experts: torch.Tensor | list[torch.Tensor] | None = None
+    # Delta-mem: runtime-owned writable adapter state returned by model protocols.
+    delta_mem_states: Any | None = None
+    delta_mem_mtp_states: Any | None = None
 
 
 @dataclass(slots=True)

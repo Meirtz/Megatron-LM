@@ -58,6 +58,13 @@ Useful knobs:
 - `TOTAL_STEPS`, `TOTAL_EPOCHS`, `TRAIN_BATCH_SIZE`, `MICRO_BATCH_SIZE`
 - `MAX_TOKENS_PER_GPU`, `MAX_LENGTH`, `MESSAGES_KEY`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
+- `LORA_RANK`, `LORA_ALPHA`, `LORA_DROPOUT`, `LORA_TARGET_MODULES`,
+  `LORA_USE_RSLORA`; LoRA overrides are emitted only when `LORA_RANK != 0`
+- `LORA_INIT`; `olora_tail` is a GLM5-only post-base-load initializer in
+  MLite today, and Qwen3-MoE rejects it explicitly instead of ignoring it.
+- `CHECKPOINT_SAVE_CONTENTS`, `CHECKPOINT_LOAD_CONTENTS`,
+  `CHECKPOINT_SAVE_LORA_ADAPTER`, and `LORA_ADAPTER_DIR_NAME` for optional LoRA
+  adapter sidecar checkpointing.
 - `MLITE_MODEL_NAME=auto`, `MLITE_IMPL=lite`
 - `ATTENTION_BACKEND=flash`
 - `DRY_RUN=1` to print the resolved `torchrun` command without launching
@@ -68,6 +75,32 @@ and GPU when VERL switches execution contexts. `OPTIMIZER_OFFLOAD=True` also
 sets `optim.override_optimizer_config.offload_fraction=1.0` by default, which
 keeps FSDP2 optimizer update state on CPU during forward/backward to reduce GPU
 memory pressure.
+
+LoRA adapter sidecar checkpoints are opt-in. Add `lora_adapter` to
+`CHECKPOINT_SAVE_CONTENTS`, set `CHECKPOINT_SAVE_LORA_ADAPTER=True`, or pass the
+corresponding Hydra overrides directly to save a PEFT-style adapter directory
+under `lora_adapter/` inside the checkpoint. Use `CHECKPOINT_LOAD_CONTENTS` to
+restore an adapter sidecar and `LORA_ADAPTER_DIR_NAME` to choose a different
+relative directory inside the checkpoint. The engine rejects absolute paths and
+`..` traversal for that directory. It uses `engine.impl_cfg.lora` as the adapter
+config unless overridden with `checkpoint.lora_adapter_kwargs`. Sidecar boolean
+flags accept explicit booleans or boolean strings; for example,
+`CHECKPOINT_SAVE_LORA_ADAPTER=False` does not enable adapter sidecar saves.
+Content keys are parsed exactly, with bracket/comma strings, whitespace, and
+simple shell quotes normalized; mapping/dict values are rejected for
+`save_contents` and `load_contents`.
+`checkpoint.lora_adapter_kwargs` and its nested `metadata` value must be
+mapping/object values. When model/optimizer state and a sidecar are requested
+together, sidecar path, kwargs, and runtime adapter API capability are checked
+before the model checkpoint is written or loaded; sidecar saves also require an
+enabled LoRA config from `engine.impl_cfg.lora` or
+`checkpoint.lora_adapter_kwargs.lora_config` before any full checkpoint write.
+Sidecar loads require the selected adapter path to already exist as a directory
+before any full checkpoint is loaded.
+For adapter-only saves, a newly-created checkpoint wrapper directory is removed
+if the adapter save fails; pre-existing directories are preserved.
+Loads whose content set contains no MLite-owned state (`model`, `optimizer`, or
+LoRA adapter sidecar) are skipped before parameter offload or CUDA reload work.
 
 Example dry run:
 
@@ -148,6 +181,13 @@ Useful GRPO knobs:
   backend in text-only mode for GSM8K by default.
 - `ACTOR_TP`, `ACTOR_PP`, `ACTOR_VPP`, `ACTOR_CP`, `ACTOR_EP`, `ACTOR_ETP`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
+- `LORA_RANK`, `LORA_ALPHA`, `LORA_DROPOUT`, `LORA_TARGET_MODULES`,
+  `LORA_USE_RSLORA`; LoRA overrides are emitted only when `LORA_RANK != 0`
+- `LORA_INIT`; `olora_tail` is a GLM5-only post-base-load initializer in
+  MLite today, and Qwen3-MoE rejects it explicitly instead of ignoring it.
+- `CHECKPOINT_SAVE_CONTENTS`, `CHECKPOINT_LOAD_CONTENTS`,
+  `CHECKPOINT_SAVE_LORA_ADAPTER`, and `LORA_ADAPTER_DIR_NAME` for optional LoRA
+  adapter sidecar checkpointing.
 - `INFER_BACKEND=vllm`
 - `USE_LEGACY_WORKER_IMPL=disable` to use VERL's new engine worker path
 - `POLICY_LOSS_MODE=vanilla` and `LOSS_AGG_MODE=seq-mean-token-sum-norm`
@@ -160,12 +200,24 @@ to a separate reference model. It also disables VERL's legacy worker path by
 default so `actor@actor_rollout_ref.actor=mlite_actor` is handled by the new
 engine worker implementation.
 
+For LoRA adapter sidecar checkpoints, use
+`CHECKPOINT_SAVE_CONTENTS=[lora_adapter]` for adapter-only saves or include
+`lora_adapter` alongside `model`/`optimizer` for a full checkpoint plus
+PEFT-style adapter directory. Loading can use
+`CHECKPOINT_LOAD_CONTENTS=[lora_adapter]` in the same form. The launcher also
+maps `CHECKPOINT_SAVE_LORA_ADAPTER=True` and
+`LORA_ADAPTER_DIR_NAME=peft_adapter` to the matching checkpoint Hydra fields.
+Boolean sidecar flags use explicit boolean-string parsing, so `False` stays
+disabled. The adapter directory name must stay relative to the checkpoint; an
+absolute path or `..` path segment is rejected. User-provided adapter kwargs and
+metadata must be mapping/object values.
+
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
 
 ## Smoke / Dry-Run Checks
 
-Checked on this branch on 2026-06-07. These checks cover shell syntax,
+Checked on this branch on 2026-06-20. These checks cover shell syntax,
 Python import compilation, and resolved command construction only; they do not
 cover end-to-end SFT or GRPO training.
 

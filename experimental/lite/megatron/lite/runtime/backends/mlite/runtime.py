@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -119,6 +119,25 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
 def _last_loss_output(outputs: list[dict]) -> dict:
     for output in reversed(outputs):
         if output.get("loss") is not None:
+            return output
+    return {}
+
+
+_MODEL_OUTPUT_PAYLOAD_KEYS = (
+    "logits",
+    "log_probs",
+    "routed_experts",
+    "delta_mem_states",
+    "delta_mem_mtp_states",
+    "mtp_logits",
+    "mtp_loss",
+    "model_output",
+)
+
+
+def _last_output_with_payload(outputs: list[dict]) -> dict:
+    for output in reversed(outputs):
+        if any(key in output and output[key] is not None for key in _MODEL_OUTPUT_PAYLOAD_KEYS):
             return output
     return {}
 
@@ -278,6 +297,7 @@ class MegatronLiteRuntime(RuntimeBase):
             step = kwargs.pop("global_step", 0)
         use_dcp = bool(kwargs.pop("use_dcp", True))
         save_rng = bool(kwargs.pop("save_rng", True))
+        save_delta_mem_state = bool(kwargs.pop("save_delta_mem_state", True))
         get_placements, is_expert = _checkpoint_hooks(handle)
         save_training_checkpoint(
             _checkpoint_model(handle, use_dcp=use_dcp),
@@ -294,12 +314,20 @@ class MegatronLiteRuntime(RuntimeBase):
             save_optimizer=kwargs.pop("save_optimizer", True),
             **kwargs,
         )
+        if save_delta_mem_state:
+            from megatron.lite.runtime.backends.mlite.delta_mem_state import (
+                save_delta_mem_runtime_state,
+            )
+
+            delta_mem_path = os.path.join(path, f"step_{int(step)}") if use_dcp else path
+            save_delta_mem_runtime_state(handle, delta_mem_path, require_state=False)
 
     def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int:
         from megatron.lite.primitive.ckpt import load_training_checkpoint
 
         use_dcp = bool(kwargs.pop("use_dcp", True))
         load_rng = bool(kwargs.pop("load_rng", True))
+        load_delta_mem_state = bool(kwargs.pop("load_delta_mem_state", True))
         update_legacy_format = bool(
             kwargs.pop(
                 "load_parameter_state_update_legacy_format",
@@ -307,7 +335,7 @@ class MegatronLiteRuntime(RuntimeBase):
             )
         )
         get_placements, is_expert = _checkpoint_hooks(handle)
-        return load_training_checkpoint(
+        step = load_training_checkpoint(
             _checkpoint_model(handle, use_dcp=use_dcp),
             handle._optimizer,
             path,
@@ -322,6 +350,13 @@ class MegatronLiteRuntime(RuntimeBase):
             load_optimizer=kwargs.pop("load_optimizer", True),
             **kwargs,
         )
+        if load_delta_mem_state:
+            from megatron.lite.runtime.backends.mlite.delta_mem_state import (
+                load_delta_mem_runtime_state,
+            )
+
+            load_delta_mem_runtime_state(handle, path, require_exists=False)
+        return step
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
@@ -334,6 +369,71 @@ class MegatronLiteRuntime(RuntimeBase):
         else:
             for chunk in model_chunks:
                 yield from chunk.named_parameters()
+
+    def export_lora_adapter_state(
+        self, handle: ModelHandle, **kwargs
+    ) -> dict[str, torch.Tensor]:
+        model_chunks, proto, model_cfg, ps = _adapter_protocol_context(handle)
+        export_fn = getattr(proto, "export_lora_adapter_state", None)
+        if not callable(export_fn):
+            raise NotImplementedError(
+                f"MLite protocol {proto.__name__} does not implement export_lora_adapter_state."
+            )
+        return export_fn(model_chunks, model_cfg, ps, **kwargs)
+
+    def save_lora_adapter(
+        self, handle: ModelHandle, output_dir: str | os.PathLike, **kwargs
+    ) -> Any:
+        model_chunks, proto, model_cfg, ps = _adapter_protocol_context(handle)
+        save_fn = getattr(proto, "save_lora_adapter", None)
+        if not callable(save_fn):
+            raise NotImplementedError(
+                f"MLite protocol {proto.__name__} does not implement save_lora_adapter."
+            )
+        return save_fn(model_chunks, model_cfg, ps, output_dir, **kwargs)
+
+    def load_lora_adapter(
+        self, handle: ModelHandle, adapter_dir: str | os.PathLike, **kwargs
+    ) -> Any:
+        model_chunks, proto, model_cfg, ps = _adapter_protocol_context(handle)
+        load_fn = getattr(proto, "load_lora_adapter", None)
+        if not callable(load_fn):
+            raise NotImplementedError(
+                f"MLite protocol {proto.__name__} does not implement load_lora_adapter."
+            )
+        return load_fn(model_chunks, adapter_dir, model_cfg, ps, **kwargs)
+
+    def export_delta_mem_runtime_state(self, handle: ModelHandle, **kwargs) -> dict[str, Any]:
+        from megatron.lite.runtime.backends.mlite.delta_mem_state import (
+            export_delta_mem_runtime_state,
+        )
+
+        return export_delta_mem_runtime_state(handle, **kwargs)
+
+    def save_delta_mem_runtime_state(
+        self, handle: ModelHandle, output_dir: str | os.PathLike, **kwargs
+    ) -> Any:
+        from megatron.lite.runtime.backends.mlite.delta_mem_state import (
+            save_delta_mem_runtime_state,
+        )
+
+        return save_delta_mem_runtime_state(handle, output_dir, **kwargs)
+
+    def load_delta_mem_runtime_state(
+        self, handle: ModelHandle, input_dir: str | os.PathLike, **kwargs
+    ) -> Any:
+        from megatron.lite.runtime.backends.mlite.delta_mem_state import (
+            load_delta_mem_runtime_state,
+        )
+
+        return load_delta_mem_runtime_state(handle, input_dir, **kwargs)
+
+    def reset_delta_mem_runtime_state(self, handle: ModelHandle) -> None:
+        from megatron.lite.runtime.backends.mlite.delta_mem_state import (
+            reset_delta_mem_runtime_state,
+        )
+
+        reset_delta_mem_runtime_state(handle)
 
     # ── Memory ──
 
@@ -392,6 +492,10 @@ class MegatronLiteRuntime(RuntimeBase):
         num_microbatches: int = 1,
         forward_only: bool = False,
     ) -> ForwardResult:
+        from megatron.lite.runtime.backends.mlite.delta_mem_state import (
+            delta_mem_runtime_lifecycle_requested,
+            wrap_delta_mem_forward_step,
+        )
         from megatron.lite.primitive.train_step import run_microbatch_loop
 
         forward_step = handle._extras["forward_step"]
@@ -406,6 +510,7 @@ class MegatronLiteRuntime(RuntimeBase):
             data_iter = iter([data])
 
         ps = handle._parallel_state
+        delta_mem_manager = None
         if ps.pp_size > 1:
             from types import SimpleNamespace
 
@@ -413,6 +518,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
             first_item = next(data_iter)
             first_batch, _loss_context = split_loss_context(first_item)
+            if delta_mem_runtime_lifecycle_requested(first_batch):
+                raise NotImplementedError(
+                    "MLite delta-mem runtime lifecycle currently supports pipeline parallel size 1."
+                )
             data_iter = chain([first_item], data_iter)
             tensor_shape = _infer_pipeline_tensor_shape(
                 first_batch, handle._extras.get("model_cfg"), ps
@@ -428,8 +537,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 loss_fn=loss_fn,
                 forward_only=forward_only,
             )
-            out = _last_loss_output(outputs)
-            loss_obj = out.get("loss") if out else None
+            loss_out = _last_loss_output(outputs)
+            payload_out = _last_output_with_payload(outputs)
+            loss_obj = loss_out.get("loss") if loss_out else None
             if isinstance(loss_obj, torch.Tensor):
                 loss_float = float(loss_obj.detach().item())
             elif loss_obj is not None:
@@ -439,8 +549,10 @@ class MegatronLiteRuntime(RuntimeBase):
             loss_t = torch.tensor([loss_float], device="cuda")
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
                 dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
-            out = {"loss": loss_t.squeeze(0)}
+            out = dict(payload_out or {})
+            out["loss"] = loss_t.squeeze(0)
         else:
+            forward_step, delta_mem_manager = wrap_delta_mem_forward_step(forward_step, handle)
             out = run_microbatch_loop(
                 handle._model,
                 data_iter,
@@ -452,6 +564,7 @@ class MegatronLiteRuntime(RuntimeBase):
                 loss_fn=loss_fn,
                 forward_only=forward_only,
             )
+            delta_mem_manager.finish(handle)
 
         if not forward_only:
             finalize_grads = handle._extras.get("finalize_grads")
@@ -475,6 +588,8 @@ class MegatronLiteRuntime(RuntimeBase):
                     if k not in metrics:
                         metrics[k] = v
             metrics["_micro_outputs"] = outputs
+        if delta_mem_manager is not None:
+            metrics.update(delta_mem_manager.metrics())
 
         return ForwardResult(
             model_output=ModelOutputs(
@@ -482,6 +597,8 @@ class MegatronLiteRuntime(RuntimeBase):
                 vocab_parallel_logits=out.get("logits") if out else None,
                 log_probs=out.get("log_probs") if out else None,
                 routed_experts=out.get("routed_experts") if out else None,
+                delta_mem_states=out.get("delta_mem_states") if out else None,
+                delta_mem_mtp_states=out.get("delta_mem_mtp_states") if out else None,
             ),
             metrics=metrics,
         )
@@ -565,4 +682,34 @@ def _checkpoint_hooks(handle: ModelHandle):
     return (
         getattr(proto, "PLACEMENT_FN", default_placement_fn),
         getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier),
+    )
+
+
+def _adapter_protocol_context(handle: ModelHandle):
+    proto = handle._extras.get("protocol")
+    if proto is None:
+        raise ValueError("MLite LoRA adapter helpers require a protocol in handle extras.")
+    model_cfg = handle._extras.get("model_cfg")
+    if model_cfg is None:
+        raise ValueError("MLite LoRA adapter helpers require model_cfg in handle extras.")
+    model_chunks = handle._extras.get("model_chunks", [handle._model])
+    if (
+        isinstance(model_chunks, str | bytes)
+        or not isinstance(model_chunks, Sequence)
+        or len(model_chunks) == 0
+    ):
+        raise ValueError(
+            "MLite LoRA adapter helpers require a non-empty sequence of model_chunks "
+            "in handle extras."
+        )
+    if any(chunk is None for chunk in model_chunks):
+        raise ValueError("MLite LoRA adapter helpers require non-None model_chunks.")
+    ps = handle._parallel_state
+    if ps is None:
+        raise ValueError("MLite LoRA adapter helpers require parallel_state on the handle.")
+    return (
+        model_chunks,
+        proto,
+        model_cfg,
+        ps,
     )

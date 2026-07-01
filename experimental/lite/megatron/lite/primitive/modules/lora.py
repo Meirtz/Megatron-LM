@@ -7,6 +7,8 @@ Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,19 +19,183 @@ import torch.nn.functional as F
 
 _DEFAULT_TARGET_MODULES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
 _TARGET_ALIASES = {
+    "all_linear": "all-linear",
     "qkv": "linear_qkv",
     "proj": "linear_proj",
+    "o_proj": "linear_proj",
     "fc1": "linear_fc1",
     "fc2": "linear_fc2",
+    "gate_up": "linear_fc1",
+    "gate_up_proj": "linear_fc1",
+    "gate_proj": "linear_fc1",
+    "up_proj": "linear_fc1",
+    "down": "linear_fc2",
+    "down_proj": "linear_fc2",
+    "q_a": "q_a_proj",
+    "q_b": "q_b_proj",
+    "kv_a": "kv_a_proj_with_mqa",
+    "kv_b": "kv_b_proj",
 }
+_TARGET_EXPANSIONS = {
+    "all-linear": _DEFAULT_TARGET_MODULES,
+}
+
+
+def _normalize_target_modules(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, Mapping):
+        raise TypeError("LoRA config target_modules must be a string or sequence of strings.")
+    try:
+        targets = tuple(value)
+    except TypeError as exc:
+        raise TypeError(
+            "LoRA config target_modules must be a string or sequence of strings."
+        ) from exc
+    invalid = [target for target in targets if not isinstance(target, str)]
+    if invalid:
+        raise TypeError(
+            "LoRA config target_modules entries must be strings, got "
+            f"{[type(target).__name__ for target in invalid]}."
+        )
+    if any(not target.strip() for target in targets):
+        raise ValueError("LoRA config target_modules entries must be non-empty strings.")
+    return targets
+
+
+def _type_name(value: Any) -> str:
+    return type(value).__name__
+
+
+def validate_lora_rank_value(value: Any, *, key: str, allow_zero: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{key} must be an integer, got {_type_name(value)}.")
+    if value < 0 or (value == 0 and not allow_zero):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{key} must be {qualifier}, got {value}.")
+    return int(value)
+
+
+def validate_lora_number_value(value: Any, *, key: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{key} must be a finite number, got {_type_name(value)}.")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be finite, got {value}.")
+    return value
+
+
+def validate_lora_dropout_value(value: Any, *, key: str) -> float:
+    value = validate_lora_number_value(value, key=key)
+    if value < 0.0 or value > 1.0:
+        raise ValueError(f"{key} must be between 0 and 1 inclusive, got {value}.")
+    return value
+
+
+def validate_lora_bool_value(value: Any, *, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise TypeError(f"{key} must be a boolean, got {_type_name(value)}.")
+
+
+def _validate_grouped_lora_splits(
+    module_name: str,
+    x: torch.Tensor,
+    splits: list[int],
+    num_local_experts: int,
+) -> list[int]:
+    if len(splits) != num_local_experts:
+        raise ValueError(f"{module_name} expected {num_local_experts} splits, got {len(splits)}.")
+    validated = [
+        validate_lora_rank_value(size, key=f"{module_name} splits[{idx}]", allow_zero=True)
+        for idx, size in enumerate(splits)
+    ]
+    total = sum(validated)
+    if total != x.shape[0]:
+        raise ValueError(
+            f"{module_name} split sizes sum to {total}, but input has {x.shape[0]} tokens."
+        )
+    return validated
+
+
+def _pop_optional_string(values: dict[str, Any], key: str) -> str | None:
+    value = values.pop(key, None)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"LoRA config {key} must be a string, got {_type_name(value)}.")
+    return value
+
+
+def _pop_peft_auxiliary_fields(values: dict[str, Any]) -> None:
+    base_model_name = values.pop("base_model_name_or_path", None)
+    if base_model_name is not None and not isinstance(base_model_name, str):
+        raise TypeError(
+            "LoRA config base_model_name_or_path must be a string, "
+            f"got {_type_name(base_model_name)}."
+        )
+
+    peft_type = _pop_optional_string(values, "peft_type")
+    if peft_type is not None and peft_type.upper() != "LORA":
+        raise ValueError(f"LoRA config peft_type={peft_type!r} is not supported.")
+
+    task_type = _pop_optional_string(values, "task_type")
+    if task_type is not None and task_type.upper() != "CAUSAL_LM":
+        raise ValueError(f"LoRA config task_type={task_type!r} is not supported.")
+
+    inference_mode = values.pop("inference_mode", None)
+    if inference_mode is not None:
+        validate_lora_bool_value(inference_mode, key="LoRA config inference_mode")
+
+    bias = _pop_optional_string(values, "bias")
+    if bias is not None and bias.lower() != "none":
+        raise ValueError(f"LoRA config bias={bias!r} is not supported.")
+
+    fan_in_fan_out = values.pop("fan_in_fan_out", None)
+    if fan_in_fan_out is not None and validate_lora_bool_value(
+        fan_in_fan_out, key="LoRA config fan_in_fan_out"
+    ):
+        raise ValueError("LoRA config fan_in_fan_out=True is not supported.")
+
+    modules_to_save = values.pop("modules_to_save", None)
+    if modules_to_save not in (None, [], ()):
+        raise ValueError("LoRA config modules_to_save is not supported for adapter-only LoRA.")
+
+    init_lora_weights = values.pop("init_lora_weights", None)
+    if init_lora_weights is not None and not isinstance(init_lora_weights, (bool, str)):
+        raise TypeError(
+            "LoRA config init_lora_weights must be a boolean, string, or None, "
+            f"got {_type_name(init_lora_weights)}."
+        )
 
 
 @dataclass(frozen=True)
 class LoraConfig:
     rank: int = 0
-    alpha: int | None = None
+    alpha: int | float | None = None
     dropout: float = 0.0
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
+    use_rslora: bool = False
+
+    def __post_init__(self) -> None:
+        rank = validate_lora_rank_value(self.rank, key="LoRA config rank", allow_zero=True)
+        alpha = (
+            None
+            if self.alpha is None
+            else validate_lora_number_value(self.alpha, key="LoRA config alpha")
+        )
+        dropout = validate_lora_dropout_value(self.dropout, key="LoRA config dropout")
+        use_rslora = validate_lora_bool_value(
+            self.use_rslora, key="LoRA config use_rslora"
+        )
+        target_modules = _normalize_target_modules(self.target_modules)
+        if rank > 0 and not target_modules:
+            raise ValueError("LoRA config target_modules must be non-empty when LoRA is enabled.")
+        object.__setattr__(self, "rank", rank)
+        object.__setattr__(self, "alpha", alpha)
+        object.__setattr__(self, "dropout", dropout)
+        object.__setattr__(self, "use_rslora", use_rslora)
+        object.__setattr__(self, "target_modules", target_modules)
 
     @property
     def enabled(self) -> bool:
@@ -37,12 +203,13 @@ class LoraConfig:
 
     @property
     def scale(self) -> float:
-        return float(self.rank if self.alpha is None else self.alpha) / float(self.rank)
+        return lora_scale(self.rank, alpha=self.alpha, use_rslora=self.use_rslora)
 
     def targets(self) -> set[str]:
         out = set()
         for target in self.target_modules:
-            out.add(_TARGET_ALIASES.get(target, target))
+            canonical = _TARGET_ALIASES.get(target, target)
+            out.update(_TARGET_EXPANSIONS.get(canonical, (canonical,)))
         return out
 
     def targets_module(self, name: str) -> bool:
@@ -50,23 +217,62 @@ class LoraConfig:
         return canonical in self.targets()
 
 
-def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraConfig:
+def effective_lora_alpha(config: LoraConfig) -> float:
+    return float(config.rank if config.alpha is None else config.alpha)
+
+
+def lora_scale(rank: int, *, alpha: int | float | None = None, use_rslora: bool = False) -> float:
+    rank = validate_lora_rank_value(rank, key="LoRA rank", allow_zero=True)
+    use_rslora = validate_lora_bool_value(use_rslora, key="LoRA use_rslora")
+    alpha_value = (
+        float(rank) if alpha is None else validate_lora_number_value(alpha, key="LoRA alpha")
+    )
+    if rank == 0:
+        return 0.0
+    denominator = math.sqrt(float(rank)) if use_rslora else float(rank)
+    return alpha_value / denominator
+
+
+def normalize_lora_config(config: LoraConfig | Mapping[str, Any] | None) -> LoraConfig:
     if config is None:
         return LoraConfig()
     if isinstance(config, LoraConfig):
         return config
-    if not isinstance(config, dict):
-        raise TypeError(f"LoRA config must be LoraConfig, dict, or None, got {type(config)!r}.")
+    if not isinstance(config, Mapping):
+        raise TypeError(
+            f"LoRA config must be LoraConfig, mapping, or None, got {type(config)!r}."
+        )
     values = dict(config)
     enabled = values.pop("enabled", None)
+    if enabled is not None:
+        enabled = validate_lora_bool_value(enabled, key="LoRA config enabled")
+    if "r" in values and "rank" not in values:
+        values["rank"] = values.pop("r")
+    else:
+        values.pop("r", None)
     if enabled is False:
+        if "rank" in values:
+            validate_lora_rank_value(values["rank"], key="LoRA config rank", allow_zero=True)
         values["rank"] = 0
+    elif enabled is True:
+        if "rank" not in values:
+            raise ValueError("LoRA config enabled=True requires a positive rank.")
+        validate_lora_rank_value(values["rank"], key="LoRA config rank")
+    if "lora_alpha" in values and "alpha" not in values:
+        values["alpha"] = values.pop("lora_alpha")
+    else:
+        values.pop("lora_alpha", None)
+    if "lora_dropout" in values and "dropout" not in values:
+        values["dropout"] = values.pop("lora_dropout")
+    else:
+        values.pop("lora_dropout", None)
     if "targets" in values and "target_modules" not in values:
         values["target_modules"] = values.pop("targets")
     else:
         values.pop("targets", None)
-    if "target_modules" in values and not isinstance(values["target_modules"], tuple):
-        values["target_modules"] = tuple(values["target_modules"])
+    if "target_modules" in values:
+        values["target_modules"] = _normalize_target_modules(values["target_modules"])
+    _pop_peft_auxiliary_fields(values)
     return LoraConfig(**values)
 
 
@@ -351,8 +557,9 @@ class LinearLoRA(nn.Module):
         out_features: int,
         rank: int,
         *,
-        alpha: int | None = None,
+        alpha: int | float | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
         sequence_parallel_input: bool = False,
         row_parallel_output: bool = False,
         sequence_parallel_scatter_output: bool = False,
@@ -367,13 +574,23 @@ class LinearLoRA(nn.Module):
         b_tensor_model_parallel: bool = False,
     ):
         super().__init__()
-        if rank <= 0:
-            raise ValueError("LoRA rank must be positive for LinearLoRA.")
-        self.rank = int(rank)
-        self.rank_partitioned_a = bool(rank_partitioned_a)
+        in_features = validate_lora_rank_value(in_features, key="LinearLoRA in_features")
+        out_features = validate_lora_rank_value(out_features, key="LinearLoRA out_features")
+        self.rank = validate_lora_rank_value(rank, key="LinearLoRA rank")
+        self.alpha = (
+            float(self.rank)
+            if alpha is None
+            else validate_lora_number_value(alpha, key="LinearLoRA alpha")
+        )
+        self.use_rslora = validate_lora_bool_value(use_rslora, key="LinearLoRA use_rslora")
+        self.rank_partitioned_a = validate_lora_bool_value(
+            rank_partitioned_a, key="LinearLoRA rank_partitioned_a"
+        )
         if self.rank_partitioned_a:
             partition_size = (
-                int(rank_partition_size)
+                validate_lora_rank_value(
+                    rank_partition_size, key="LoRA rank partition size"
+                )
                 if rank_partition_size is not None
                 else (dist.get_world_size(tp_group) if tp_group is not None else 1)
             )
@@ -388,22 +605,34 @@ class LinearLoRA(nn.Module):
         else:
             self.rank_partition_size = 1
             self.local_rank = self.rank
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
-        self.dropout_p = float(dropout)
-        self.sequence_parallel_input = bool(sequence_parallel_input)
-        self.row_parallel_output = bool(row_parallel_output)
-        self.sequence_parallel_scatter_output = bool(sequence_parallel_scatter_output)
+        self.scale = lora_scale(self.rank, alpha=self.alpha, use_rslora=self.use_rslora)
+        self.dropout_p = validate_lora_dropout_value(dropout, key="LinearLoRA dropout")
+        self.sequence_parallel_input = validate_lora_bool_value(
+            sequence_parallel_input, key="LinearLoRA sequence_parallel_input"
+        )
+        self.row_parallel_output = validate_lora_bool_value(
+            row_parallel_output, key="LinearLoRA row_parallel_output"
+        )
+        self.sequence_parallel_scatter_output = validate_lora_bool_value(
+            sequence_parallel_scatter_output, key="LinearLoRA sequence_parallel_scatter_output"
+        )
         if self.row_parallel_output and self.sequence_parallel_scatter_output:
             raise ValueError(
                 "Use either row_parallel_output or sequence_parallel_scatter_output, not both."
             )
         self.tp_group = tp_group
-        self.tp_rank = int(tp_rank)
-        self.input_parallel_reduce = bool(input_parallel_reduce)
-        self.output_partitioned_b = bool(output_partitioned_b)
+        self.tp_rank = validate_lora_rank_value(tp_rank, key="LinearLoRA tp_rank", allow_zero=True)
+        self.input_parallel_reduce = validate_lora_bool_value(
+            input_parallel_reduce, key="LinearLoRA input_parallel_reduce"
+        )
+        self.output_partitioned_b = validate_lora_bool_value(
+            output_partitioned_b, key="LinearLoRA output_partitioned_b"
+        )
         if self.output_partitioned_b:
             partition_size = (
-                int(output_partition_size)
+                validate_lora_rank_value(
+                    output_partition_size, key="LoRA output partition size"
+                )
                 if output_partition_size is not None
                 else (dist.get_world_size(tp_group) if tp_group is not None else 1)
             )
@@ -419,9 +648,13 @@ class LinearLoRA(nn.Module):
             self.output_partition_size = 1
             self.local_out_features = out_features
         self.lora_a = nn.Parameter(torch.empty(self.local_rank, in_features))
-        self.lora_b = nn.Parameter(torch.empty(self.local_out_features, rank))
-        self.lora_a.tensor_model_parallel = bool(a_tensor_model_parallel)
-        self.lora_b.tensor_model_parallel = bool(b_tensor_model_parallel)
+        self.lora_b = nn.Parameter(torch.empty(self.local_out_features, self.rank))
+        self.lora_a.tensor_model_parallel = validate_lora_bool_value(
+            a_tensor_model_parallel, key="LinearLoRA a_tensor_model_parallel"
+        )
+        self.lora_b.tensor_model_parallel = validate_lora_bool_value(
+            b_tensor_model_parallel, key="LinearLoRA b_tensor_model_parallel"
+        )
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
 
@@ -459,6 +692,22 @@ class LinearLoRA(nn.Module):
             out = _scatter_sequence_parallel(out, self.tp_group, self.tp_rank)
         return out
 
+    def materialized_delta_weight(self) -> torch.Tensor:
+        """Return the dense LoRA delta weight for weight-space consumers.
+
+        This is intended for modules that use a linear weight analytically
+        instead of calling the linear layer directly. It supports the unsharded,
+        dropout-free case used by GLM5 DSA's `kv_b_proj` decomposition.
+        """
+
+        if self.dropout_p:
+            raise NotImplementedError(
+                "materialized LoRA delta weights do not support lora_dropout > 0."
+            )
+        if self.rank_partitioned_a or self.output_partitioned_b:
+            raise NotImplementedError("materialized LoRA delta weights require unsharded LoRA tensors.")
+        return self.lora_b.matmul(self.lora_a) * self.scale
+
 
 class GroupedLinearLoRA(nn.Module):
     """Per-local-expert LoRA delta for `te.GroupedLinear` expert surfaces."""
@@ -470,26 +719,36 @@ class GroupedLinearLoRA(nn.Module):
         out_features: int,
         rank: int,
         *,
-        alpha: int | None = None,
+        alpha: int | float | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
-        if rank <= 0:
-            raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
-        self.num_local_experts = int(num_local_experts)
-        self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
-        self.dropout_p = float(dropout)
-        self.lora_a = nn.Parameter(torch.empty(num_local_experts, rank, in_features))
-        self.lora_b = nn.Parameter(torch.empty(num_local_experts, out_features, rank))
+        self.num_local_experts = validate_lora_rank_value(
+            num_local_experts, key="GroupedLinearLoRA num_local_experts"
+        )
+        in_features = validate_lora_rank_value(in_features, key="GroupedLinearLoRA in_features")
+        out_features = validate_lora_rank_value(out_features, key="GroupedLinearLoRA out_features")
+        self.rank = validate_lora_rank_value(rank, key="GroupedLinearLoRA rank")
+        self.alpha = (
+            float(self.rank)
+            if alpha is None
+            else validate_lora_number_value(alpha, key="GroupedLinearLoRA alpha")
+        )
+        self.use_rslora = validate_lora_bool_value(
+            use_rslora, key="GroupedLinearLoRA use_rslora"
+        )
+        self.scale = lora_scale(self.rank, alpha=self.alpha, use_rslora=self.use_rslora)
+        self.dropout_p = validate_lora_dropout_value(dropout, key="GroupedLinearLoRA dropout")
+        self.lora_a = nn.Parameter(torch.empty(self.num_local_experts, self.rank, in_features))
+        self.lora_b = nn.Parameter(torch.empty(self.num_local_experts, out_features, self.rank))
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
 
     def forward(self, x: torch.Tensor, splits: list[int]) -> torch.Tensor:
-        if len(splits) != self.num_local_experts:
-            raise ValueError(
-                f"GroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
-            )
+        splits = _validate_grouped_lora_splits(
+            "GroupedLinearLoRA", x, splits, self.num_local_experts
+        )
         outputs = []
         offset = 0
         for expert_idx, size in enumerate(splits):
@@ -518,29 +777,45 @@ class SharedGroupedLinearLoRA(nn.Module):
         out_features: int,
         rank: int,
         *,
-        alpha: int | None = None,
+        alpha: int | float | None = None,
         dropout: float = 0.0,
+        use_rslora: bool = False,
     ):
         super().__init__()
-        if rank <= 0:
-            raise ValueError("LoRA rank must be positive for SharedGroupedLinearLoRA.")
-        self.num_local_experts = int(num_local_experts)
-        self.rank = int(rank)
-        self.scale = float(rank if alpha is None else alpha) / float(rank)
-        self.dropout_p = float(dropout)
+        self.num_local_experts = validate_lora_rank_value(
+            num_local_experts, key="SharedGroupedLinearLoRA num_local_experts"
+        )
+        in_features = validate_lora_rank_value(
+            in_features, key="SharedGroupedLinearLoRA in_features"
+        )
+        out_features = validate_lora_rank_value(
+            out_features, key="SharedGroupedLinearLoRA out_features"
+        )
+        self.rank = validate_lora_rank_value(rank, key="SharedGroupedLinearLoRA rank")
+        self.alpha = (
+            float(self.rank)
+            if alpha is None
+            else validate_lora_number_value(alpha, key="SharedGroupedLinearLoRA alpha")
+        )
+        self.use_rslora = validate_lora_bool_value(
+            use_rslora, key="SharedGroupedLinearLoRA use_rslora"
+        )
+        self.scale = lora_scale(self.rank, alpha=self.alpha, use_rslora=self.use_rslora)
+        self.dropout_p = validate_lora_dropout_value(
+            dropout, key="SharedGroupedLinearLoRA dropout"
+        )
         self.shared_across_experts = True
-        self.lora_a = nn.Parameter(torch.empty(rank, in_features))
-        self.lora_b = nn.Parameter(torch.empty(out_features, rank))
+        self.lora_a = nn.Parameter(torch.empty(self.rank, in_features))
+        self.lora_b = nn.Parameter(torch.empty(out_features, self.rank))
         self.lora_a.tensor_model_parallel = False
         self.lora_b.tensor_model_parallel = False
         nn.init.kaiming_uniform_(self.lora_a, a=5**0.5)
         nn.init.zeros_(self.lora_b)
 
     def forward(self, x: torch.Tensor, splits: list[int]) -> torch.Tensor:
-        if len(splits) != self.num_local_experts:
-            raise ValueError(
-                f"SharedGroupedLinearLoRA expected {self.num_local_experts} splits, got {len(splits)}."
-            )
+        _validate_grouped_lora_splits(
+            "SharedGroupedLinearLoRA", x, splits, self.num_local_experts
+        )
         dropped = F.dropout(x, p=self.dropout_p, training=self.training) if self.dropout_p else x
         return dropped.matmul(self.lora_a.t()).matmul(self.lora_b.t()) * self.scale
 
@@ -550,7 +825,9 @@ __all__ = [
     "LinearLoRA",
     "LoraConfig",
     "SharedGroupedLinearLoRA",
+    "effective_lora_alpha",
     "freeze_non_lora_params",
+    "lora_scale",
     "normalize_lora_config",
     "trainable_param_stats",
 ]

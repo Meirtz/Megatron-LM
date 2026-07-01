@@ -51,6 +51,9 @@ TEST_FREQ="${TEST_FREQ:--1}"
 RESUME_MODE="${RESUME_MODE:-disable}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 CHECKPOINT_SAVE_CONTENTS="${CHECKPOINT_SAVE_CONTENTS:-[model,optimizer,extra]}"
+CHECKPOINT_LOAD_CONTENTS="${CHECKPOINT_LOAD_CONTENTS:-}"
+CHECKPOINT_SAVE_LORA_ADAPTER="${CHECKPOINT_SAVE_LORA_ADAPTER:-}"
+LORA_ADAPTER_DIR_NAME="${LORA_ADAPTER_DIR_NAME:-}"
 LOAD_HF_WEIGHTS="${LOAD_HF_WEIGHTS:-True}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
@@ -78,6 +81,12 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # - dist_opt (default): Megatron-Core DDP + distributed optimizer.
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
 MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
+LORA_RANK="${LORA_RANK:-0}"
+LORA_ALPHA="${LORA_ALPHA:-${LORA_RANK}}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
+LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-all-linear}"
+LORA_USE_RSLORA="${LORA_USE_RSLORA:-False}"
+LORA_INIT="${LORA_INIT:-}"
 
 LR="${LR:-1e-5}"
 MIN_LR="${MIN_LR:-${LR}}"
@@ -179,6 +188,16 @@ COMMON_ARGS=(
   "checkpoint.save_contents=${CHECKPOINT_SAVE_CONTENTS}"
 )
 
+if [[ -n "${CHECKPOINT_LOAD_CONTENTS}" ]]; then
+  COMMON_ARGS+=("checkpoint.load_contents=${CHECKPOINT_LOAD_CONTENTS}")
+fi
+if [[ -n "${CHECKPOINT_SAVE_LORA_ADAPTER}" ]]; then
+  COMMON_ARGS+=("checkpoint.save_lora_adapter=${CHECKPOINT_SAVE_LORA_ADAPTER}")
+fi
+if [[ -n "${LORA_ADAPTER_DIR_NAME}" ]]; then
+  COMMON_ARGS+=("checkpoint.lora_adapter_dir_name=${LORA_ADAPTER_DIR_NAME}")
+fi
+
 if [[ -n "${VAL_FILES}" ]]; then
   COMMON_ARGS+=("data.val_files=${VAL_FILES}")
 fi
@@ -204,6 +223,19 @@ BACKEND_ARGS=(
   "+engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 )
 
+if [[ "${LORA_RANK}" != "0" ]]; then
+  BACKEND_ARGS+=(
+    "+engine.impl_cfg.lora.rank=${LORA_RANK}"
+    "+engine.impl_cfg.lora.alpha=${LORA_ALPHA}"
+    "+engine.impl_cfg.lora.dropout=${LORA_DROPOUT}"
+    "+engine.impl_cfg.lora.target_modules=${LORA_TARGET_MODULES}"
+    "+engine.impl_cfg.lora.use_rslora=${LORA_USE_RSLORA}"
+  )
+fi
+if [[ -n "${LORA_INIT}" ]]; then
+  BACKEND_ARGS+=("+engine.impl_cfg.lora_init=${LORA_INIT}")
+fi
+
 if [[ "${OPTIMIZER_OFFLOAD}" == "True" || "${OPTIMIZER_OFFLOAD}" == "true" || "${OPTIMIZER_OFFLOAD}" == "1" ]]; then
   BACKEND_ARGS+=(
     "+optim.override_optimizer_config.offload_fraction=${OPTIMIZER_STATE_OFFLOAD_FRACTION}"
@@ -224,8 +256,10 @@ COMMAND=(
   verl.trainer.sft_trainer
   "${COMMON_ARGS[@]}"
   "${BACKEND_ARGS[@]}"
-  "${EXTRA_ARGS[@]}"
 )
+if (( ${#EXTRA_ARGS[@]} )); then
+  COMMAND+=("${EXTRA_ARGS[@]}")
+fi
 
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"
 printf '\n' >> "${CMD_FILE}"

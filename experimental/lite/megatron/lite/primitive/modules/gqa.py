@@ -7,10 +7,18 @@ Supports sequence parallel, context parallel, and THD (packed sequences).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
 
+from megatron.lite.primitive.modules.delta_mem import (
+    DeltaMemAttentionCorrection,
+    DeltaMemConfig,
+    normalize_delta_mem_config,
+)
 from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
@@ -57,7 +65,8 @@ class GQAttention(nn.Module):
         use_fp32_rope: bool = False,
         zero_centered_gamma: bool = False,
         qkv_layout: str = "flat",
-        lora_config: LoraConfig | dict | None = None,
+        lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None = None,
         mrope_section: list[int] | None = None,
     ):
         super().__init__()
@@ -110,6 +119,7 @@ class GQAttention(nn.Module):
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
                 sequence_parallel_input=self.qkv.use_sp,
                 tp_group=ps.tp_group,
                 rank_partition_size=ps.tp_size,
@@ -124,6 +134,7 @@ class GQAttention(nn.Module):
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
                 tp_group=ps.tp_group,
                 tp_rank=ps.tp_rank,
                 sequence_parallel_scatter_output=self.proj.use_sp,
@@ -132,6 +143,26 @@ class GQAttention(nn.Module):
                 output_partitioned_b=ps.tp_size > 1,
                 a_tensor_model_parallel=ps.tp_size > 1,
                 b_tensor_model_parallel=ps.tp_size > 1,
+            )
+
+        delta_mem = normalize_delta_mem_config(delta_mem_config)
+        self.delta_mem_config = delta_mem
+        self.delta_mem: DeltaMemAttentionCorrection | None = None
+        if delta_mem.enabled:
+            if ps.tp_size > 1:
+                raise ValueError("GQAttention DeltaMem wiring currently supports tensor parallel size 1.")
+            if ps.cp_size > 1:
+                raise ValueError("GQAttention DeltaMem wiring currently supports context parallel size 1.")
+            if use_thd:
+                raise ValueError("GQAttention DeltaMem wiring currently does not support THD packed sequences.")
+            self.delta_mem = DeltaMemAttentionCorrection(
+                hidden_size=hidden_size,
+                query_size=self.num_heads_local * head_dim,
+                output_size=hidden_size,
+                rank=delta_mem.rank,
+                write_bias=delta_mem.write_bias,
+                correction_bias=delta_mem.correction_bias,
+                state_policy=delta_mem.state_policy,
             )
 
         if self._mrope_section is None:
@@ -171,12 +202,33 @@ class GQAttention(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        *,
+        delta_mem_state: torch.Tensor | None = None,
+        delta_mem_read_key: torch.Tensor | None = None,
+        delta_mem_state_indices: torch.Tensor | None = None,
+        return_delta_mem_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
         q, gate, k, v = self._split_qkv(qkv)
+        delta_mem_result = None
+        if self.delta_mem is not None:
+            if packed_seq_params is not None:
+                raise ValueError("GQAttention DeltaMem wiring does not support THD packed sequences.")
+            delta_mem_hidden = x.to(dtype=self.delta_mem.query_delta_proj.weight.dtype)
+            if delta_mem_state is None:
+                delta_mem_state = self._initial_delta_mem_state(delta_mem_hidden)
+            delta_mem_result = self.delta_mem(
+                delta_mem_hidden,
+                delta_mem_state,
+                read_key=delta_mem_read_key,
+                state_indices=delta_mem_state_indices,
+            )
 
         is_thd = packed_seq_params is not None
         if is_thd:
@@ -184,6 +236,8 @@ class GQAttention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
+        if delta_mem_result is not None:
+            q = q + delta_mem_result.query_delta.to(dtype=q.dtype).reshape_as(q)
 
         # RoPE uses the local unfused rotate-half helpers.
         if self._use_fp32_rope:
@@ -265,7 +319,18 @@ class GQAttention(nn.Module):
         output = self.proj(attn_out)
         if self.proj_lora is not None:
             output = output + self.proj_lora(attn_out)
+        if delta_mem_result is not None:
+            output = output + delta_mem_result.output_delta.to(dtype=output.dtype)
+        if return_delta_mem_state:
+            if delta_mem_result is None:
+                raise ValueError("return_delta_mem_state=True requires enabled DeltaMem config.")
+            return output, delta_mem_result.next_state
         return output
+
+    def _initial_delta_mem_state(self, x: torch.Tensor) -> torch.Tensor:
+        if self.delta_mem is None:
+            raise ValueError("DeltaMem state requested but DeltaMem config is disabled.")
+        return self.delta_mem.initial_state(x)
 
     def _qkv_lora_input(self, x: torch.Tensor) -> torch.Tensor:
         linear = self.qkv.linear

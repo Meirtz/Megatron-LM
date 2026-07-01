@@ -8,7 +8,9 @@ loss computation).
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -16,10 +18,12 @@ import transformer_engine.pytorch as te
 
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.delta_mem import DeltaMemConfig
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
 from megatron.lite.primitive.modules.lora import LoraConfig
 from megatron.lite.primitive.modules.router import TopKRouter
+from megatron.lite.primitive.modules.router_replay import RouterReplay, RouterReplayAction
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
@@ -50,12 +54,17 @@ class MoELayer(nn.Module):
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
-        lora_config: LoraConfig | dict | None = None,
+        lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        router_replay: RouterReplay | None = None,
     ):
         super().__init__()
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
-            config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
+            config,
+            ps,
+            router_bias_rate=router_bias_rate,
+            compute_aux_loss=False,
+            router_replay=router_replay,
         )
         self.experts = Experts(
             config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
@@ -125,10 +134,13 @@ class TransformerLayer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
-        lora_config: LoraConfig | dict | None = None,
+        lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None = None,
+        enable_router_replay: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.router_replay = RouterReplay(layer_idx=layer_idx) if enable_router_replay else None
 
         # Declaration order follows MC's TransformerLayer (self_attention →
         # pre_mlp_layernorm → mlp). `named_parameters()` iterates in
@@ -146,6 +158,7 @@ class TransformerLayer(nn.Module):
             use_thd=use_thd,
             qkv_layout="mcore",
             lora_config=lora_config,
+            delta_mem_config=delta_mem_config,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
@@ -156,13 +169,31 @@ class TransformerLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             lora_config=lora_config,
+            router_replay=self.router_replay,
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        *,
+        delta_mem_state: torch.Tensor | None = None,
+        delta_mem_state_indices: torch.Tensor | None = None,
+        return_delta_mem_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         residual = x
-        h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+        h = self.attn(
+            x,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            delta_mem_state=delta_mem_state,
+            delta_mem_state_indices=delta_mem_state_indices,
+            return_delta_mem_state=return_delta_mem_state,
+        )
+        next_delta_mem_state = None
+        if return_delta_mem_state:
+            h, next_delta_mem_state = h
         x = residual + h
 
         residual = x
@@ -170,6 +201,9 @@ class TransformerLayer(nn.Module):
         moe_out = self.moe(h)
         x = residual + moe_out
 
+        if return_delta_mem_state:
+            assert next_delta_mem_state is not None
+            return x, next_delta_mem_state
         return x
 
 
@@ -212,7 +246,9 @@ class MultiTokenPredictionLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
-        lora_config: LoraConfig | dict | None,
+        lora_config: LoraConfig | Mapping[str, Any] | None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None,
+        enable_router_replay: bool,
     ):
         super().__init__()
         self.ps = ps
@@ -233,6 +269,8 @@ class MultiTokenPredictionLayer(nn.Module):
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
             lora_config=lora_config,
+            delta_mem_config=delta_mem_config,
+            enable_router_replay=enable_router_replay,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -244,7 +282,12 @@ class MultiTokenPredictionLayer(nn.Module):
         hidden_states: torch.Tensor,
         rotary_position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        delta_mem_state: torch.Tensor | None = None,
+        delta_mem_state_indices: torch.Tensor | None = None,
+        return_delta_mem_state: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor
+    ]:
         attention_position_ids = (
             rotary_position_ids if rotary_position_ids is not None else position_ids
         )
@@ -265,10 +308,23 @@ class MultiTokenPredictionLayer(nn.Module):
         hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
-        hidden_states = self.transformer_layer(
-            hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
+        layer_out = self.transformer_layer(
+            hidden_states,
+            position_ids=attention_position_ids,
+            packed_seq_params=packed_seq_params,
+            delta_mem_state=delta_mem_state,
+            delta_mem_state_indices=delta_mem_state_indices,
+            return_delta_mem_state=return_delta_mem_state,
         )
+        next_delta_mem_state = None
+        if return_delta_mem_state:
+            hidden_states, next_delta_mem_state = layer_out
+        else:
+            hidden_states = layer_out
         hidden_states = self.final_layernorm(hidden_states)
+        if return_delta_mem_state:
+            assert next_delta_mem_state is not None
+            return hidden_states, input_ids, position_ids, next_delta_mem_state
         return hidden_states, input_ids, position_ids
 
 
@@ -286,7 +342,9 @@ class MultiTokenPredictionBlock(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         repeated_layer: bool,
-        lora_config: LoraConfig | dict | None,
+        lora_config: LoraConfig | Mapping[str, Any] | None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None,
+        enable_router_replay: bool,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -306,10 +364,52 @@ class MultiTokenPredictionBlock(nn.Module):
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
                     lora_config=lora_config,
+                    delta_mem_config=delta_mem_config,
+                    enable_router_replay=enable_router_replay,
                 )
                 for idx in range(layers_to_build)
             ]
         )
+
+    def delta_mem_layer_count(self) -> int:
+        return self.num_layers
+
+    def _normalize_delta_mem_states(
+        self,
+        delta_mem_states: Sequence[torch.Tensor | None] | None,
+    ) -> list[torch.Tensor | None]:
+        expected = self.delta_mem_layer_count()
+        if delta_mem_states is None:
+            return [None] * expected
+        if isinstance(delta_mem_states, (str, bytes)) or not isinstance(delta_mem_states, Sequence):
+            raise TypeError("Qwen3MoE MTP delta_mem_states must be a sequence of tensors or None.")
+        if len(delta_mem_states) != expected:
+            raise ValueError(
+                "Qwen3MoE MTP delta_mem_states length must match MTP prediction depths: "
+                f"expected {expected}, got {len(delta_mem_states)}."
+            )
+        return list(delta_mem_states)
+
+    def _normalize_delta_mem_state_indices(
+        self,
+        delta_mem_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | None,
+    ) -> list[torch.Tensor | None]:
+        expected = self.delta_mem_layer_count()
+        if delta_mem_state_indices is None:
+            return [None] * expected
+        if isinstance(delta_mem_state_indices, torch.Tensor):
+            return [delta_mem_state_indices] * expected
+        if isinstance(delta_mem_state_indices, (str, bytes)) or not isinstance(delta_mem_state_indices, Sequence):
+            raise TypeError(
+                "Qwen3MoE MTP delta_mem_state_indices must be a tensor, "
+                "a sequence of tensors, or None."
+            )
+        if len(delta_mem_state_indices) != expected:
+            raise ValueError(
+                "Qwen3MoE MTP delta_mem_state_indices length must match MTP prediction depths: "
+                f"expected {expected}, got {len(delta_mem_state_indices)}."
+            )
+        return list(delta_mem_state_indices)
 
     def forward(
         self,
@@ -318,19 +418,47 @@ class MultiTokenPredictionBlock(nn.Module):
         position_ids: torch.Tensor | None,
         hidden_states: torch.Tensor,
         packed_seq_params=None,
-    ) -> list[torch.Tensor]:
+        delta_mem_states: Sequence[torch.Tensor | None] | None = None,
+        delta_mem_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | None = None,
+        return_delta_mem_states: bool = False,
+    ) -> list[torch.Tensor] | tuple[list[torch.Tensor], list[torch.Tensor]]:
         outputs: list[torch.Tensor] = []
         rotary_position_ids = position_ids
+        delta_mem_state_list = (
+            self._normalize_delta_mem_states(delta_mem_states)
+            if return_delta_mem_states or delta_mem_states is not None
+            else []
+        )
+        delta_mem_state_index_list = (
+            self._normalize_delta_mem_state_indices(delta_mem_state_indices)
+            if return_delta_mem_states or delta_mem_state_indices is not None
+            else []
+        )
+        next_delta_mem_states: list[torch.Tensor] = []
         for depth in range(self.num_layers):
             layer = self.layers[0] if self.repeated_layer else self.layers[depth]
-            hidden_states, input_ids, position_ids = layer(
+            layer_out = layer(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 rotary_position_ids=rotary_position_ids,
                 packed_seq_params=packed_seq_params,
+                delta_mem_state=delta_mem_state_list[depth]
+                if delta_mem_state_list
+                else None,
+                delta_mem_state_indices=delta_mem_state_index_list[depth]
+                if delta_mem_state_index_list
+                else None,
+                return_delta_mem_state=return_delta_mem_states,
             )
+            if return_delta_mem_states:
+                hidden_states, input_ids, position_ids, next_delta_mem_state = layer_out
+                next_delta_mem_states.append(next_delta_mem_state)
+            else:
+                hidden_states, input_ids, position_ids = layer_out
             outputs.append(hidden_states)
+        if return_delta_mem_states:
+            return outputs, next_delta_mem_states
         return outputs
 
 
@@ -360,7 +488,9 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
-        lora_config: LoraConfig | dict | None = None,
+        lora_config: LoraConfig | Mapping[str, Any] | None = None,
+        delta_mem_config: DeltaMemConfig | Mapping[str, Any] | None = None,
+        router_replay: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -395,6 +525,8 @@ class Qwen3MoEModel(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     lora_config=lora_config,
+                    delta_mem_config=delta_mem_config,
+                    enable_router_replay=router_replay,
                 )
                 for idx in self.layer_indices
             ]
@@ -425,6 +557,8 @@ class Qwen3MoEModel(nn.Module):
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
                 lora_config=lora_config,
+                delta_mem_config=delta_mem_config,
+                enable_router_replay=router_replay,
             )
 
         self.sp_params: list[nn.Parameter] = []
@@ -438,6 +572,112 @@ class Qwen3MoEModel(nn.Module):
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
+    def delta_mem_layer_count(self) -> int:
+        return len(self.layers)
+
+    def delta_mem_mtp_layer_count(self) -> int:
+        return self.mtp.delta_mem_layer_count() if self.mtp is not None else 0
+
+    def _has_delta_mem_layers(self) -> bool:
+        if any(layer.attn.delta_mem is not None for layer in self.layers):
+            return True
+        if self.mtp is None:
+            return False
+        return any(
+            mtp_layer.transformer_layer.attn.delta_mem is not None
+            for mtp_layer in self.mtp.layers
+        )
+
+    def _normalize_delta_mem_states(
+        self,
+        delta_mem_states: Sequence[torch.Tensor | None] | None,
+    ) -> list[torch.Tensor | None]:
+        expected = self.delta_mem_layer_count()
+        if delta_mem_states is None:
+            return [None] * expected
+        if isinstance(delta_mem_states, (str, bytes)) or not isinstance(delta_mem_states, Sequence):
+            raise TypeError("Qwen3MoEModel delta_mem_states must be a sequence of tensors or None.")
+        if len(delta_mem_states) != expected:
+            raise ValueError(
+                "Qwen3MoEModel delta_mem_states length must match local transformer layers: "
+                f"expected {expected}, got {len(delta_mem_states)}."
+            )
+        return list(delta_mem_states)
+
+    def _normalize_delta_mem_mtp_states(
+        self,
+        delta_mem_mtp_states: Sequence[torch.Tensor | None] | None,
+    ) -> list[torch.Tensor | None]:
+        if self.mtp is None:
+            if delta_mem_mtp_states is not None:
+                raise ValueError("Qwen3MoEModel delta_mem_mtp_states require enabled MTP.")
+            return []
+        return self.mtp._normalize_delta_mem_states(delta_mem_mtp_states)
+
+    def _normalize_delta_mem_state_indices(
+        self,
+        delta_mem_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | None,
+    ) -> list[torch.Tensor | None]:
+        expected = self.delta_mem_layer_count()
+        if delta_mem_state_indices is None:
+            return [None] * expected
+        if isinstance(delta_mem_state_indices, torch.Tensor):
+            return [delta_mem_state_indices] * expected
+        if isinstance(delta_mem_state_indices, (str, bytes)) or not isinstance(delta_mem_state_indices, Sequence):
+            raise TypeError(
+                "Qwen3MoEModel delta_mem_state_indices must be a tensor, "
+                "a sequence of tensors, or None."
+            )
+        if len(delta_mem_state_indices) != expected:
+            raise ValueError(
+                "Qwen3MoEModel delta_mem_state_indices length must match local transformer layers: "
+                f"expected {expected}, got {len(delta_mem_state_indices)}."
+            )
+        return list(delta_mem_state_indices)
+
+    def _normalize_delta_mem_mtp_state_indices(
+        self,
+        delta_mem_mtp_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | None,
+    ) -> list[torch.Tensor | None]:
+        if self.mtp is None:
+            if delta_mem_mtp_state_indices is not None:
+                raise ValueError("Qwen3MoEModel delta_mem_mtp_state_indices require enabled MTP.")
+            return []
+        return self.mtp._normalize_delta_mem_state_indices(delta_mem_mtp_state_indices)
+
+    def _split_delta_mem_states_payload(
+        self,
+        delta_mem_states: Sequence[torch.Tensor | None] | Mapping[str, Any] | None,
+        delta_mem_mtp_states: Sequence[torch.Tensor | None] | None,
+    ) -> tuple[Sequence[torch.Tensor | None] | None, Sequence[torch.Tensor | None] | None]:
+        if isinstance(delta_mem_states, Mapping):
+            main_states = delta_mem_states.get("main")
+            mtp_states = (
+                delta_mem_mtp_states
+                if delta_mem_mtp_states is not None
+                else delta_mem_states.get("mtp")
+            )
+            return main_states, mtp_states
+        return delta_mem_states, delta_mem_mtp_states
+
+    def _split_delta_mem_state_indices_payload(
+        self,
+        delta_mem_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | Mapping[str, Any] | None,
+        delta_mem_mtp_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | None,
+    ) -> tuple[
+        Sequence[torch.Tensor | None] | torch.Tensor | None,
+        Sequence[torch.Tensor | None] | torch.Tensor | None,
+    ]:
+        if isinstance(delta_mem_state_indices, Mapping):
+            main_indices = delta_mem_state_indices.get("main")
+            mtp_indices = (
+                delta_mem_mtp_state_indices
+                if delta_mem_mtp_state_indices is not None
+                else delta_mem_state_indices.get("mtp")
+            )
+            return main_indices, mtp_indices
+        return delta_mem_state_indices, delta_mem_mtp_state_indices
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -450,6 +690,11 @@ class Qwen3MoEModel(nn.Module):
         use_fused_kernels: bool = False,
         calculate_entropy: bool = False,
         return_log_probs: bool = True,
+        delta_mem_states: Sequence[torch.Tensor | None] | Mapping[str, Any] | None = None,
+        delta_mem_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | Mapping[str, Any] | None = None,
+        delta_mem_mtp_states: Sequence[torch.Tensor | None] | None = None,
+        delta_mem_mtp_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | None = None,
+        return_delta_mem_states: bool = False,
     ) -> dict:
         if self.embed is not None:
             assert input_ids is not None
@@ -469,13 +714,66 @@ class Qwen3MoEModel(nn.Module):
         with fp8_ctx:
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
-            for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+            delta_mem_main_states, delta_mem_mtp_states = self._split_delta_mem_states_payload(
+                delta_mem_states, delta_mem_mtp_states
+            )
+            delta_mem_main_state_indices, delta_mem_mtp_state_indices = (
+                self._split_delta_mem_state_indices_payload(
+                    delta_mem_state_indices, delta_mem_mtp_state_indices
+                )
+            )
+            use_delta_mem_state_handoff = (
+                delta_mem_main_states is not None
+                or delta_mem_main_state_indices is not None
+                or delta_mem_mtp_states is not None
+                or delta_mem_mtp_state_indices is not None
+                or return_delta_mem_states
+            )
+            if use_delta_mem_state_handoff and not self._has_delta_mem_layers():
+                raise ValueError("Qwen3MoEModel delta-mem state handoff requires enabled DeltaMem config.")
+            delta_mem_state_list = (
+                self._normalize_delta_mem_states(delta_mem_main_states)
+                if use_delta_mem_state_handoff
+                else []
+            )
+            delta_mem_state_index_list = (
+                self._normalize_delta_mem_state_indices(delta_mem_main_state_indices)
+                if use_delta_mem_state_handoff
+                else []
+            )
+            delta_mem_mtp_state_list = (
+                self._normalize_delta_mem_mtp_states(delta_mem_mtp_states)
+                if use_delta_mem_state_handoff
+                else []
+            )
+            delta_mem_mtp_state_index_list = (
+                self._normalize_delta_mem_mtp_state_indices(delta_mem_mtp_state_indices)
+                if use_delta_mem_state_handoff
+                else []
+            )
+            next_delta_mem_states: list[torch.Tensor] = []
+            next_delta_mem_mtp_states: list[torch.Tensor] | None = None
+            for layer_idx, layer in enumerate(self.layers):
+                if use_delta_mem_state_handoff:
+                    layer_out = layer(
+                        h,
+                        position_ids=position_ids,
+                        packed_seq_params=packed_seq_params,
+                        delta_mem_state=delta_mem_state_list[layer_idx],
+                        delta_mem_state_indices=delta_mem_state_index_list[layer_idx],
+                        return_delta_mem_state=True,
+                    )
+                    h, next_delta_mem_state = layer_out
+                    next_delta_mem_states.append(next_delta_mem_state)
+                else:
+                    h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
             # Head path is SP-aware: norm runs on SP-sharded [S/tp, B, H] and
             # head's internal all-gather happens inside VocabParallelOutput.
             # Mirrors MC GPTModel's final_layernorm → output_layer(sp=True).
 
         output = {"hidden_states": h}
+        if use_delta_mem_state_handoff:
+            output["delta_mem_states"] = next_delta_mem_states
 
         if self.head is not None:
             hidden_for_head = self.norm(h)
@@ -491,10 +789,19 @@ class Qwen3MoEModel(nn.Module):
                     packed_seq_params=packed_seq_params,
                     temperature=temperature_value,
                     use_fused_kernels=use_fused_kernels,
+                    delta_mem_mtp_states=delta_mem_mtp_state_list
+                    if use_delta_mem_state_handoff
+                    else None,
+                    delta_mem_mtp_state_indices=delta_mem_mtp_state_index_list
+                    if use_delta_mem_state_handoff
+                    else None,
+                    return_delta_mem_states=use_delta_mem_state_handoff,
                 )
                 if mtp_result is not None:
-                    hidden_for_head, mtp_loss = mtp_result
+                    hidden_for_head, mtp_loss, next_delta_mem_mtp_states = mtp_result
                     output["mtp_loss"] = mtp_loss
+                    if next_delta_mem_mtp_states is not None:
+                        output["delta_mem_mtp_states"] = next_delta_mem_mtp_states
                 labels_sb = labels.transpose(0, 1).contiguous()
                 if use_fused_kernels:
                     hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
@@ -527,7 +834,54 @@ class Qwen3MoEModel(nn.Module):
                 logits = self.head(hidden_for_head)
                 output["logits"] = self.head.gather(logits)
 
+        routed_experts = self.recorded_routed_experts()
+        if routed_experts is not None:
+            output["routed_experts"] = routed_experts
         return output
+
+    def router_replay_instances(self) -> list[RouterReplay]:
+        routers = [layer.router_replay for layer in self.layers if layer.router_replay is not None]
+        if self.mtp is not None:
+            for mtp_layer in self.mtp.layers:
+                replay = mtp_layer.transformer_layer.router_replay
+                if replay is not None:
+                    routers.append(replay)
+        return routers
+
+    def set_router_replay_data(self, routed_experts: list[torch.Tensor]) -> None:
+        routers = self.router_replay_instances()
+        if len(routed_experts) != len(routers):
+            raise ValueError(
+                f"Router Replay expected {len(routers)} tensors for this model chunk, "
+                f"got {len(routed_experts)}."
+            )
+        for router, topk_indices in zip(routers, routed_experts, strict=True):
+            router.set_target_indices(topk_indices)
+
+    def set_router_replay_action(self, action: RouterReplayAction | str) -> None:
+        if isinstance(action, str):
+            action = RouterReplayAction(action)
+        for router in self.router_replay_instances():
+            router.set_router_replay_action(action)
+
+    def clear_router_replay_action(self) -> None:
+        for router in self.router_replay_instances():
+            router.clear_router_replay_action()
+
+    def clear_router_replay_indices(self) -> None:
+        for router in self.router_replay_instances():
+            router.clear_indices()
+
+    def recorded_routed_experts(self) -> list[torch.Tensor | None] | None:
+        routers = self.router_replay_instances()
+        if not routers:
+            return None
+        if not any(router.router_replay_action == RouterReplayAction.RECORD for router in routers):
+            return None
+        recorded = [router.get_recorded_indices() for router in routers]
+        if all(indices is None for indices in recorded):
+            return None
+        return recorded
 
     def _apply_mtp_loss(
         self,
@@ -540,7 +894,10 @@ class Qwen3MoEModel(nn.Module):
         packed_seq_params,
         temperature: float,
         use_fused_kernels: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        delta_mem_mtp_states: Sequence[torch.Tensor | None] | None = None,
+        delta_mem_mtp_state_indices: Sequence[torch.Tensor | None] | torch.Tensor | None = None,
+        return_delta_mem_states: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None] | None:
         if self.mtp is None:
             return None
         if not self.mtp_enable_train:
@@ -552,12 +909,20 @@ class Qwen3MoEModel(nn.Module):
         else:
             loss_mask = loss_mask.to(dtype=torch.float32)
 
-        mtp_hidden_states = self.mtp(
+        mtp_output = self.mtp(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
+            delta_mem_states=delta_mem_mtp_states,
+            delta_mem_state_indices=delta_mem_mtp_state_indices,
+            return_delta_mem_states=return_delta_mem_states,
         )
+        if return_delta_mem_states:
+            mtp_hidden_states, next_delta_mem_mtp_states = mtp_output
+        else:
+            mtp_hidden_states = mtp_output
+            next_delta_mem_mtp_states = None
 
         mtp_labels = labels.clone()
         mtp_loss_mask = loss_mask.clone()
@@ -601,6 +966,7 @@ class Qwen3MoEModel(nn.Module):
         return (
             hidden_states,
             torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean(),
+            next_delta_mem_mtp_states,
         )
 
     def _head_weight_for_fused_ce(self, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -19,6 +19,7 @@ Protocol convention (what runtime calls):
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_context,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
@@ -38,6 +40,10 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLA
 from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.delta_mem import (
+    DeltaMemConfig,
+    normalize_delta_mem_config,
+)
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     freeze_non_lora_params,
@@ -55,8 +61,13 @@ __all__ = [
     "PLACEMENT_FN",
     "build_model",
     "build_model_config",
+    "export_lora_adapter_state",
     "export_hf_weights",
+    "initialize_lora_olora_tail",
+    "load_lora_adapter",
+    "load_lora_adapter_state",
     "load_hf_weights",
+    "save_lora_adapter",
     "vocab_size",
 ]
 
@@ -86,7 +97,10 @@ class ImplConfig:
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
     deterministic: bool = True
-    lora: LoraConfig | dict | None = None
+    lora: LoraConfig | Mapping[str, Any] | None = None
+    lora_init: bool | str | None = None
+    delta_mem: DeltaMemConfig | Mapping[str, Any] | None = None
+    router_replay: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +143,43 @@ def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
     kwargs = pack_thd_forward_kwargs(model, batch)
     add_loss_context_kwargs(kwargs, include_return_log_probs=True)
     add_cross_entropy_fusion(kwargs, model)
-    return model(**kwargs)
+    extras = getattr(batch, "extras", None) or {}
+    for key in (
+        "delta_mem_states",
+        "delta_mem_state_indices",
+        "delta_mem_mtp_states",
+        "delta_mem_mtp_state_indices",
+        "return_delta_mem_states",
+    ):
+        if key in extras:
+            kwargs[key] = extras[key]
+    with router_replay_context(model, batch):
+        return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_forward_output(model, batch, output)
+
+
+def _resolve_lora_init(impl_cfg: ImplConfig) -> str | None:
+    value = impl_cfg.lora_init
+    if value is None and isinstance(impl_cfg.lora, Mapping):
+        value = impl_cfg.lora.get("init_lora_weights")
+    if value in (None, True, False):
+        return None
+    if not isinstance(value, str):
+        raise TypeError(
+            f"Qwen3-MoE LoRA init must be a string, boolean, or None, got {type(value)!r}."
+        )
+    normalized = value.strip().lower()
+    if normalized in ("", "none", "null", "false", "true"):
+        return None
+    if normalized != "olora_tail":
+        raise NotImplementedError(
+            f"Qwen3-MoE LoRA init {value!r} is not implemented in MLite yet; "
+            "currently supported: 'olora_tail' for tp=1/etp=1."
+        )
+    return normalized
 
 
 def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -143,6 +189,16 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     """
     p = impl_cfg.parallel
     lora_config = normalize_lora_config(impl_cfg.lora)
+    delta_mem_config = normalize_delta_mem_config(impl_cfg.delta_mem)
+    lora_init = _resolve_lora_init(impl_cfg)
+    if lora_init == "olora_tail":
+        if not lora_config.enabled:
+            raise ValueError("Qwen3-MoE lora_init='olora_tail' requires enabled LoRA rank > 0.")
+        if p.tp > 1:
+            raise NotImplementedError("Qwen3-MoE lora_init='olora_tail' currently supports tp=1.")
+        etp = 1 if p.etp is None else p.etp
+        if etp > 1:
+            raise NotImplementedError("Qwen3-MoE lora_init='olora_tail' currently supports etp=1.")
 
     # ── validation ──
     if impl_cfg.use_deepep and (p.etp is not None and p.etp > 1):
@@ -178,6 +234,8 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         lora_config=lora_config,
+        delta_mem_config=delta_mem_config,
+        router_replay=impl_cfg.router_replay,
     )
 
     vpp = None if p.vpp == 1 else p.vpp
@@ -218,6 +276,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     optimizer = None
     finalize_grads = None
     post_model_load_hook = None
+    fsdp2_post_model_load_hook = None
     if impl_cfg.optimizer == "dist_opt":
         from megatron.lite.primitive.optimizers.megatron_wrap import (
             build_dist_opt_training_optimizer,
@@ -241,7 +300,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 
-        def _post_model_load_hook():
+        def _fsdp2_post_model_load_hook():
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
             from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
@@ -261,11 +320,25 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
                 )
             }
 
-        post_model_load_hook = _post_model_load_hook
+        fsdp2_post_model_load_hook = _fsdp2_post_model_load_hook
     elif impl_cfg.optimizer is None:
         optimizer_backend = "none"
     else:
         raise ValueError(f"Unknown qwen3_moe lite optimizer: {impl_cfg.optimizer!r}.")
+
+    if lora_init == "olora_tail" or fsdp2_post_model_load_hook is not None:
+
+        def _post_model_load_hook():
+            updates: dict[str, Any] = {}
+            if lora_init == "olora_tail":
+                updates.setdefault("extras", {})[
+                    "lora_init_result"
+                ] = initialize_lora_olora_tail(chunks, model_cfg, ps)
+            if fsdp2_post_model_load_hook is not None:
+                updates.update(fsdp2_post_model_load_hook())
+            return updates
+
+        post_model_load_hook = _post_model_load_hook
 
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
@@ -287,7 +360,9 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             "optimizer_backend": optimizer_backend,
             "post_model_load_hook": post_model_load_hook,
             "lora_config": lora_config,
+            "lora_init": lora_init,
             "lora_stats": lora_stats,
+            "delta_mem_config": delta_mem_config,
         },
     )
 
@@ -314,6 +389,46 @@ def export_hf_weights(
 
     for chunk in chunks:
         yield from _export(chunk, model_cfg, ps, **kwargs)
+
+
+def export_lora_adapter_state(chunks, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import (
+        export_lora_adapter_state as export_impl,
+    )
+
+    return export_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def initialize_lora_olora_tail(chunks, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import (
+        initialize_lora_olora_tail as initialize_impl,
+    )
+
+    return initialize_impl(chunks, model_cfg, ps, **kwargs)
+
+
+def save_lora_adapter(
+    chunks, model_cfg: Qwen3MoEConfig, ps: ParallelState, output_dir: str | Path, **kwargs
+):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import save_lora_adapter as save_impl
+
+    return save_impl(chunks, model_cfg, ps, output_dir, **kwargs)
+
+
+def load_lora_adapter_state(chunks, state, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import (
+        load_lora_adapter_state as load_impl,
+    )
+
+    return load_impl(chunks, state, model_cfg, ps, **kwargs)
+
+
+def load_lora_adapter(
+    chunks, adapter_dir: str | Path, model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
+):
+    from megatron.lite.model.qwen3_moe.lite.lora_adapter import load_lora_adapter as load_impl
+
+    return load_impl(chunks, adapter_dir, model_cfg, ps, **kwargs)
 
 
 # ---------------------------------------------------------------------------

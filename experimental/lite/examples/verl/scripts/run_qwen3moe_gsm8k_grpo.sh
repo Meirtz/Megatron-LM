@@ -37,6 +37,7 @@ VAL_FILES="${VAL_FILES:-${DATASET_DIR}/test.parquet}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${EXAMPLE_ROOT}/outputs/qwen35_gsm8k_grpo}"
 PROJECT_NAME="${PROJECT_NAME:-verl-mlite-qwen35-gsm8k-grpo}"
 INFER_BACKEND="${INFER_BACKEND:-vllm}"
+ROUTER_REPLAY_MODE="${ROUTER_REPLAY_MODE:-${ROUTING_REPLAY_MODE:-disabled}}"
 
 NNODES="${NNODES:-1}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-${NPROC_PER_NODE:-8}}"
@@ -47,6 +48,7 @@ ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-512}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-1024}"
 PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-8192}"
+FILTER_OVERLONG_PROMPTS="${FILTER_OVERLONG_PROMPTS:-True}"
 
 ROLLOUT_N="${ROLLOUT_N:-5}"
 ROLLOUT_MODE="${ROLLOUT_MODE:-async}"
@@ -69,6 +71,7 @@ ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 ROLLOUT_TOP_K="${ROLLOUT_TOP_K:--1}"
 ROLLOUT_LIMIT_IMAGES="${ROLLOUT_LIMIT_IMAGES:-0}"
 ROLLOUT_LIMIT_VIDEOS="${ROLLOUT_LIMIT_VIDEOS:-0}"
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-False}"
 VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.0}"
 VAL_TOP_P="${VAL_TOP_P:-1.0}"
 VAL_DO_SAMPLE="${VAL_DO_SAMPLE:-False}"
@@ -88,6 +91,12 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 # - dist_opt (default): Megatron-Core DDP + distributed optimizer.
 # - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
 MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-dist_opt}"
+LORA_RANK="${LORA_RANK:-0}"
+LORA_ALPHA="${LORA_ALPHA:-${LORA_RANK}}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
+LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-all-linear}"
+LORA_USE_RSLORA="${LORA_USE_RSLORA:-False}"
+LORA_INIT="${LORA_INIT:-}"
 
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
@@ -112,6 +121,10 @@ SAVE_FREQ="${SAVE_FREQ:-20}"
 TEST_FREQ="${TEST_FREQ:-5}"
 RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
+CHECKPOINT_SAVE_CONTENTS="${CHECKPOINT_SAVE_CONTENTS:-}"
+CHECKPOINT_LOAD_CONTENTS="${CHECKPOINT_LOAD_CONTENTS:-}"
+CHECKPOINT_SAVE_LORA_ADAPTER="${CHECKPOINT_SAVE_LORA_ADAPTER:-}"
+LORA_ADAPTER_DIR_NAME="${LORA_ADAPTER_DIR_NAME:-}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
 USE_LEGACY_WORKER_IMPL="${USE_LEGACY_WORKER_IMPL:-disable}"
@@ -122,6 +135,37 @@ if [[ "${INFER_BACKEND}" != "vllm" && "${INFER_BACKEND}" != "sglang" && "${INFER
   echo "Unsupported INFER_BACKEND=${INFER_BACKEND}. Expected vllm, sglang, or trtllm." >&2
   exit 1
 fi
+
+case "${ROUTER_REPLAY_MODE}" in
+  disabled | disable)
+    ROUTER_REPLAY_MODE="disabled"
+    ;;
+  R3)
+    if [[ "${INFER_BACKEND}" != "sglang" ]]; then
+      echo "ROUTER_REPLAY_MODE=R3 currently requires INFER_BACKEND=sglang." >&2
+      exit 1
+    fi
+    if (( $# > 0 )); then
+      for extra_arg in "$@"; do
+        normalized_arg="$(printf '%s' "${extra_arg}" | tr '[:upper:]' '[:lower:]')"
+        case "${normalized_arg}" in
+          *sequence_packing*=true* | *sequence_packing*=1* | *sequence_packing*=yes* | *sequence_packing*=on*)
+            echo "ROUTER_REPLAY_MODE=R3 does not support sequence packing. Remove override: ${extra_arg}" >&2
+            exit 1
+            ;;
+        esac
+      done
+    fi
+    ;;
+  R2)
+    echo "ROUTER_REPLAY_MODE=R2 is not supported by the MLite GRPO example yet." >&2
+    exit 1
+    ;;
+  *)
+    echo "Unsupported ROUTER_REPLAY_MODE=${ROUTER_REPLAY_MODE}. Expected disabled or R3." >&2
+    exit 1
+    ;;
+esac
 
 case "${MLITE_OPTIMIZER_BACKEND}" in
   dist_opt)
@@ -177,13 +221,14 @@ DATA=(
   "data.return_raw_chat=True"
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
-  "data.filter_overlong_prompts=True"
+  "data.filter_overlong_prompts=${FILTER_OVERLONG_PROMPTS}"
   "data.truncation=error"
 )
 
 MODEL=(
   "actor_rollout_ref.model.path=${MODEL_PATH}"
   "actor_rollout_ref.model.trust_remote_code=True"
+  "actor_rollout_ref.model.use_remove_padding=True"
   "actor_rollout_ref.model.use_fused_kernels=False"
 )
 
@@ -222,6 +267,26 @@ ACTOR=(
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 )
 
+if [[ "${LORA_RANK}" != "0" ]]; then
+  ACTOR+=(
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.rank=${LORA_RANK}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.alpha=${LORA_ALPHA}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.dropout=${LORA_DROPOUT}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.target_modules=${LORA_TARGET_MODULES}"
+    "+actor_rollout_ref.actor.engine.impl_cfg.lora.use_rslora=${LORA_USE_RSLORA}"
+  )
+fi
+if [[ -n "${LORA_INIT}" ]]; then
+  ACTOR+=("+actor_rollout_ref.actor.engine.impl_cfg.lora_init=${LORA_INIT}")
+fi
+
+if [[ "${ROUTER_REPLAY_MODE}" == "R3" ]]; then
+  ACTOR+=(
+    "+actor_rollout_ref.actor.engine.router_replay.mode=R3"
+    "+actor_rollout_ref.actor.engine.impl_cfg.router_replay=True"
+  )
+fi
+
 if [[ "${OPTIMIZER_OFFLOAD}" == "True" || "${OPTIMIZER_OFFLOAD}" == "true" || "${OPTIMIZER_OFFLOAD}" == "1" ]]; then
   ACTOR+=(
     "+actor_rollout_ref.actor.optim.override_optimizer_config.offload_fraction=${OPTIMIZER_STATE_OFFLOAD_FRACTION}"
@@ -248,6 +313,7 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE}"
   "actor_rollout_ref.rollout.top_p=${ROLLOUT_TOP_P}"
   "actor_rollout_ref.rollout.top_k=${ROLLOUT_TOP_K}"
+  "actor_rollout_ref.rollout.enforce_eager=${ROLLOUT_ENFORCE_EAGER}"
   "actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}"
   "actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}"
   "actor_rollout_ref.rollout.val_kwargs.do_sample=${VAL_DO_SAMPLE}"
@@ -260,6 +326,9 @@ if [[ "${INFER_BACKEND}" == "vllm" ]]; then
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=${ROLLOUT_LIMIT_IMAGES}"
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.video=${ROLLOUT_LIMIT_VIDEOS}"
   )
+fi
+if [[ "${ROUTER_REPLAY_MODE}" == "R3" ]]; then
+  ROLLOUT+=("actor_rollout_ref.rollout.enable_rollout_routing_replay=True")
 fi
 
 TRAINER=(
@@ -279,8 +348,22 @@ TRAINER=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
-  "trainer.use_legacy_worker_impl=${USE_LEGACY_WORKER_IMPL}"
+  "+trainer.use_legacy_worker_impl=${USE_LEGACY_WORKER_IMPL}"
 )
+
+CHECKPOINT=()
+if [[ -n "${CHECKPOINT_SAVE_CONTENTS}" ]]; then
+  CHECKPOINT+=("+checkpoint.save_contents=${CHECKPOINT_SAVE_CONTENTS}")
+fi
+if [[ -n "${CHECKPOINT_LOAD_CONTENTS}" ]]; then
+  CHECKPOINT+=("+checkpoint.load_contents=${CHECKPOINT_LOAD_CONTENTS}")
+fi
+if [[ -n "${CHECKPOINT_SAVE_LORA_ADAPTER}" ]]; then
+  CHECKPOINT+=("+checkpoint.save_lora_adapter=${CHECKPOINT_SAVE_LORA_ADAPTER}")
+fi
+if [[ -n "${LORA_ADAPTER_DIR_NAME}" ]]; then
+  CHECKPOINT+=("+checkpoint.lora_adapter_dir_name=${LORA_ADAPTER_DIR_NAME}")
+fi
 
 COMMAND=(
   python3
@@ -293,8 +376,13 @@ COMMAND=(
   "${ACTOR[@]}"
   "${ROLLOUT[@]}"
   "${TRAINER[@]}"
-  "${EXTRA_ARGS[@]}"
 )
+if (( ${#CHECKPOINT[@]} )); then
+  COMMAND+=("${CHECKPOINT[@]}")
+fi
+if (( ${#EXTRA_ARGS[@]} )); then
+  COMMAND+=("${EXTRA_ARGS[@]}")
+fi
 
 printf '%q ' "${COMMAND[@]}" > "${CMD_FILE}"
 printf '\n' >> "${CMD_FILE}"

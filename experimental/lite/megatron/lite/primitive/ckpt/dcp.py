@@ -84,7 +84,18 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
+            key = f"{model_prefix}.{name}"
+            state_dict[key] = _dcp_tensor_from_param(param, mesh, placements)
+            _trace_dcp_param(
+                "save_prepare",
+                key=key,
+                name=name,
+                param=param,
+                tensor=state_dict[key],
+                placements=placements,
+                ps=ps,
+                expert=is_expert(name),
+            )
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
@@ -146,8 +157,17 @@ def load_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
-                param, mesh, placements
+            key = f"{model_prefix}.{name}"
+            state_dict[key] = _empty_dcp_tensor_like_param(param, mesh, placements)
+            _trace_dcp_param(
+                "load_prepare",
+                key=key,
+                name=name,
+                param=param,
+                tensor=state_dict[key],
+                placements=placements,
+                ps=ps,
+                expert=is_expert(name),
             )
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
@@ -157,8 +177,28 @@ def load_training_checkpoint(
             key = f"{model_prefix}.{name}"
             if key in state_dict:
                 t = state_dict[key]
+                _trace_dcp_param(
+                    "load_after_dcp",
+                    key=key,
+                    name=name,
+                    param=param,
+                    tensor=t,
+                    placements=get_placements(name),
+                    ps=ps,
+                    expert=is_expert(name),
+                )
                 with torch.no_grad():
                     _copy_tensor_(param, t)
+                _trace_dcp_param(
+                    "load_after_copy",
+                    key=key,
+                    name=name,
+                    param=param,
+                    tensor=param,
+                    placements=get_placements(name),
+                    ps=ps,
+                    expert=is_expert(name),
+                )
 
     if load_optimizer:
         _load_optimizer_checkpoint(optimizer, ckpt_path)
@@ -281,18 +321,130 @@ def _is_dtensor_like(tensor: Any) -> bool:
     )
 
 
+def _trace_param_selected(name: str, key: str) -> bool:
+    raw = os.environ.get("MLITE_DCP_TRACE_PARAM", "").strip()
+    if not raw:
+        return False
+    if raw == "*":
+        return True
+    needles = [item.strip() for item in raw.split(",") if item.strip()]
+    return any(needle in name or needle in key for needle in needles)
+
+
+def _tensor_trace_summary(tensor: Any) -> dict[str, Any]:
+    local = _to_local_tensor(tensor.detach() if hasattr(tensor, "detach") else tensor)
+    if not isinstance(local, torch.Tensor):
+        return {"type": type(local).__name__}
+    summary: dict[str, Any] = {
+        "shape": list(local.shape),
+        "dtype": str(local.dtype),
+        "device": str(local.device),
+        "numel": int(local.numel()),
+    }
+    if local.numel() == 0:
+        return summary
+    detached = local.detach()
+    if detached.is_floating_point() or detached.is_complex():
+        as_float = detached.float()
+        summary.update(
+            {
+                "sum": float(as_float.sum().item()),
+                "mean": float(as_float.mean().item()),
+                "abs_max": float(as_float.abs().max().item()),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "sum": int(detached.long().sum().item()),
+                "max": int(detached.max().item()),
+            }
+        )
+    return summary
+
+
+def _trace_dcp_param(
+    event: str,
+    *,
+    key: str,
+    name: str,
+    param: torch.Tensor,
+    tensor: Any,
+    placements: list,
+    ps: ParallelState,
+    expert: bool,
+) -> None:
+    if not _trace_param_selected(name, key):
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    param_mesh = getattr(param, "device_mesh", None)
+    param_placements = getattr(param, "placements", None)
+    record = {
+        "event": event,
+        "rank": int(rank),
+        "key": key,
+        "name": name,
+        "expert": bool(expert),
+        "ps": {
+            "pp_rank": int(getattr(ps, "pp_rank", 0)),
+            "ep_rank": int(getattr(ps, "ep_rank", 0)),
+            "etp_rank": int(getattr(ps, "etp_rank", 0)),
+            "expert_dp_rank": int(getattr(ps, "expert_dp_rank", 0)),
+            "pp_size": int(getattr(ps, "pp_size", 1)),
+            "ep_size": int(getattr(ps, "ep_size", 1)),
+            "etp_size": int(getattr(ps, "etp_size", 1)),
+            "expert_dp_size": int(getattr(ps, "expert_dp_size", 1)),
+        },
+        "protocol_placements": [repr(item) for item in placements],
+        "param_is_dtensor_like": bool(_is_dtensor_like(param)),
+        "param_device_mesh": repr(param_mesh),
+        "param_placements": repr(param_placements),
+        "tensor_is_dtensor_like": bool(_is_dtensor_like(tensor)),
+        "tensor_summary": _tensor_trace_summary(tensor),
+    }
+    print("[MLITE_DCP_TRACE] " + repr(record), flush=True)
+
+
 def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: list) -> DTensor:
+    local_tensor = _to_local_tensor(param).detach()
     if _is_dtensor_like(param):
-        return _dtensor_from_dtensor_like_param(param, _to_local_tensor(param).detach())
-    return DTensor.from_local(_to_local_tensor(param).detach(), mesh, placements)
+        if not _checkpoint_has_real_shard(mesh, placements):
+            return _dtensor_from_dtensor_like_param(param, local_tensor)
+        global_shape = _global_shape_from_checkpoint_placements(
+            param, local_tensor, mesh, placements
+        )
+        return _dtensor_from_checkpoint_local(local_tensor, mesh, placements, global_shape)
+    return DTensor.from_local(local_tensor, mesh, placements)
 
 
 def _empty_dcp_tensor_like_param(
     param: torch.Tensor, mesh: DeviceMesh, placements: list
 ) -> DTensor:
+    param_local_tensor = _to_local_tensor(param)
+    local_tensor = torch.empty_like(param_local_tensor)
     if _is_dtensor_like(param):
-        return _dtensor_from_dtensor_like_param(param, torch.empty_like(_to_local_tensor(param)))
-    return DTensor.from_local(torch.empty_like(_to_local_tensor(param)), mesh, placements)
+        if not _checkpoint_has_real_shard(mesh, placements):
+            return _dtensor_from_dtensor_like_param(param, local_tensor)
+        global_shape = _global_shape_from_checkpoint_placements(
+            param, param_local_tensor, mesh, placements
+        )
+        return _dtensor_from_checkpoint_local(local_tensor, mesh, placements, global_shape)
+    return DTensor.from_local(local_tensor, mesh, placements)
+
+
+def _dtensor_from_checkpoint_local(
+    local_tensor: torch.Tensor,
+    mesh: DeviceMesh,
+    placements: list,
+    global_shape: tuple[int, ...],
+) -> DTensor:
+    return DTensor.from_local(
+        local_tensor,
+        mesh,
+        placements,
+        shape=global_shape,
+        stride=_contiguous_stride(global_shape),
+    )
 
 
 def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Tensor) -> DTensor:
@@ -305,10 +457,93 @@ def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Te
     )
 
 
+def _global_shape_from_checkpoint_placements(
+    param: torch.Tensor, local_tensor: torch.Tensor, mesh: DeviceMesh, placements: list
+) -> tuple[int, ...]:
+    local_shape = tuple(int(dim) for dim in local_tensor.shape)
+    logical_shape = _logical_shape_from_param(param, local_shape)
+    if logical_shape is not None and logical_shape != local_shape:
+        return logical_shape
+
+    shape = list(local_shape)
+    for mesh_axis, placement in enumerate(placements):
+        shard_dim = _placement_shard_dim(placement)
+        if shard_dim is None:
+            continue
+        if shard_dim < 0:
+            shard_dim += len(shape)
+        if shard_dim < 0 or shard_dim >= len(shape):
+            raise ValueError(
+                f"Shard placement dim {shard_dim} is out of range for local shape {tuple(shape)}."
+            )
+        shape[shard_dim] *= _mesh_dim_size(mesh, mesh_axis)
+    return tuple(shape)
+
+
+def _logical_shape_from_param(param: torch.Tensor, local_shape: tuple[int, ...]) -> tuple[int, ...] | None:
+    shape = getattr(param, "shape", None)
+    if shape is None:
+        return None
+    logical_shape = tuple(int(dim) for dim in shape)
+    if len(logical_shape) != len(local_shape):
+        return None
+    if all(global_dim >= local_dim for global_dim, local_dim in zip(logical_shape, local_shape, strict=True)):
+        return logical_shape
+    return None
+
+
+def _checkpoint_has_real_shard(mesh: DeviceMesh, placements: list) -> bool:
+    return any(
+        _placement_shard_dim(placement) is not None and _mesh_dim_size(mesh, mesh_axis) > 1
+        for mesh_axis, placement in enumerate(placements)
+    )
+
+
+def _placement_shard_dim(placement: Any) -> int | None:
+    dim = getattr(placement, "dim", None)
+    if callable(dim):
+        dim = dim()
+    if dim is None:
+        dim = getattr(placement, "_dim", None)
+    if dim is None:
+        text = repr(placement)
+        marker = "Shard(dim="
+        if marker in text:
+            dim_text = text.split(marker, 1)[1].split(")", 1)[0]
+            dim = int(dim_text)
+    return int(dim) if dim is not None else None
+
+
+def _mesh_dim_size(mesh: DeviceMesh, axis: int) -> int:
+    shape = getattr(mesh, "shape", None)
+    if callable(shape):
+        shape = shape()
+    if shape is not None:
+        return int(shape[axis])
+    mesh_tensor = getattr(mesh, "mesh", None)
+    if mesh_tensor is not None and hasattr(mesh_tensor, "shape"):
+        return int(mesh_tensor.shape[axis])
+    size_fn = getattr(mesh, "size", None)
+    if callable(size_fn):
+        return int(size_fn(axis))
+    raise ValueError(f"Checkpoint mesh does not expose size for axis {axis}.")
+
+
+def _contiguous_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    stride: list[int] = []
+    running = 1
+    for dim in reversed(shape):
+        stride.append(running)
+        running *= int(dim)
+    return tuple(reversed(stride))
+
+
 def _copy_tensor_(target: torch.Tensor, src: torch.Tensor) -> None:
     local_target = _to_local_tensor(target)
     local_src = _to_local_tensor(src).to(device=local_target.device, dtype=local_target.dtype)
     if isinstance(local_target, torch.Tensor) and local_target is not target:
+        if local_target.numel() == 0 and local_src.numel() != 0:
+            return
         local_target.copy_(local_src)
     else:
         target.copy_(local_src)

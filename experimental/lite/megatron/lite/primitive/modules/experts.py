@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -77,7 +78,7 @@ class Experts(nn.Module):
         *,
         fp8: bool = False,
         moe_act_recompute: bool = False,
-        lora_config: LoraConfig | dict | None = None,
+        lora_config: LoraConfig | Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
@@ -111,6 +112,7 @@ class Experts(nn.Module):
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
             )
         if lora.enabled and lora.targets_module("linear_fc2"):
             self.fc2_lora = SharedGroupedLinearLoRA(
@@ -120,6 +122,7 @@ class Experts(nn.Module):
                 lora.rank,
                 alpha=lora.alpha,
                 dropout=lora.dropout,
+                use_rslora=lora.use_rslora,
             )
         if ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1:
             tp_group = ps.tp_group

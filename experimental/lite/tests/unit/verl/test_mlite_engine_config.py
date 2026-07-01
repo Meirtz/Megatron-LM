@@ -98,7 +98,18 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
             cp=1,
             optimizer_offload=True,
             attention_backend_override="flash",
-            impl_cfg={"use_thd": True, "deterministic": False},
+            impl_cfg={
+                "use_thd": True,
+                "deterministic": False,
+                "lora": {
+                    "rank": 16,
+                    "alpha": 32,
+                    "dropout": 0.0,
+                    "target_modules": "all-linear",
+                    "use_rslora": True,
+                },
+                "lora_init": "olora_tail",
+            },
         )
     )
 
@@ -113,6 +124,14 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
     assert config.attention_backend_override == "flash"
     assert config.impl_cfg["use_thd"] is True
     assert config.impl_cfg["deterministic"] is False
+    assert config.impl_cfg["lora"] == {
+        "rank": 16,
+        "alpha": 32,
+        "dropout": 0.0,
+        "target_modules": "all-linear",
+        "use_rslora": True,
+    }
+    assert config.impl_cfg["lora_init"] == "olora_tail"
 
 
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
